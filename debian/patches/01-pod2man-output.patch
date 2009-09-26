@@ -1,0 +1,12 @@
+diff -Nur bucardo-4.1.2/Makefile.PL bucardo-4.1.2.new/Makefile.PL
+--- bucardo-4.1.2/Makefile.PL	2009-09-25 21:49:17.000000000 +1000
++++ bucardo-4.1.2.new/Makefile.PL	2009-09-26 18:09:39.000000000 +1000
+@@ -26,7 +26,7 @@
+     NO_META      => 1,
+     VERSION_FROM => 'Bucardo.pm',
+     EXE_FILES    => ['bucardo_ctl'],
+-    MAN1PODS     => { 'bucardo_ctl' => 'blib/man1/bucardo_ctl.1pm' },
++    MAN1PODS     => { 'bucardo_ctl' => 'blib/man1/bucardo_ctl.1p' },
+     NORECURS     => 1,
+     clean        => { FILES => 'log.bucardo.* *~ *.tmp outgoingmail.* bucardo_test_database*/' },
+ );

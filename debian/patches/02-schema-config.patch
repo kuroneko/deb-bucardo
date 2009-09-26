@@ -1,0 +1,34 @@
+diff -Nur bucardo-4.4.0/bucardo.schema bucardo-4.4.0.new/bucardo.schema
+--- bucardo-4.4.0/bucardo.schema	2009-10-15 03:43:21.000000000 +1100
++++ bucardo-4.4.0.new/bucardo.schema	2009-10-22 09:00:54.000000000 +1100
+@@ -127,8 +127,8 @@
+ log_showtime|3|Show timestamp in the log output?  0=off  1=seconds since epoch  2=scalar gmtime  3=scalar localtime
+ log_showline|0|Show line number in the log output?
+ log_conflict_details|0|Log detailed conflict data?
+-log_conflict_file|bucardo_conflict.log|Name of the conflict detail log file
+-warning_file|bucardo.warning.log|File containing all log lines starting with "Warning"
++log_conflict_file|/var/log/bucardo/conflict.log|Name of the conflict detail log file
++warning_file|/var/log/bucardo/warning.log|File containing all log lines starting with "Warning"
+ \.
+ 
+ -- Versioning
+@@ -143,8 +143,8 @@
+ COPY bucardo.bucardo_config(setting,value,about)
+ FROM STDIN
+ WITH DELIMITER '|';
+-default_email_from|nobody@example.com|Who the alert emails are sent as
+-default_email_to|nobody@example.com|Who to send alert emails to
++default_email_from|root|Who the alert emails are sent as
++default_email_to|root|Who to send alert emails to
+ default_email_host|localhost|Which host to send email through
+ email_debug_file||File to save a copy of all outgoing emails to
+ host_safety_check||Regex to make sure we don't accidentally run where we should not
+@@ -152,7 +152,7 @@
+ max_delete_clause|200|Maximum number of items to delete inside of IN() clauses
+ max_select_clause|500|Maximum number of items to select inside of IN() clauses
+ piddir|/var/run/bucardo|Directory holding Bucardo PID files
+-reason_file|bucardo.restart.reason.log|File to hold reasons for stopping and starting
++reason_file|/var/log/bucardo/restart.reason|File to hold reasons for stopping and starting
+ stats_script_url|http://www.bucardo.org/|Location of the stats script
+ stopfile|fullstopbucardo|Name of the semaphore file used to stop Bucardo processes
+ syslog_facility|LOG_LOCAL1|Which syslog facility level to use

@@ -1,0 +1,5 @@
+bucardo (4.4.0-1) unstable; urgency=low
+
+  * Initial release (Closes: #497650)
+
+ -- Nicholas Jefferson <nicholas@pythonic.com.au>  Sat, 26 Sep 2009 17:36:16 +1000

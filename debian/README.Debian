@@ -1,0 +1,10 @@
+Bucardo for Debian
+------------------
+
+To use Bucardo, execute psql --file /usr/share/bucardo/bucardo.schema as a
+PostgreSQL superuser, which creates a user named "bucardo" and a database also
+named "bucardo", then populate the tables in that database as required, then
+configure /etc/bucardorc to access that database, and enable the bucardo
+daemon in /etc/default/bucardo.
+
+ -- Nicholas Jefferson <nicholas@pythonic.com.au>  Wed, 08 Apr 2009 09:15:06 +1000

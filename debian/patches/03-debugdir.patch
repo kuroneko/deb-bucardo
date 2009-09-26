@@ -1,0 +1,12 @@
+diff -Nur bucardo-4.1.2/bucardo_ctl bucardo-4.1.2.new/bucardo_ctl
+--- bucardo-4.1.2/bucardo_ctl	2009-09-25 21:49:59.000000000 +1000
++++ bucardo-4.1.2.new/bucardo_ctl	2009-09-26 21:24:40.000000000 +1000
+@@ -57,7 +57,7 @@
+ 			  sendmail     => 0,
+ 			  extraname    => '',
+ 			  debugfilesep => 0,
+-			  debugdir     => '.',
++			  debugdir     => '/var/log/bucardo',
+ 			  debugname    => '',
+ 			  debugsyslog  => 1,
+ 			  debugfile    => 1,

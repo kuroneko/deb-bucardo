@@ -1,0 +1,4 @@
+# Default settings for /etc/init.d/bucardo
+
+# Whether or not to run the bucardo daemon; set to 1 to enable.
+ENABLED=0

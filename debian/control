@@ -1,0 +1,19 @@
+Source: bucardo
+Priority: optional
+Maintainer: Nicholas Jefferson <nicholas@pythonic.com.au>
+Build-Depends: cdbs, debhelper (>= 5), perl (>= 5.10.0)
+Standards-Version: 3.8.3
+Section: database
+Homepage: http://bucardo.org/
+
+Package: bucardo
+Architecture: all
+Depends: ${misc:Depends}, adduser, perl (>= 5.10.0), libdbix-safe-perl, libdbd-pg-perl
+Recommends: postgresql-plperl-8.4
+Description: asynchronous replication system for PostgreSQL
+ Bucardo is an asynchronous PostgreSQL replication system, allowing for both
+ multi-master and multi-slave operations.
+ .
+ Bucardo uses PL/pgSQL and Pl/PerlU triggers to send notification events to a
+ daemon, which replicates the data modifications, and Bucardo provides both
+ standard and custom conflict resolution methods.
