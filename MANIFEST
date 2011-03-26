@@ -22,12 +22,14 @@ scripts/bucardo_rrd
 scripts/bucardo-report
 scripts/check_bucardo_sync
 scripts/bucardo_ctl.rc
+scripts/slony_migrator.pl
 
 Bucardo.pm.html
 bucardo_ctl.html
 
 ## Testing-related stuff
 .perlcriticrc
+t/00-release.t
 t/01-basic.t
 t/02-simple.t
 t/02-monkey_with_db_table.t
@@ -51,3 +53,6 @@ t/15-star.t
 t/98-cleanup.t
 t/99-signature.t
 t/BucardoTesting.pm
+t/truncate_test_logs.notest
+
+patches/Bucardo.4.4.0.fix.search.path.patch.txt

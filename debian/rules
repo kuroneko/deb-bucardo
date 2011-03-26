@@ -13,4 +13,4 @@ common-build-indep::
 	make
 
 common-install-indep::
-	make install DESTDIR=$(CURDIR)/debian/bucardo
+	make install DESTDIR=$(CURDIR)/debian/bucardo INSTALL_BASE=$(CURDIR)/debian/bucardo

@@ -1,3 +1,9 @@
+bucardo (4.4.2-1) unstable; urgency=low
+
+  * New version of Bucardo
+
+ -- Nicholas Jefferson <nicholas@pythonic.com.au>  Sat, 26 Mar 2011 18:03:32 +1100
+
 bucardo (4.4.0-1) unstable; urgency=low
 
   * Initial release (Closes: #497650)
