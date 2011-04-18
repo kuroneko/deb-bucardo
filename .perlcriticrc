@@ -1,0 +1,105 @@
+
+## perlcritic file for Bucardo
+## Usage: perlcritic -profile <thisfile> <scriptname>
+
+verbose = 8
+severity = 1
+profile-strictness = quiet
+
+##
+## Five:
+##
+
+[-ControlStructures::ProhibitMutatingListFunctions]
+[-Subroutines::ProhibitNestedSubs] 
+[-ValuesAndExpressions::ProhibitAccessOfPrivateData]
+
+##
+## Four:
+##
+
+## We are just fine with 'die', thanks very much
+[-ErrorHandling::RequireUseOfExceptions]
+[-InputOutput::ProhibitOneArgSelect]
+## Too many false positives for this one:
+[-InputOutput::RequireBriefOpen]
+[-Lax::RequireEndWithTrueConst]
+[-Modules::RequireEndWithOne]
+## This does such a poor job we have to exclude it
+[-RegularExpressions::ProhibitCaptureWithoutTest]
+[-RegularExpressions::ProhibitFixedStringMatches]
+[-ValuesAndExpressions::ProhibitMixedBooleanOperators]
+[-Variables::RequireLocalizedPunctuationVars]
+[-InputOutput::ProhibitExplicitStdin]
+
+##
+## Three:
+##
+
+[-Bangs::ProhibitNumberedNames]
+[-Bangs::ProhibitVagueNames]
+[-BuiltinFunctions::ProhibitComplexMappings]
+[-CodeLayout::RequireUseUTF8]
+[-ControlStructures::ProhibitCascadingIfElse]
+[-ControlStructures::ProhibitDeepNests]
+[-Documentation::RequirePODUseEncodingUTF8]
+[-ErrorHandling::RequireCarping]
+[-ErrorHandling::RequireCheckingReturnValueOfEval]
+[-InputOutput::ProhibitBacktickOperators]
+[-Lax::ProhibitComplexMappings::LinesNotStatements]
+[-Modules::ProhibitExcessMainComplexity]
+[-Modules::ProhibitUseQuotedVersion]
+[-RegularExpressions::ProhibitComplexRegexes]
+[-RegularExpressions::RequireExtendedFormatting]
+[-Subroutines::ProhibitExcessComplexity]
+[-ValuesAndExpressions::ProhibitImplicitNewlines]
+[-Variables::ProhibitPackageVars]
+[-ValuesAndExpressions::ProhibitVersionStrings]
+
+##
+## Two:
+##
+
+[-Bangs::ProhibitFlagComments]
+[-BuiltinFunctions::ProhibitBooleanGrep]
+[-CodeLayout::ProhibitQuotedWordLists]
+[-ControlStructures::ProhibitPostfixControls]
+[-Documentation::RequirePodSections]
+[-Editor::RequireEmacsFileVariables]
+[-Lax::ProhibitEmptyQuotes::ExceptAsFallback]
+## This one really ought to be removed entirely:
+## Giving too many false positives in bucardo_ctl:
+[-Miscellanea::ProhibitUselessNoCritic]
+[-Miscellanea::RequireRcsKeywords]
+[-References::ProhibitDoubleSigils]
+[-RegularExpressions::RequireDotMatchAnything]
+[-RegularExpressions::RequireLineBoundaryMatching]
+[-Tics::ProhibitLongLines]
+[-ValuesAndExpressions::ProhibitEmptyQuotes]
+[-ValuesAndExpressions::ProhibitMagicNumbers]
+## This one has such potential to be useful, but complains about some wrong things:
+[-ValuesAndExpressions::ProhibitNoisyQuotes]
+[-ValuesAndExpressions::RequireNumberSeparators]
+[-ValuesAndExpressions::RestrictLongStrings]
+[-Variables::ProhibitPunctuationVars]
+
+##
+## One:
+##
+
+[-CodeLayout::ProhibitParensWithBuiltins]
+[-CodeLayout::RequireTidyCode]
+[-Documentation::PodSpelling]
+## Yeah, because everyone checks the return value of 'print'
+[-InputOutput::RequireCheckedSyscalls]
+[-Miscellanea::RequireRcsKeywords]
+[-NamingConventions::Capitalization]
+[-RegularExpressions::ProhibitEscapedMetacharacters]
+
+## Change the severity level of some specific items
+
+[CodeLayout::ProhibitTrailingWhitespace]
+severity = 5
+
+[Subroutines::ProhibitBuiltinHomonyms]
+severity = 5

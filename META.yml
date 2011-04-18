@@ -1,0 +1,42 @@
+--- #YAML:1.0
+name                : Bucardo
+version             : 4.4.0
+abstract            : Postgres multi-master replication system
+author:              
+  - Greg Sabino Mullane <greg@endpoint.com>
+
+license             : bsd
+dynamic_config      : 1
+distribution_type   : module
+
+requires:
+  DBI               : 1.51
+  DBD::Pg           : 2.0
+  DBIx::Safe        : 1.2.4
+  IO::Handle        : 1.24
+  Sys::Hostname     : 1.11
+  Sys::Syslog       : 0.13
+  Net::SMTP         : 0
+build_requires:
+  Test::Harness     : 2.03
+  Test::More        : 0.61
+  Module::Signature : 0.50
+
+provides:
+  Bucardo:
+    file            : Bucardo.pm
+    version         : 4.4.0
+  bucardo_ctl:
+    file            : bucardo_ctl
+    version         : 4.4.0
+
+resources:
+  homepage          : http://bucardo.org/index.html
+  MailingList       : http://bucardo.org/list.html
+  bugtracker        : http://bucardo.org/bugs.html
+  repository        : http://bucardo.org/repo.html
+  license           : http://bucardo.org/license.html
+meta-spec:
+  version           : 1.3
+  url               : http://module-build.sourceforge.net/META-spec-v1.3.html
+generated_by        : emacs

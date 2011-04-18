@@ -1,0 +1,392 @@
+[GSM is Greg Sabino Mullane <greg@endpoint.com> <greg@turnstep.com> ]
+
+Bucardo version 4.4.0, released October 14, 2009
+
+  - Allow validate_goat() to work correctly against pgbouncer databases by 
+    respecting the server_side_prepares parameter. [GSM]
+
+  - Loosen restrictions on customcode - now the derived columns must match 
+    the target, but the target and source tables can be completely different. [GSM]
+
+  - Add the bucardo_audit() function that runs on all master databases, ensures 
+    that everything related to the bucardo_* control tables is correct.
+    [Josh Tolley and GSM]
+
+  - Fix bucardo_ctl add sync ... tables=x - now adds the sync on first pass, 
+    even if the tables have not been added. [GSM]
+
+  - Adding customcode via bucardo_ctl can now specify sync, goat, priority, 
+    and active columns. [GSM]
+
+  - When viewing customcode via 'bucardo_ctl list code foo', the src_code column 
+    is shown last. [GSM]
+
+  - Add some small sleeps before checking for stale pid files, to allow their owners 
+    a chance to clean them up first. [GSM]
+
+  - Give a warning when kicking an inactive sync. [GSM]
+
+  - Remove 'text' casting which prevented 'bucardo_ctl inspect' from working on 
+    older versions of Postgres. [GSM]
+
+  - Allow testing of multiple versions of Postgres at the same time by setting the 
+    environment variables PGBINDIR[A-Z]. [GSM]
+
+Bucardo version 4.3.0, released October 8, 2009
+
+  - Allow MCP and CTL to kill based on piddir, not just audit_pid. This will prevent duplicate 
+    kids from existing if audit_pid is switched off. [GSM]
+
+  - Fix error in lowest/highest conflict handling. [Mathieu Arnold]
+
+  - Add new column to customcode: trigrules. Defaults to false: if true, 
+    we turn on triggers and rules for the duration of the custom code. [GSM]
+
+  - Add a new configuration value 'host_safety_check', to help prevent 
+    Bucardo from being copied from one host to another and then run 
+    without modifying at least bucardo.db.dbhost first. [GSM]
+
+  - For custom code exception handlers, make the 'dbi_error' hash key return 
+    a flattened string of the actual exception thrown. [GSM]
+
+  - Ensure exiting processes always remove their pidfile. [GSM]
+
+  - Have the MCP clean up old pid files from the piddir on startup. [GSM]
+
+  - Remove the 'pidfile' configuration option: now hard-coded to 'bucardo.mcp.pid' [GSM]
+
+  - Make the pid file names more consistent, add new ones for kid processes. [GSM]
+
+  - Refactor the killing of pids, make safer by checking they are bucardo-like [GSM]
+
+  - Remove the PIDCLEANUP option from Bucardo.pm [GSM]
+
+  - Better upgrading of very old versions of Bucardo. [GSM]
+
+  - Allow add, remove, and list customcode through bucardo_ctl [GSM]
+
+  - Allow bucardo_ctl upgrade to remove configuration settings. [GSM]
+
+Bucardo version 4.2.2, released October 2, 2009
+
+  - Fix so that warning_file works properly again. [GSM]
+
+Bucardo version 4.2.1, released October 1, 2009
+
+  - Improve ability of 'bucardo_ctl upgrade' to work against older
+    versions of Bucardo [GSM]
+
+  - Changed the chunking threshold for pushdelta to 100,000 and 10,000 [GSM]
+
+  - Make bucardo_ctl list table|sequence follow same wildcard rules as 
+    other list nouns. [GSM]
+
+  - Remove the old 'alter' verb from bucardo_ctl: use 'update' instead [GSM]
+
+  - Fix a SQL error in 'bucardo_ctl status <sync> [GSM]
+
+  - Remove the unused t/bucardo.test.data file [GSM]
+
+Bucardo version 4.2.0, released September 30, 2009
+
+  - Add the "delta_bypass" feature, which allows a pushdelta sync to switch 
+    to 'fullcopy' mode on the fly, depending on the number of rows that 
+    have changed. [GSM]
+
+  - Fixed an error preventing customselect from working in certain situations. [GSM]
+
+  - Have 'bucardo_ctl install' check for successful plperlu installation. [GSM]
+
+  - Clean up and standardize all the bucardo_ctl list/add/remove actions. [GSM]
+
+Bucardo version 4.1.2, released September 25, 2009
+
+ - Fix sequence replication by setting is_called properly on the targets
+   [GSM, thanks to Selena Deckelmann for discovering this]
+
+ - Respect server_side_prepares db setting in validate_sync. Previously, 
+   this function would fail if validating more than one table at a time 
+   and the database was set as server_side_prepares off [GSM]
+
+ - Make sure we cast rowid* to text within the bucardo_add_delta-called 
+   functions, for picky versions of Postgres. [GSM]
+
+Bucardo version 4.1.1, released September 24, 2009
+
+ - Fix case where Bucardo was too eager to lock tables post serialization 
+   failures. Since we can't really do this automatically and safely, 
+   remove the code in question for now. [GSM, hat tip to Selena Deckelmann]
+
+Bucardo version 4.1.0, released September 24, 2009
+
+  - Fix problem with possible function name collision when the names 
+    of the combined columns in the primary key is greater than NAMEDATALEN, 
+    which we'll assume is 63. [GSM]
+
+  - Add "bucardo_ctl inspect table" to show all dependencies, as well 
+    as cross referencing against herds the table is in [GSM]
+
+  - Fix an error when validate_sync tries to recreate an existing trigger; 
+    occurred when a fullcopy sync was set to ping=true [GSM]
+
+  - When using "bucardo_ctl add all tables db=<name>", make sure we only 
+    look for the already added tables for that specific database.
+    [Selena Deckelmann and Josh Tolley]
+
+  - Add new boolean column to the "db" table named "server_side_prepares", which 
+    is true by default. If off, Bucardo will not use server-side prepared 
+    statements, and thus can be used in PgBouncer's transaction mode.
+    [GSM, idea by Andrew Spencer]
+
+  - During pushdelta, break large number of rows for a single table until multiple 
+    DELETE and COPY calls, to help debugging, to allow for a progress indicator 
+    both at the Bucardo and Postgres levels, and to prevent crashes seen on 
+    older versions of Postgres when very large IN() lists are used. [GSM]
+
+  - When using "bucardo_ctl add all tables", ignore any tables inside 
+    schemas starting with 'bucardo' [GSM]
+
+  - Allow --verbose flag for list syncs to show linked tables [GSM]
+
+  - Allow --verbose flag for list tables to show linked herds and syncs [GSM]
+
+  - Change rebuild_index to a smallint: a 1 only runs it with a fullcopy.
+    If you really want to use it otherwise, set it to 2 [GSM]
+
+  - Allow the dbhost to be turned off (local socket only) in the db table 
+    when using "bucardo_ctl update db <name> host=non. [GSM]
+
+
+Bucardo version 4.0.3, released September 16, 2009
+
+  - Fix some minor problems with bucardo_ctl and "add sync" [GSM]
+
+  - Allow ping to be specified for new tables added via "add sync" [GSM]
+
+
+Bucardo version 4.0.2, released September 16, 2009
+
+  - Add the name of the database to the install choices, as some systems 
+    have mismatched names (BSD's 'pgsql' user) [Vilem Kebrt]
+
+  - Clear out stale q entries on startup, created when a kid was hit with a 
+    kill -9. This was causing Bucardo to think the q slot was still active. [GSM]
+
+  - Fix cases where we were not quoting the UNLISTEN names [GSM]
+
+  - Remove duplicate PID numbers from log [GSM]
+
+  - Prohibit syncs from having names reserved for synctypes. [GSM]
+
+  - Add new delete method of "truncate_cascade" for syncs [GSM]
+
+  - Allow "foo*", "*foo", and "*foo*" wildcard format in bucardo_ctl 
+    when specifying syncs, e.g. bucardo_ctl kick ABC* [GSM]
+
+  - Allow special cases for bucardo_ctl kick: "all [synctype] [active]" [GSM]
+
+  - Allow filtering of 'bucardo_ctl list syncs' by synctype [GSM]
+
+  - Allow 'bucardo_ctl add sync tables=...' to work with schema.table format [GSM]
+
+  - Add --verbose option to 'bucardo_ctl list syncs' to show tables [GSM]
+
+  - Allow name changes for syncs, herds, dbs, dbgroups [GSM]
+
+  - Automatically add missing tables when doing 
+    "bucardo_ctl add sync source=dbname ... tables=x,y,z" [GSM]
+
+  - Allow multiple items to be changed at one time with 'bucardo_ctl update item' [GSM]
+
+  - Change validate_sync notice to LOG [GSM]
+
+
+Bucardo version 4.0.1, released September 8, 2009
+
+  - Fix to allow "add all tables db=foo" to work as expected. [GSM]
+
+  - Set audit_pid to be off by default. [GSM]
+
+  - Fix broken WHERE clause inside bucardo_ctl for "add table" [GSM]
+
+
+Version 4.0.0, released September 7, 2009
+
+New features:
+
+  - Add support for multi-column primary keys. Thanks to Backcountry.com. [GSM]
+
+  - Add new 'onetimecopy' attribute to sync table, to allow recreation on 
+    demand of pushdelta tables on slaves via COPY. [GSM]
+
+  - Support for replication after TRUNCATE. This will only work on 
+    Postgres version 8.4 and higher, and only pushdelta syncs. [GSM]
+
+  - Add log_conflict_details to allow logging of conflict information 
+    to a separate file. [Adam Wendt]
+
+  - Add 'maxkicks' and 'lifetime' to syncs to force restart of controller 
+    and kids after a certain number of kicks or time. [Josh Tolley]
+    Thanks to Backcountry.com.
+
+  - Allow replication of sequences. [GSM]
+
+  - Add the bucardo_custom_trigger table, which allows tight control of exactly 
+    what items in a table will be replicated. [Ben Allen]
+
+  - Add the bucardo_rate table to track exactly how long replication takes
+    on a per-sync and per-table basis. [GSM]
+
+  - Add more bucardo_ctl actions: install, reload, validate, restart, update [GSM]
+
+  - Allow adding of all tables and sequences in a database at once via bucardo_ctl [GSM]
+
+  - Add in bucardo_compress_delta function, to remove duplicate rows from 
+    the bucardo_delta table. [GSM]
+
+  - Allow the injection of custom messages into the Bucardo logs, and make 
+    an interface for same in bucardo_ctl. [GSM]
+
+  - Add the "warning_file" config parameter to log all 'Warning' messages. [GSM]
+
+  - Add validate_all_syncs() function, and allow an argument to both that 
+    and validate_sync() to force recreation of supporting objects. [GSM]
+
+Enhancements:
+
+  - Remove 'Moose' dependency. [GSM]
+
+  - Remove disable_triggers and disable_rules from the sync table. 
+    We simply choose pg_class or replica based on the version of the 
+    database in question. [GSM]
+
+  - Rewrite the pushdelta sync method to be more efficient and safer. [GSM]
+
+  - Change from Mail::Sendmail to Net::SMTP [Ben Allen]
+
+  - Allow wildcards in the 'bucardo_ctl kick' [Josh Tolley]
+
+  - Improve the FreeBSD scripts/bucardo_ctl.rc file [Ben Allen]
+
+  - Add "sendmail" option to the customcode input. [Ben Allen]
+
+  - Add 'bucardo_ctl upgrade' to make intra-version upgrades easy 
+    and automatic. [Selena Deckelmann and GSM]
+
+  - Add more tests and improve existing ones. [Josh Tolley]
+
+  - Force READ WRITE mode so Bucardo works on read only databases. [GSM]
+
+  - Make the audit_pid table more useful. Use sequences instead of 
+    PIDs to find children. Allow for the audit_pid table to be toggled off. [GSM]
+
+  - Remove the debugstderr and debugstdout options, as they never worked 
+    correctly anyway. [GSM]
+
+  - When truncating during fullcopy, fallback to delete if it fails. [GSM]
+
+  - On startup, all syncs that may have trigger-based notifies are 
+    initially kicked. [GSM]
+
+  - MCP listens for pings during table validations. [GSM]
+
+  - Have master_q use a trigger, not multiple rules. Remove the need 
+    for a separate create_child_q() function. [GSM]
+
+  - Default for log_showtime is now 'scalar localtime' rather than 
+    epoch seconds. [GSM]
+
+  - No longer require a reason for the "stop" action. [GSM]
+
+  - Add INSTALL_BUCARDODIR for quick and dirty 'make install' [GSM]
+
+Bug fixes:
+
+  - Fix failure to disable/enable triggers when using pg_class and table 
+    and schema are words changed by quote_ident. [Ben Allen]
+
+  - Tolerate incompatibility in DEFAULT of negative numbers between 
+    Postgres 8.2 and 8.3. [Jon Jensen]
+
+  - Do better checking of bucardo_ctl executable when MCP is restarting. [Ben Allen]
+
+  - Change timestamp to timestamptz where needed inside Bucardo.pm [Yan Farmawan]
+
+  - Put schema in db_getconn calls [Alex Bahlai]
+
+  - Record the proper PID for the MCP in the pid file [Goran Gugic]
+
+  - Set the tcp_* defaults in bucardo_config to zero (system default). [GSM]
+
+  - Allow for dead columns when checking attnums. [GSM]
+
+  - Do not attempt respawn of MCP if mcp_dbproblem_sleep is 0. [GSM]
+
+
+Bucardo version 3.1.0, released April 6, 2008
+
+  - Fix race condition in bucardo_delta/bucardo_track updates 
+    for pushdelta syncs. [GSM]
+
+  - Auto-detect primary keys (or unique indexes) for added tables. [GSM]
+
+  - Add update_bucardo_schema.pl to facilitate version changes. [GSM]
+
+  - Use correct quoted/non-quoted versions of primary keys to allow 
+    primary keys with spaces, etc. [GSM]
+
+  - Add new options to log_showtime to show non-epoch time strings [GSM]
+
+  - Make bucardo_ctl use the global version number, not its own. [GSM]
+
+  - Support bytea in primary key and regular columns. [GSM]
+
+
+Bucardo version 3.0.9, released March 26, 2008
+
+  - Fix problem causing killed controller to not re-do interrupted syncs 
+    on restart. [GSM]
+
+
+Bucardo version 3.0.8, released February 5, 2008
+
+  - Fix error in 'latest' conflict code. [Adam Wendt].
+
+  - Filter out inactive target dbs from bucardo-report script.
+    [Spencer Christensen <schristensen@backcountry.com>]
+
+  - Fix race condition in bucardo_delta/bucardo_track updates 
+    for pushdelta syncs. [GSM]
+
+  - Fix a sorting problem in the bucardo-report script. [Jon Jensen <jon@endpoint.com>]
+
+  - Fix problem with after_sync code not firing at correct time for staylive kids. [GSM]
+
+
+Bucardo version 3.0.7, released October 11, 2007
+
+ - Allow bucardo_ctl options to be specified in a .bucardorc file. [GSM]
+
+ - Add new index to bucardo_delta for faster purging. [GSM]
+
+ - Add a BSD-style rc file in the scripts directory. [Ben Allen <bsa@lanl.gov>]
+
+ - Activate the "latest" standard_conflict method. [GSM]
+
+ - Fix error for tables with primary key and no other columns in pushdelta/swap syncs, 
+   per report from Ben Allen. [GSM]
+
+ - Change pid and ppid columns in table "q" from smallint to integer. [Ben Allen <bsa@lanl.gov>]
+
+ - Ensure sourcedbh used by customcode has inactivedestroy set. [GSM]
+
+ - Find system grep rather than hard-coding the path [Jeff Boes <jeff@endpoint.com>]
+
+ - Fix for tests: make third database have a default password. [GSM]
+
+ - Add ping method to CTL and KID processes. [GSM]
+
+
+Bucardo version 3.0.6 - First public release, September 1, 2007
+
+

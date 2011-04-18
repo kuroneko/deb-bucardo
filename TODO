@@ -1,0 +1,46 @@
+TODO list for Bucardo
+=====================
+
+These range the gamut from wildly speculative ideas to must-have features.
+
+- Have Bucardo do the cleanups based on PG version, rather than cronjobs
+  (e.g. vacuum pg_listener, purge_bucardo_delta)
+- Implement "log shipping" for pushdelta slaves. This could be done by creating 
+  a SQL dump consisting of DELETE from <tab> WHERE pk IN (...); COPY <tab> 
+  FROM STDIN; ...
+- Death-level custom code hooks
+- Better conflict example in test suite, uses database handles
+- Make timeslices for master_q adjustable
+- Allow more data types for pkey on goats
+- Handle partitioned tables
+- Allow notification emails to be regex sorted, e.g. serialization warnings
+- Make bucardo_ctl use same algorithm as bucardo-report for grabbing sync history
+- Have bucardo_ctl give details on KILLED syncs while kicking
+- Address all XXX and TODO inside Bucardo.pm
+- Have a single table track current status of each sync/target combo. This would 
+  allow the controller to do smarter things, and would make the reporting much faster
+- Add a pause mode
+- Add exception code for DELETE
+- Purge or move audit_pid on startup
+- Break logging into named levels
+- I8n all messages/docs/etc.
+- Allow targets to be hard-linked: nobody goes on until everyone has finished
+- Support large objects
+- Support system tables (Postgres 12.0?)
+- Check for superuser on startup, to prevent errors that only show when a KID tries something.
+- Add a flag that allows for table structure checking before each sync
+- Make a Bucardo bundle for CPAN-like fun
+- Optimize swaps: use COPY if only new stuff on both sides. If exception, fall back
+- Readonly slaves: trigger/rule to prevent with good message
+- bucardo_help() function to explain all
+- Handle non-orderable data types such as polygons
+- Put this list into a bug tracker
+- Document all LISTEN/NOTIFY strings in one area
+- Use 2PC where possible
+- Consider intra-kid communication to copy tables one-by-one to keep things in cache
+- Use DBD::Pg async mode to reduce waiting, esp. for multi-master
+- Consider failover strategies
+- Log validate_sync changes somewhere, add rollback statements
+- Consider keeping long-term stats for a sync/table: total rows transferred, etc.
+- Add support for manual DDL changes (in progress)
+- Add support for automatic DDL changes (in progress)
