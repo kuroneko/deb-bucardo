@@ -13,7 +13,7 @@ use 5.008003;
 use strict;
 use warnings;
 
-our $VERSION = '4.4.3';
+our $VERSION = '4.4.4';
 
 use sigtrap qw( die normal-signals ); ## Call die() on HUP, INT, PIPE, or TERM
 use Config;                           ## Used to map signal names
@@ -2888,7 +2888,7 @@ sub start_controller {
                                 ## Connect to the source database
                                 my $srcdbh = $self->connect_database($sourcedb);
                                 ## Create a list of all targets
-                                my $targetlist = join ',' => map { s/\'/''/g; qq{'$_'} } keys %$targetdb;
+                                my $targetlist = join ',' => map { s/\'/''/g; s{\\}{\\\\}go; qq{'$_'} } keys %$targetdb;
                                 my $numtargets = keys %$targetdb;
                                 for my $g (@{$sync->{goatlist}}) {
 
@@ -4825,7 +4825,7 @@ sub start_kid {
                     ## Build a list of all PK values
                     my $pkvals = '';
                     for my $row (@$info) {
-                        my $inner = join ',' => map { s/\'/''/go; qq{'$_'}; } @$row;
+                        my $inner = join ',' => map { s/\'/''/go; s{\\}{\\\\}go; qq{'$_'}; } @$row;
                         $pkvals .= $g->{pkcols} > 1 ? "($inner)," : "$inner,";
                     }
                     chop $pkvals;
@@ -4876,7 +4876,7 @@ sub start_kid {
                                 my $dcount = 0;
                                 my $delcount = 0;
                                 for my $row (@$info) {
-                                    my $inner = join ',' => map { s/\'/''/go; qq{'$_'}; } @$row;
+                                    my $inner = join ',' => map { s/\'/''/go; s{\\}{\\\\}go; qq{'$_'}; } @$row;
                                     ## Put this group of pks into a temporary array
                                     $delchunks[$delcount] .= $g->{pkcols} > 1 ? "($inner)," : "$inner,";
                                     ## Once we reach out limit, start appending to the next bit of the array
@@ -4924,6 +4924,7 @@ sub start_kid {
                             my $buffer = '';
                             $self->glog(qq{Begin COPY to $S.$T});
 
+							my $rows_copied = 0;
                             if ($source_modern_copy and @delchunks) {
                                 my $dcount = 1;
                                 for my $chunk (@delchunks) {
@@ -4933,6 +4934,7 @@ sub start_kid {
                                     $dcount++;
                                     while ($sourcedbh->pg_getcopydata($buffer) >= 0) {
                                         $targetdbh->pg_putcopydata($buffer);
+										$rows_copied++;
                                     }
                                 }
                             }
@@ -4940,12 +4942,12 @@ sub start_kid {
                                 $sourcedbh->do($srccmd);
                                 while ($sourcedbh->pg_getcopydata($buffer) >= 0) {
                                     $targetdbh->pg_putcopydata($buffer);
+									$rows_copied++;
                                 }
                             }
 
                             $targetdbh->pg_putcopyend();
-                            $self->glog(qq{End COPY to $S.$T});
-                            $dmlcount{allinserts}{target} += $dmlcount{I}{target}{$S}{$T} = @$info;
+                            $dmlcount{allinserts}{target} += $dmlcount{I}{target}{$S}{$T} = $rows_copied;
 
                             if (! $source_modern_copy) {
                                 $self->glog("Dropping temporary table $temptable");
@@ -5491,6 +5493,7 @@ sub start_kid {
                         }
                         else {
                             (my $safepkval = $pkval) =~ s/\'/''/go;
+							$safepkval =~ s{\\}{\\\\}go;
                             push @safepk => qq{'$safepkval'};
                         }
                     }
@@ -5502,6 +5505,7 @@ sub start_kid {
                             }
                             else {
                                 (my $safepkval = $pk) =~ s/\'/''/go;
+								$safepkval =~ s{\\}{\\\\}go;
                                 push @safepk => qq{'$safepkval'};
                             }
                         }
@@ -6233,7 +6237,7 @@ Bucardo - Postgres multi-master replication system
 
 =head1 VERSION
 
-This document describes version 4.4.3 of Bucardo
+This document describes version 4.4.4 of Bucardo
 
 =head1 WEBSITE
 
