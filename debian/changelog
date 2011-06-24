@@ -1,3 +1,11 @@
+bucardo (4.4.4-1) unstable; urgency=low
+
+  * New version of Bucardo
+  * Added patch to set session authorization in bucardo.schema script (Closes: #630785)
+  * Improved instructions in README.Debian
+
+ -- Nicholas Jefferson <nicholas@pythonic.com.au>  Tue, 21 Jun 2011 11:58:50 +1000
+
 bucardo (4.4.3-1) unstable; urgency=low
 
   * New version of Bucardo
