@@ -1,0 +1,13 @@
+diff -Nur bucardo-4.4.4/bucardo.schema bucardo-4.4.4.new/bucardo.schema
+--- bucardo-4.4.4/bucardo.schema	2011-06-21 14:42:32.673483387 +1000
++++ bucardo-4.4.4.new/bucardo.schema	2011-06-21 14:56:06.745509641 +1000
+@@ -12,7 +12,8 @@
+ ALTER USER bucardo SET search_path = bucardo;
+ SET CLIENT_MIN_MESSAGES = 'WARNING';
+ 
+-\c bucardo bucardo
++\c bucardo
++SET SESSION AUTHORIZATION bucardo;
+ 
+ -- plpgsql and plperlu are loaded, but just in case:
+ SET client_min_messages = 'FATAL';
