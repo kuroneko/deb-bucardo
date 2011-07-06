@@ -1,8 +1,13 @@
 bucardo (4.4.5-1) unstable; urgency=low
 
+  [ Nicholas Jefferson ]
   * New version of Bucardo
 
- -- Nicholas Jefferson <nicholas@pythonic.com.au>  Wed, 06 Jul 2011 10:31:53 +1000
+  [ Michael Meskes ]
+  * Bumped Standards-Version to 3.9.2, no changes needed.
+  * Added source/format file.
+
+ -- Michael Meskes <meskes@debian.org>  Wed, 06 Jul 2011 09:46:56 +0200
 
 bucardo (4.4.4-1) unstable; urgency=low
 
