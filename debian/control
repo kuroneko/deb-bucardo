@@ -1,6 +1,7 @@
 Source: bucardo
 Priority: optional
 Maintainer: Nicholas Jefferson <nicholas@pythonic.com.au>
+Uploaders: Michael Meskes <meskes@debian.org>
 Build-Depends: cdbs, debhelper (>= 5), perl (>= 5.10.0)
 Standards-Version: 3.9.1
 Section: database
