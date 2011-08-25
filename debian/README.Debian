@@ -2,7 +2,7 @@ Bucardo for Debian
 ------------------
 
 To use Bucardo, install PL/Perl on the database server (which is available in
-the "postgresql-plperl-9.0" package on Debian systems) and, as a PostgreSQL
+the "postgresql-plperl-*" package on Debian systems) and, as a PostgreSQL
 superuser, execute:
 
     psql --file /usr/share/bucardo/bucardo.schema
