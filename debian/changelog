@@ -1,3 +1,11 @@
+bucardo (4.4.6-1) unstable; urgency=low
+
+  * Also support PostgreSQL 9.1 as dependency.
+  * Imported Upstream version 4.4.6
+  * Converted patch system to quilt.
+
+ -- Michael Meskes <meskes@debian.org>  Thu, 25 Aug 2011 13:08:22 +0200
+
 bucardo (4.4.5-1) unstable; urgency=low
 
   [ Nicholas Jefferson ]

@@ -1,0 +1,4 @@
+01-pod2man-output.patch
+02-schema-config.patch
+03-debugdir.patch
+04-session-authorization.patch
