@@ -1,3 +1,9 @@
+bucardo (4.4.8-1) unstable; urgency=low
+
+  * Imported Upstream version 4.4.8
+
+ -- Michael Meskes <meskes@debian.org>  Fri, 23 Dec 2011 11:40:26 +0100
+
 bucardo (4.4.6-1) unstable; urgency=low
 
   * Also support PostgreSQL 9.1 as dependency.
