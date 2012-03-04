@@ -13,7 +13,7 @@
 
 NAME=bucardo
 DESC="PostgreSQL replication system"
-DAEMON=/usr/bin/bucardo_ctl
+DAEMON=/usr/bin/bucardo
 PIDFILE=/var/run/bucardo/bucardo.mcp.pid
 
 test -x $DAEMON || exit 0

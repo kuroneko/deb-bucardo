@@ -1,34 +1,34 @@
-diff -Nur bucardo-4.4.2/bucardo.schema bucardo-4.4.2.new/bucardo.schema
---- bucardo-4.4.2/bucardo.schema	2011-03-17 11:27:22.000000000 +1100
-+++ bucardo-4.4.2.new/bucardo.schema	2011-03-27 16:19:27.345146453 +1100
-@@ -126,8 +126,8 @@
- log_showtime|3|Show timestamp in the log output?  0=off  1=seconds since epoch  2=scalar gmtime  3=scalar localtime
+diff -Nur bucardo/bucardo.schema bucardo.new/bucardo.schema
+--- bucardo/bucardo.schema	2011-03-17 11:27:22.000000000 +1100
++++ bucardo.new/bucardo.schema	2011-03-27 16:19:27.345146453 +1100
+@@ -135,9 +135,9 @@
+ log_showlevel|0|Show log level in the log output?
  log_showline|0|Show line number in the log output?
- log_conflict_details|0|Log detailed conflict data?
+ log_showtime|3|Show timestamp in the log output?  0=off  1=seconds since epoch  2=scalar gmtime  3=scalar localtime
 -log_conflict_file|bucardo_conflict.log|Name of the conflict detail log file
--warning_file|bucardo.warning.log|File containing all log lines starting with "Warning"
 +log_conflict_file|/var/log/bucardo/conflict.log|Name of the conflict detail log file
+ log_level|NORMAL|How verbose to make the logging. Higher is more verbose.
+-warning_file|bucardo.warning.log|File containing all log lines starting with "Warning"
 +warning_file|/var/local/bucardo/warning.log|File containing all log lines starting with "Warning"
  \.
  
  -- Versioning
-@@ -142,8 +142,8 @@
- COPY bucardo.bucardo_config(setting,value,about)
+@@ -153,15 +153,15 @@
  FROM STDIN
  WITH DELIMITER '|';
+ bucardo_vac|1|Do we want the automatic VAC daemon to run?
 -default_email_from|nobody@example.com|Who the alert emails are sent as
 -default_email_to|nobody@example.com|Who to send alert emails to
 +default_email_from|root|Who the alert emails are sent as
 +default_email_to|root|Who to send alert emails to
  default_email_host|localhost|Which host to send email through
+ default_standard_conflict|bucardo_latest|Default conflict method for all syncs
  email_debug_file||File to save a copy of all outgoing emails to
+ flatfile_dir|.|Directory to store the flatfile output inside of
  host_safety_check||Regex to make sure we don't accidentally run where we should not
-@@ -151,7 +151,7 @@
- max_delete_clause|200|Maximum number of items to delete inside of IN() clauses
- max_select_clause|500|Maximum number of items to select inside of IN() clauses
  piddir|/var/run/bucardo|Directory holding Bucardo PID files
 -reason_file|bucardo.restart.reason.log|File to hold reasons for stopping and starting
 +reason_file|/var/log/bucardo/restart.reason|File to hold reasons for stopping and starting
+ semaphore_table|bucardo_status|Table to let apps know a sync is ongoing
+ statement_chunk_size|10000|How many primary keys to shove into a single statement
  stats_script_url|http://www.bucardo.org/|Location of the stats script
- stopfile|fullstopbucardo|Name of the semaphore file used to stop Bucardo processes
- syslog_facility|LOG_LOCAL1|Which syslog facility level to use

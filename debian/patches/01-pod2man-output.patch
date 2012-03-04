@@ -1,12 +1,12 @@
-diff -Nur bucardo-4.4.2/Makefile.PL bucardo-4.4.2.new/Makefile.PL
---- bucardo-4.4.2/Makefile.PL	2011-03-17 11:27:22.000000000 +1100
-+++ bucardo-4.4.2.new/Makefile.PL	2011-03-27 16:16:05.569146631 +1100
-@@ -26,7 +26,7 @@
-     NO_META      => 1,
+diff -Nur bucardo/Makefile.PL bucardo.new/Makefile.PL
+--- bucardo/Makefile.PL	2011-03-17 11:27:22.000000000 +1100
++++ bucardo.new/Makefile.PL	2011-03-27 16:16:05.569146631 +1100
+@@ -31,7 +31,7 @@
+     NEEDS_LINKING => 0,
      VERSION_FROM => 'Bucardo.pm',
-     EXE_FILES    => ['bucardo_ctl'],
--    MAN1PODS     => { 'bucardo_ctl' => 'blib/man1/bucardo_ctl.1pm' },
-+    MAN1PODS     => { 'bucardo_ctl' => 'blib/man1/bucardo_ctl.1p' },
+     EXE_FILES    => ['bucardo'],
+-    MAN1PODS     => { 'bucardo' => 'blib/man1/bucardo.1p' },
++    MAN1PODS     => { 'bucardo' => 'blib/man1/bucardo.1pm' },
      NORECURS     => 1,
-     clean        => { FILES => 'log.bucardo.* *~ *.tmp outgoingmail.* bucardo_test_database*/' },
  );
+ 

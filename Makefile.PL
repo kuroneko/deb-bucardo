@@ -4,10 +4,11 @@ use warnings;
 use 5.008003;
 
 ## No version.pm for this one, as the prereqs are not loaded yet.
-my $VERSION = '4.4.8';
+my $VERSION = '4.99.3';
 
 WriteMakefile(
     NAME         => 'Bucardo',
+    clean        => { FILES => 'log.bucardo.* *~ *.tmp outgoingmail.* bucardo_test_database*/ test.sqlite.db' },
     ABSTRACT     => 'Postgres asynchronous multi-master replication system',
     AUTHOR       => 'Greg Sabino Mullane <greg@endpoint.com>',
     LICENSE      => 'BSD',
@@ -22,13 +23,16 @@ WriteMakefile(
                      'IO::Handle'          => '1.24',
                      'Sys::Hostname'       => '1.11',
                      'Sys::Syslog'         => '0.13',
+					 'File::Spec'          => '0',
+					 'MIME::Base64'        => '0',
+					 'boolean'             => '0',
                  },
     NO_META      => 1,
+    NEEDS_LINKING => 0,
     VERSION_FROM => 'Bucardo.pm',
-    EXE_FILES    => ['bucardo_ctl'],
-    MAN1PODS     => { 'bucardo_ctl' => 'blib/man1/bucardo_ctl.1pm' },
+    EXE_FILES    => ['bucardo'],
+    MAN1PODS     => { 'bucardo' => 'blib/man1/bucardo.1p' },
     NORECURS     => 1,
-    clean        => { FILES => 'log.bucardo.* *~ *.tmp outgoingmail.* bucardo_test_database*/' },
 );
 
 package MY;
@@ -38,11 +42,11 @@ sub clean {
 	$string =~ s{\t}{\tperl t/98-cleanup\.t\n\t};
 	$string .= qq{\n\nhtml : \n\t};
     $string .= qq{\t\$(NOECHO) pod2html Bucardo.pm > Bucardo.pm.html\n};
-    $string .= qq{\t\$(NOECHO) pod2html bucardo_ctl > bucardo_ctl.html\n};
+    $string .= qq{\t\$(NOECHO) pod2html bucardo > bucardo.html\n};
     $string .= qq{\t\$(NOECHO) \$(RM_F) pod*.tmp pm_to_blib\n};
-    $string .= qq{\t\$(NOECHO) \$(PERL) -pi -e "s/<link.*?>//" Bucardo.pm.html bucardo_ctl.html\n};
-    $string .= qq{\t\$(NOECHO) \$(PERL) -pi -e "s~\\`\\`(.+?)''~&quot;\\1&quot;~g" Bucardo.pm.html bucardo_ctl.html\n};
-    $string .= qq{\t\$(NOECHO) \$(ECHO) Created Bucardo.pm.html and bucardo_ctl.html\n};
+    $string .= qq{\t\$(NOECHO) \$(PERL) -pi -e "s/<link.*?>//" Bucardo.pm.html bucardo.html\n};
+    $string .= qq{\t\$(NOECHO) \$(PERL) -pi -e "s~\\`\\`(.+?)''~&quot;\\1&quot;~g" Bucardo.pm.html bucardo.html\n};
+    $string .= qq{\t\$(NOECHO) \$(ECHO) Created Bucardo.pm.html and bucardo.html\n};
 	return $string;
 }
 

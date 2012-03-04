@@ -13,6 +13,7 @@ profile-strictness = quiet
 [-ControlStructures::ProhibitMutatingListFunctions]
 [-Subroutines::ProhibitNestedSubs] 
 [-ValuesAndExpressions::ProhibitAccessOfPrivateData]
+[-Subroutines::ProhibitExplicitReturnUndef]
 
 ##
 ## Four:
@@ -48,11 +49,13 @@ profile-strictness = quiet
 [-ErrorHandling::RequireCheckingReturnValueOfEval]
 [-InputOutput::ProhibitBacktickOperators]
 [-Lax::ProhibitComplexMappings::LinesNotStatements]
+[-Miscellanea::ProhibitUnrestrictedNoCritic]
 [-Modules::ProhibitExcessMainComplexity]
 [-Modules::ProhibitUseQuotedVersion]
 [-RegularExpressions::ProhibitComplexRegexes]
 [-RegularExpressions::RequireExtendedFormatting]
 [-Subroutines::ProhibitExcessComplexity]
+[-Subroutines::ProhibitManyArgs]
 [-ValuesAndExpressions::ProhibitImplicitNewlines]
 [-Variables::ProhibitPackageVars]
 [-ValuesAndExpressions::ProhibitVersionStrings]
@@ -61,6 +64,7 @@ profile-strictness = quiet
 ## Two:
 ##
 
+[-Bangs::ProhibitCommentedOutCode]
 [-Bangs::ProhibitFlagComments]
 [-BuiltinFunctions::ProhibitBooleanGrep]
 [-CodeLayout::ProhibitQuotedWordLists]
@@ -69,7 +73,7 @@ profile-strictness = quiet
 [-Editor::RequireEmacsFileVariables]
 [-Lax::ProhibitEmptyQuotes::ExceptAsFallback]
 ## This one really ought to be removed entirely:
-## Giving too many false positives in bucardo_ctl:
+## Giving too many false positives in bucardo:
 [-Miscellanea::ProhibitUselessNoCritic]
 [-Miscellanea::RequireRcsKeywords]
 [-References::ProhibitDoubleSigils]
@@ -88,6 +92,7 @@ profile-strictness = quiet
 ## One:
 ##
 
+[-BuiltinFunctions::ProhibitReverseSortBlock]
 [-CodeLayout::ProhibitParensWithBuiltins]
 [-CodeLayout::RequireTidyCode]
 [-Documentation::PodSpelling]

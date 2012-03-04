@@ -2,7 +2,7 @@
 
 set -e
 
-DAEMON=/usr/bin/bucardo_ctl
+DAEMON=/usr/bin/bucardo
 
 if [ -f /etc/default/bucardo ] ; then
 	. /etc/default/bucardo
