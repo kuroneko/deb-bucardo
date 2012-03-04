@@ -1,7 +1,6 @@
-
 Bucardo.pm
 bucardo.schema
-bucardo_ctl
+bucardo
 
 SIGNATURE
 README
@@ -21,21 +20,24 @@ scripts/README
 scripts/bucardo_rrd
 scripts/bucardo-report
 scripts/check_bucardo_sync
-scripts/bucardo_ctl.rc
+scripts/bucardo.rc
 scripts/slony_migrator.pl
 
 Bucardo.pm.html
-bucardo_ctl.html
+bucardo.html
 
 ## Testing-related stuff
 .perlcriticrc
-t/00-release.t
 t/01-basic.t
-t/09-uniqueconstraint.t
-t/15-star.t
+t/02-bctl-db.t
+t/02-bctl-dbg.t
+t/20-drizzle.t
+t/20-mongo.t
+t/20-mysql.t
+t/20-oracle.t
+t/20-sqlite.t
 t/98-cleanup.t
 t/99-signature.t
 t/BucardoTesting.pm
-t/truncate_test_logs.notest
 
-patches/Bucardo.4.4.0.fix.search.path.patch.txt
+

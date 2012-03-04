@@ -2,7 +2,7 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
-<title>bucardo_ctl - utility script for controlling the Bucardo program</title>
+<title>bucardo - utility script for controlling the Bucardo program</title>
 <meta http-equiv="content-type" content="text/html; charset=utf-8" />
 
 </head>
@@ -43,67 +43,67 @@
 <p>
 </p>
 <h1><a name="name">NAME</a></h1>
-<p>bucardo_ctl - utility script for controlling the Bucardo program</p>
+<p>bucardo - utility script for controlling the Bucardo program</p>
 <p>
 </p>
 <hr />
 <h1><a name="version">VERSION</a></h1>
-<p>This document describes version 4.4.8 of bucardo_ctl</p>
+<p>This document describes version 4.99.3 of bucardo</p>
 <p>
 </p>
 <hr />
 <h1><a name="synopsis">SYNOPSIS</a></h1>
 <pre>
-  ./bucardo_ctl install</pre>
+  ./bucardo install</pre>
 <pre>
-  ./bucardo_ctl list dbs</pre>
+  ./bucardo list dbs</pre>
 <pre>
-  ./bucardo_ctl add sync testsync source=herd1 type=pushdelta targetdb=B</pre>
+  ./bucardo add sync testsync source=herd1 type=pushdelta targetdb=B</pre>
 <pre>
-  ./bucardo_ctl add sync testsync source=herd1 type=pushdelta targetdb=B tables=tab1,tab2,tab3</pre>
+  ./bucardo add sync testsync source=herd1 type=pushdelta targetdb=B tables=tab1,tab2,tab3</pre>
 <pre>
-  ./bucardo_ctl add database newdb name=internal_name port=5432 host=myserver</pre>
+  ./bucardo add database newdb dbname=internal_name port=5432 host=myserver</pre>
 <pre>
-  ./bucardo_ctl add all tables db=foo</pre>
+  ./bucardo add all tables db=foo [herd=x] [pkonly]</pre>
 <pre>
-  ./bucardo_ctl add all sequences db=foo</pre>
+  ./bucardo add all sequences db=foo [herd=x]</pre>
 <pre>
-  ./bucardo_ctl add herd newherd table1 table2 table3 ...</pre>
+  ./bucardo add herd newherd table1 table2 table3 ...</pre>
 <pre>
-  ./bucardo_ctl add dbgroup name db1 db2 db3 ...</pre>
+  ./bucardo add dbgroup name db1 db2 db3 ...</pre>
 <pre>
-  ./bucardo_ctl start &quot;Starting up - Greg&quot;</pre>
+  ./bucardo start &quot;Starting up - Greg&quot;</pre>
 <pre>
-  ./bucardo_ctl stop &quot;Bringing down for debugging - Raul E.&quot;</pre>
+  ./bucardo stop &quot;Bringing down for debugging - Raul E.&quot;</pre>
 <pre>
-  ./bucardo_ctl ping</pre>
+  ./bucardo ping</pre>
 <pre>
-  ./bucardo_ctl status</pre>
+  ./bucardo status</pre>
 <pre>
-  ./bucardo_ctl status sync1 sync2</pre>
+  ./bucardo status sync1 sync2</pre>
 <pre>
-  ./bucardo_ctl kick sync1 sync2</pre>
+  ./bucardo kick sync1 sync2</pre>
 <pre>
-  ./bucardo_ctl kick sync1 0</pre>
+  ./bucardo kick sync1 0</pre>
 <pre>
-  ./bucardo_ctl reload_config</pre>
+  ./bucardo reload_config</pre>
 <pre>
-  ./bucardo_ctl upgrade</pre>
+  ./bucardo upgrade</pre>
 <pre>
-  ./bucardo_ctl reload sync</pre>
+  ./bucardo reload sync</pre>
 <pre>
-  ./bucardo_ctl validate sync</pre>
+  ./bucardo validate sync</pre>
 <pre>
-  ./bucardo_ctl message &quot;Your message here&quot;</pre>
+  ./bucardo message &quot;Your message here&quot;</pre>
 <pre>
-  ./bucardo_ctl config show</pre>
+  ./bucardo config show</pre>
 <pre>
-  ./bucardo_ctl config set foo=bar baz=123</pre>
+  ./bucardo config set foo=bar baz=123</pre>
 <p>
 </p>
 <hr />
 <h1><a name="description">DESCRIPTION</a></h1>
-<p>The bucardo_ctl script is the main interaction to a running Bucardo instance. It can 
+<p>The bucardo script is the main interaction to a running Bucardo instance. It can 
 be used to start and stop Bucardo, add new items, kick syncs, and even install and 
 upgrade Bucardo itself. For more complete documentation, please view the wiki at:</p>
 <p><a href="http://bucardo.org/">http://bucardo.org/</a></p>
@@ -115,7 +115,7 @@ upgrade Bucardo itself. For more complete documentation, please view the wiki at
 <dt><strong><a name="install" class="item"><strong>install</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl install</p>
+<p>Usage: ./bucardo install</p>
 <p>Attempts to install the Bucardo schema from the file 'bucardo.schema' into an existing 
 Postgres cluster. The user 'bucardo' and database 'bucardo' will be created first as needed.
 This is an interactive installer, but you can supply the following values from the command 
@@ -134,16 +134,16 @@ line:</p>
 <dt><strong><a name="upgrade" class="item"><strong>upgrade</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl upgrade</p>
-<p>Upgrades an existing Bucardo installation to the current version of the bucardo_ctl script. 
-Requires that the bucardo_ctl script and the bucardo.schema file be the same version. All 
+<p>Usage: ./bucardo upgrade</p>
+<p>Upgrades an existing Bucardo installation to the current version of the bucardo script. 
+Requires that the bucardo script and the bucardo.schema file be the same version. All 
 changes should be backwards compatible, but you may need to re-validate existing scripts 
 to make sure changes get propagated to all databases.</p>
 </dd>
 <dt><strong><a name="start" class="item"><strong>start</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl start &quot;Reason --name&quot;</p>
+<p>Usage: ./bucardo start &quot;Reason --name&quot;</p>
 <p>Restarts Bucardo cleanly by first issuing the equivalent of a stop to ask any existing Bucardo 
 processes to exit, and then starting a new Bucardo MCP process. A short reason and name should 
 be provided - these are logged in the reason_file file and sent in the email sent when Bucardo 
@@ -155,7 +155,7 @@ exit with a return value of 2.</p>
 <dt><strong><a name="stop" class="item"><strong>stop</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl stop &quot;Reason --name&quot;</p>
+<p>Usage: ./bucardo stop &quot;Reason --name&quot;</p>
 <p>Forces Bucardo to quit by creating a stop file which all MCP, CTL, and KID processes should 
 detect and cause them to exit. Note that active syncs will not exit right away, as they 
 will not look for the stop file until they have finished their current run. Typically, 
@@ -167,7 +167,7 @@ is also used by Bucardo when it exits and sends out mail about its death.</p>
 <dt><strong><a name="list" class="item"><strong>list</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl list &lt;type&gt; &lt;regex&gt;</p>
+<p>Usage: ./bucardo list &lt;type&gt; &lt;regex&gt;</p>
 <p>Lists summary information about databases, tables, sequences, syncs, or herds. Adding anything 
 after the type will look up all matching entries.</p>
 </dd>
@@ -175,9 +175,9 @@ after the type will look up all matching entries.</p>
 
 <dd>
 <p>Usage:  add &lt;item_type&gt; &lt;item_name&gt;</p>
-<p>Usage:  add database &lt;dbname&gt; name=internal_name port=xxx host=xxx user=xxx pass=xxx service=xxx conn=xxx sourcelimit=xxx targetlimit=xxx ssp=1/0</p>
-<p>Usage:  add table [schema].table db=internal_db_name ping=bool standard_conflict=xxx makedelta=bool herd=xxx</p>
-<p>Usage:  add all tables herd=xxx</p>
+<p>Usage:  add database &lt;dbname&gt; dbname=internal_name port=xxx host=xxx user=xxx pass=xxx service=xxx conn=xxx sourcelimit=xxx targetlimit=xxx ssp=1/0</p>
+<p>Usage:  add table [schema].table db=internal_db_name ping=bool standard_conflict=xxx herd=xxx</p>
+<p>Usage:  add all tables [herd=xxx] [pkonly]</p>
 <p>Usage:  add sequence [schema].table herd=xxx</p>
 <p>Usage:  add all sequences herd=xxx</p>
 <p>Usage:  add sync syncname options</p>
@@ -197,11 +197,11 @@ dbgroup, herd, sync, table, and sequence.</p>
 <dt><strong><a name="kick" class="item"><strong>kick</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl kick &lt;syncname(s)&gt; [timeout]</p>
+<p>Usage: ./bucardo kick &lt;syncname(s)&gt; [timeout]</p>
 <p>Tells one or more named syncs to fire as soon as possible. Note that this simply sends a request that 
 the sync fire: it may not start right away if the same sync is already running, or if the source or 
 target database has exceeded the number of allowed Bucardo connections. If the final argument is a 
-number, it is treated as a timeout. If this number is zero, the bucardo_ctl command will not return 
+number, it is treated as a timeout. If this number is zero, the bucardo command will not return 
 until the sync has finished. For any other number, the sync will wait at most that number of seconds. 
 If any sync has not finished before the timeout, a false value is returned. In all other cases, a 
 true value is returned.</p>
@@ -218,14 +218,14 @@ information is loaded.</p>
 <dt><strong><a name="show" class="item"><strong>show</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl show &lt;all|setting1&gt; [setting2..]</p>
+<p>Usage: ./bucardo show &lt;all|setting1&gt; [setting2..]</p>
 <p>Shows the current values in the bucardo_config table. Use the keyword 'all' to see all the settings, or 
 specify one or more search terms.</p>
 </dd>
 <dt><strong><a name="set" class="item"><strong>set</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl set setting1=value [setting2=value]</p>
+<p>Usage: ./bucardo set setting1=value [setting2=value]</p>
 <p>Sets one or more items inside the bucardo_config table. Setting names are case-insensitive.</p>
 </dd>
 <dt><strong><a name="ping" class="item"><strong>ping</strong></a></strong></dt>
@@ -238,52 +238,40 @@ was returned, the program will exit with a value of 0. If it times out, the valu
 <dt><strong><a name="status" class="item"><strong>status</strong></a></strong></dt>
 
 <dd>
-<p>Usage: ./bucardo_ctl status [syncname(s)] [--sort=#] [--daysback=#] [--showdays]</p>
-<p>Shows the current status of all known syncs in a tabular format. If given one or more syncnames, 
-shows detailed information for each one.</p>
-<p>When showing all syncs, the columns are:</p>
+<p>Usage: ./bucardo status [syncname(s)] [--sort=#] [--showdays] [--compress]</p>
+<p>Shows the brief status of all known syncs in a tabular format. If given one or more syncnames, 
+shows detailed information for each one. To see detailed information for all syncs, simply 
+use 'status all'.</p>
+<p>When showing brief information, the columns are:</p>
 <ol>
 <li><strong><a name="name" class="item"><strong>Name</strong></a></strong>
 
 <p>The name of the sync</p>
 </li>
-<li><strong><a name="type" class="item"><strong>Type</strong></a></strong>
-
-<p>The type of the sync. <code>F</code> = fullcopy, <code>S</code> = swap, <code>P</code> = pushdelta. In addition, if a sync is overdue, a <code>O!</code> will 
-appear, and if it is expired, a <code>E!</code> will appear.</p>
-</li>
 <li><strong><a name="state" class="item"><strong>State</strong></a></strong>
 
-<p>The current status of this sync. If no sync is running, <code>idle</code> will appear. If a sync has been requested, but has not 
-started yet, <code>WAIT</code> will appear, along with how long since the sync was requested. If a sync is 
-currently running, <code>RUN</code> will appear, followed by the amount of time the sync has been running, followed by which 
-target the sync is running against. Note that syncs running to more than one database at a time will only show 
-the one most recently started.</p>
+<p>The state of the sync. Can be 'Good', 'Bad', 'Empty', or 'No records found'</p>
 </li>
-<li><strong><a name="pid" class="item"><strong>PID</strong></a></strong>
+<li><strong><a name="last_good" class="item"><strong>Last good</strong></a></strong>
 
-<p>The PID of the current sync's controller (CTL). Note that if this is not a persistent sync and the state is <code>idle</code>, 
-this is merely a historical record and does not represent an active process.</p>
-</li>
-<li><strong><a name="last_good" class="item"><strong>Last_good</strong></a></strong>
-
-<p>How long since this sync last ran successfully. Remember that this is affected by the --daysback parameter.</p>
+<p>When the sync last successfully ran.</p>
 </li>
 <li><strong><a name="time" class="item"><strong>Time</strong></a></strong>
 
-<p>The amount of time the last successful sync took to run.</p>
+<p>How long it has been since the last sync success</p>
 </li>
-<li><strong><a name="i_" class="item"><strong>I/U/D</strong></a></strong>
+<li><strong><a name="last_i_u" class="item"><strong>Last I/U</strong></a></strong>
 
-<p>The number of inserts. updates, and deletes performed by the last successful sync.</p>
+<p>The number of insert and deletes performed by the last successful sync. May also show 
+the number of rows truncated (T) or conflicted (C), if applicable.</p>
 </li>
-<li><strong><a name="last_bad" class="item"><strong>Last_bad</strong></a></strong>
+<li><strong><a name="last_bad" class="item"><strong>Last bad</strong></a></strong>
 
-<p>How long since this sync failed to run successfully. Strongly affected by the --daysback parameter.</p>
+<p>When the sync last failed.</p>
 </li>
 <li><strong><a name="time2" class="item"><strong>Time</strong></a></strong>
 
-<p>The amount of time the last failed sync took before it was aborted.</p>
+<p>How long it has been since the last sync failure</p>
 </li>
 </ol>
 </dd>
@@ -330,17 +318,17 @@ as they will not change very often if at all.</p>
 <dt><strong><a name="verbose" class="item"><strong>--verbose</strong></a></strong></dt>
 
 <dd>
-<p>Makes bucardo_ctl run verbosely. Default is off.</p>
+<p>Makes bucardo run verbosely. Default is off.</p>
 </dd>
 <dt><strong><a name="quiet" class="item"><strong>--quiet</strong></a></strong></dt>
 
 <dd>
-<p>Tells bucardo_ctl to be as quiet as possible. Default is off.</p>
+<p>Tells bucardo to be as quiet as possible. Default is off.</p>
 </dd>
 <dt><strong><a name="help" class="item"><strong>--help</strong></a></strong></dt>
 
 <dd>
-<p>Shows a brief summary of usage for bucardo_ctl.</p>
+<p>Shows a brief summary of usage for bucardo.</p>
 </dd>
 </dl>
 <p>
@@ -371,11 +359,6 @@ via a cronjob, so turning --notimer on will simply print the entire message with
 <h2><a name="status_arguments">Status arguments</a></h2>
 <p>The following arguments are only used with the 'status' command:</p>
 <dl>
-<dt><strong><a name="daysback" class="item"><strong>--daysback=#</strong></a></strong></dt>
-
-<dd>
-<p>Sets how many days backwards to search the old 'q' logs for information. Defaults to 3 days.</p>
-</dd>
 <dt><strong><a name="showdays" class="item"><strong>--showdays</strong></a></strong></dt>
 
 <dd>
@@ -404,7 +387,7 @@ the sort order.</p>
 
 <dd>
 <p>Tells Bucardo whether or not to send mail on interesting events: startup, shutdown, and errors. Default is on.
-Only applicable when using ./bucardo_ctl start.</p>
+Only applicable when using ./bucardo start.</p>
 </dd>
 <dt><strong><a name="extraname_string" class="item"><strong>--extraname=string</strong></a></strong></dt>
 
@@ -455,19 +438,17 @@ the current directory will be used if found. If not found, then the file <em cla
 the file /etc/bucardorc will be used if available. The format of the file is option = value, one per line. Any 
 line starting with a '#' will be skipped. Any values loaded from a bucardorc file will be overwritten by 
 command-line options. All bucardorc files can be ignored by supplying a <code>--no-bucardorc</code> argument. A specific 
-file can be forced with the <code>--bucardorc=file</code> option; if this option is set, bucardo_ctl will refuse to run 
+file can be forced with the <code>--bucardorc=file</code> option; if this option is set, bucardo will refuse to run 
 unless that file can be read.</p>
 <p>
 </p>
 <hr />
 <h1><a name="environment_variables">ENVIRONMENT VARIABLES</a></h1>
-<p>The bucardo_ctl script uses <em>$ENV{HOME}</em> to look for a <em class="file">.bucardorc</em> file.</p>
+<p>The bucardo script uses <em>$ENV{HOME}</em> to look for a <em class="file">.bucardorc</em> file.</p>
 <p>
 </p>
 <hr />
 <h1><a name="bugs">BUGS</a></h1>
-<p>The 'status' command does not yet return current information, and the start time in particular should be 
-taken with a grain of salt.</p>
 <p>Bug reports and feature requests are always welcome, please visit <a href="http://bucardo.org">http://bucardo.org</a> or email <a href="mailto:bucardo-general@bucardo.org.">bucardo-general@bucardo.org.</a></p>
 <p>
 </p>
