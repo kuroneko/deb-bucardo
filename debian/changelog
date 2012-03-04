@@ -1,6 +1,7 @@
-bucardo (4.99.3-1) unstable; urgency=low
+bucardo (4.99.3-1) UNRELEASED; urgency=low
 
   * Imported Upstream version 4.99.3
+  * Bumped Standards-Version to 3.9.3, no changes needed.
 
  -- Michael Meskes <meskes@debian.org>  Sun, 04 Mar 2012 13:05:08 +0100
 
