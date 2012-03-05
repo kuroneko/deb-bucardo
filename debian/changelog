@@ -5,6 +5,7 @@ bucardo (4.99.3-1) UNRELEASED; urgency=low
   * Do not try to upgrade bucardo when coming from version 4.
   * Package now removes homedir (if empty) and locks user account on purge.
     (Closes: #656465)
+  * Added 'status' option to init file.
 
  -- Michael Meskes <meskes@debian.org>  Mon, 05 Mar 2012 15:28:36 +0100
 
