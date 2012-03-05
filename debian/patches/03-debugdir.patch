@@ -1,0 +1,12 @@
+diff -Nur bucardo/bucardo bucardo.new/bucardo
+--- bucardo/bucardo	2011-03-17 11:27:22.000000000 +1100
++++ bucardo.new/bucardo	2011-03-27 16:24:57.156683374 +1100
+@@ -58,7 +58,7 @@
+               sendmail     => 0,
+               extraname    => '',
+               debugfilesep => 0,
+-              debugdir     => '.',
++              debugdir     => '/var/log/bucardo',
+               debugname    => '',
+               debugsyslog  => 1,
+               debugfile    => 1,
