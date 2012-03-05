@@ -18,8 +18,14 @@ configure)
 		fi
 	done
 	if [ "$ENABLED" != "0" ] ; then
-		su bucardo --command "$DAEMON upgrade batch" || true
-		su bucardo --command "$DAEMON validate all" || true
+		# Do not try crossing the 4/5 boundary.
+		if `su bucardo --command "psql -c 'select 1 from syncrun' bucardo" > /dev/null`; then
+			su bucardo --command "$DAEMON upgrade batch" || true
+			su bucardo --command "$DAEMON validate all" || true
+		else
+			echo "Sorry, but Bucardo version 4 cannot be upgraded to version 5";
+			echo "You will have to recreate your information (dbs, syncs, etc.)";
+		fi
 	fi
 	;;
 abort-upgrade|abort-remove|abort-deconfigure)
