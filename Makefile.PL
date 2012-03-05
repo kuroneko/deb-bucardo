@@ -31,7 +31,7 @@ WriteMakefile(
     NEEDS_LINKING => 0,
     VERSION_FROM => 'Bucardo.pm',
     EXE_FILES    => ['bucardo'],
-    MAN1PODS     => { 'bucardo' => 'blib/man1/bucardo.1p' },
+    MAN1PODS     => { 'bucardo' => 'blib/man1/bucardo.1pm' },
     NORECURS     => 1,
 );
 
