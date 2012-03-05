@@ -2,8 +2,11 @@ bucardo (4.99.3-1) UNRELEASED; urgency=low
 
   * Imported Upstream version 4.99.3
   * Bumped Standards-Version to 3.9.3, no changes needed.
+  * Do not try to upgrade bucardo when coming from version 4.
+  * Package now removes homedir (if empty) and locks user account on purge.
+    (Closes: #656465)
 
- -- Michael Meskes <meskes@debian.org>  Sun, 04 Mar 2012 13:05:08 +0100
+ -- Michael Meskes <meskes@debian.org>  Mon, 05 Mar 2012 15:28:36 +0100
 
 bucardo (4.4.8-1) unstable; urgency=low
 

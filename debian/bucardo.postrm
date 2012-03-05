@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -e
+
+# Lock user account
+if [ "$1" = "purge" ]; then
+	usermod -L -e 1 bucardo
+fi
+
+#DEBHELPER#
+

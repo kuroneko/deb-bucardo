@@ -10,8 +10,13 @@ fi
 
 case "$1" in
 configure)
-	adduser --system --group --gecos "bucardo" --home /var/lib/bucardo --shell /bin/sh bucardo
-	for file in /etc/bucardorc /var/log/bucardo ; do
+	# Create dedicated bucardo user
+	if ! getent passwd bucardo > /dev/null; then
+		adduser --system --group --gecos "bucardo" --home /var/lib/bucardo --no-create-home --shell /bin/bash bucardo
+	fi
+	# Unlock account, it may have been locked by an earlier package removal
+	usermod -U -e '' bucardo
+	for file in /etc/bucardorc /var/log/bucardo /var/lib/bucardo; do
 		if [ -e $file ] && ! dpkg-statoverride --list $file >/dev/null ; then
 			chown bucardo:bucardo $file
 			chmod o-o $file
