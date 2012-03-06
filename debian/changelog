@@ -6,6 +6,7 @@ bucardo (4.99.3-1) unstable; urgency=low
   * Package now removes homedir (if empty) and locks user account on purge.
     (Closes: #656465)
   * Added 'status' option to init file.
+  * Added dependency on libboolean-perl.
 
  -- Michael Meskes <meskes@debian.org>  Mon, 05 Mar 2012 15:28:36 +0100
 
