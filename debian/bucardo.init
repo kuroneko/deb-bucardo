@@ -55,7 +55,7 @@ stop)
 	log_end_msg 0
 	;;
 status)
-	status_of_proc "$DAEMON" watchdog
+	status_of_proc -p "$PIDFILE" bucardo
 	;;
 *)
 	log_action_msg "Usage: $0 {start|force-reload|reload|restart|stop}" >&2
