@@ -16,7 +16,7 @@ configure)
 	fi
 	# Unlock account, it may have been locked by an earlier package removal
 	usermod -U -e '' bucardo
-	for file in /etc/bucardorc /var/log/bucardo /var/lib/bucardo; do
+	for file in /etc/bucardorc /var/log/bucardo /var/lib/bucardo /var/run/bucardo; do
 		if [ -e $file ] && ! dpkg-statoverride --list $file >/dev/null ; then
 			chown bucardo:bucardo $file
 			chmod o-o $file
