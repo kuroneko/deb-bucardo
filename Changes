@@ -1,6 +1,12 @@
 [ GSM is Greg Sabino Mullane <greg@endpoint.com> <greg@turnstep.com> ]
 
-Bucardo version 5.0.0, released ??, 2011
+Bucardo version 5.0.0, released ??, 2012
+
+  - Complete rework of Bucardo: we now allow as many source and target 
+    databases as wanted in a single sync. [GSM]
+
+  - Allow alternate targets: Drizzle, MariaDB, MongoDB, MySQL, Oracle, Redis, 
+    SQLite, as well as "flat files" [GSM]
 
   - Rename bucardo_ctl to simply bucardo [Jon Jensen, GSM]
 
@@ -36,6 +42,8 @@ Bucardo version 5.0.0, released ??, 2011
   - Add new subprocess (VAC) to run bucardo_purge_delta. [GSM]
 
   - Fix errors with bytea and swap syncs. [GSM]
+
+  - Do not replicate null values to MongoDB [Ali Asad Lotia]
 
   - Add 'default_standard_conflict' option, per idea from Franz Dürr. [GSM]
 
@@ -89,6 +97,8 @@ Bucardo version 5.0.0, released ??, 2011
 
   - Automatically create the bucardo (superuser) if we can connect as 'postgres'. [GSM]
 
+  - Add 'bucardo list all' feature [Christian Recktenwald]
+
   - Allow removal of tables from herds via bucardo. [GSM]
 
   - Add create_child_q_table() function. [GSM]
@@ -111,6 +121,28 @@ Bucardo version 5.0.0, released ??, 2011
   - Show each target's Postgres version, time, and timezone on first connect. [GSM]
 
   - Change main trigger names to 'bucardo_delta' and 'bucardo_kick' [GSM]
+
+
+Bucardo version 4.4.8, released November 30, 2011
+
+  - Fix incorrect checking of hostname for host_safety_check [GSM]
+
+  - Fix wrong version number in the bucardo_ctl script.
+
+
+Bucardo version 4.4.7, released November 8, 2011
+
+  - Fix bug when using multi-column primary keys where the first 
+    is an int, and the second is not. Reported by Brady S Edwards [GSM]
+
+  - Do not rely on $@ to catch important evals [GSM]
+
+
+Bucardo version 4.4.6, released July 10, 2011
+
+  - Fix bug resulting in wrong escapes in swap syncs for int4 primary keys
+    Reported by Kiriakos Tsourapas. [GSM]
+
 
 Bucardo version 4.4.5, released June 18, 2011
 
