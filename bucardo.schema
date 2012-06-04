@@ -1,6 +1,6 @@
 
 -- Schema for the main Bucardo database
--- Version 4.99.3
+-- Version 4.99.5
 
 -- Should be run as a superuser
 -- This should not need to be run directly: use either
@@ -14,7 +14,6 @@
 SET client_min_messages = 'FATAL';
 CREATE USER bucardo SUPERUSER;
 CREATE DATABASE bucardo OWNER bucardo;
-ALTER DATABASE bucardo SET search_path = bucardo, public;
 
 \c bucardo bucardo
 
@@ -23,6 +22,7 @@ SET client_min_messages = 'FATAL';
 CREATE LANGUAGE plpgsql;
 CREATE LANGUAGE plperlu;
 CREATE SCHEMA bucardo;
+ALTER DATABASE bucardo SET search_path = bucardo, public;
 
 -- The above were allowed to fail, because there is no harm if the objects
 -- already existed. From this point forward however, we suffer no errors
@@ -48,18 +48,18 @@ $bc$;
 -- Main bucardo configuration information
 --
 CREATE TABLE bucardo.bucardo_config (
-  setting  TEXT        NOT NULL, -- short unique name, maps to %config inside Bucardo
-  value    TEXT        NOT NULL,
+  name     TEXT        NOT NULL, -- short unique name, maps to %config inside Bucardo
+  setting  TEXT        NOT NULL,
   about    TEXT            NULL, -- long description
   type     TEXT            NULL, -- sync or goat
-  name     TEXT            NULL, -- which specific sync or goat
+  item     TEXT            NULL, -- which specific sync or goat
   cdate    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE bucardo.bucardo_config IS $$Contains configuration variables for a specific Bucardo instance$$;
 
-CREATE UNIQUE INDEX bucardo_config_unique ON bucardo.bucardo_config(LOWER(setting)) WHERE name IS NULL;
+CREATE UNIQUE INDEX bucardo_config_unique ON bucardo.bucardo_config(LOWER(name)) WHERE item IS NULL;
 
-CREATE UNIQUE INDEX bucardo_config_unique_name ON bucardo.bucardo_config(setting,name,type) WHERE name IS NOT NULL;
+CREATE UNIQUE INDEX bucardo_config_unique_name ON bucardo.bucardo_config(name,item,type) WHERE item IS NOT NULL;
 
 ALTER TABLE bucardo.bucardo_config ADD CONSTRAINT valid_config_type CHECK (type IN ('sync','goat'));
 
@@ -71,16 +71,16 @@ BEGIN
 
   NEW.setting = LOWER(NEW.setting);
 
-  IF (NEW.type IS NOT NULL and NEW.name IS NULL) THEN
+  IF (NEW.type IS NOT NULL and NEW.item IS NULL) THEN
     RAISE EXCEPTION 'Must provide a specific %', NEW.type;
   END IF;
 
-  IF (NEW.name IS NOT NULL and NEW.type IS NULL) THEN
+  IF (NEW.item IS NOT NULL and NEW.type IS NULL) THEN
     RAISE EXCEPTION 'Must provide a type if giving a name';
   END IF;
 
-  IF (NEW.setting = 'sync' OR NEW.setting = 'goat') THEN
-    RAISE EXCEPTION 'Invalid setting name';
+  IF (NEW.name = 'sync' OR NEW.name = 'goat') THEN
+    RAISE EXCEPTION 'Invalid configuration name';
   END IF;
 
   RETURN NEW;
@@ -95,13 +95,13 @@ CREATE TRIGGER check_bucardo_config
   FOR EACH ROW EXECUTE PROCEDURE bucardo.check_bucardo_config();
 
 -- Sleep times (all in seconds)
-COPY bucardo.bucardo_config(setting,value,about)
+COPY bucardo.bucardo_config("name",setting,about)
 FROM STDIN
 WITH DELIMITER '|';
-mcp_loop_sleep|0.5|How long does the main MCP daemon sleep between loops?
+mcp_loop_sleep|0.2|How long does the main MCP daemon sleep between loops?
 mcp_dbproblem_sleep|15|How many seconds to sleep before trying to respawn
 mcp_vactime|60|How often in seconds do we check that a VAC is still running?
-ctl_sleep|0.5|How long does the controller loop sleep?
+ctl_sleep|0.2|How long does the controller loop sleep?
 kid_sleep|0.5|How long does a kid loop sleep?
 kid_nodeltarows_sleep|0.5|How long do kids sleep if no delta rows are found?
 kid_serial_sleep|10|How long to sleep in seconds if we hit a serialization error
@@ -113,7 +113,7 @@ vac_run|30|How often does the VAC process run?
 
 
 -- Various timeouts (times are in seconds)
-COPY bucardo.bucardo_config(setting,value,about)
+COPY bucardo.bucardo_config("name",setting,about)
 FROM STDIN
 WITH DELIMITER '|';
 mcp_pingtime|60|How often do we ping check the MCP?
@@ -127,7 +127,7 @@ tcp_keepalives_count|0|How many probes to send. 0 indicates sticking with system
 
 
 -- Logging
-COPY bucardo.bucardo_config(setting,value,about)
+COPY bucardo.bucardo_config(name,setting,about)
 FROM STDIN
 WITH DELIMITER '|';
 log_microsecond|0|Show microsecond output in the timestamps?
@@ -141,15 +141,15 @@ warning_file|bucardo.warning.log|File containing all log lines starting with "Wa
 \.
 
 -- Versioning
-COPY bucardo.bucardo_config(setting,value,about)
+COPY bucardo.bucardo_config(name,setting,about)
 FROM STDIN
 WITH DELIMITER '|';
-bucardo_version|4.99.3|Bucardo version this schema was created with
-bucardo_current_version|4.99.3|Current version of Bucardo
+bucardo_version|4.99.5|Bucardo version this schema was created with
+bucardo_current_version|4.99.5|Current version of Bucardo
 \.
 
 -- Other settings:
-COPY bucardo.bucardo_config(setting,value,about)
+COPY bucardo.bucardo_config(name,setting,about)
 FROM STDIN
 WITH DELIMITER '|';
 bucardo_vac|1|Do we want the automatic VAC daemon to run?
@@ -170,7 +170,7 @@ syslog_facility|LOG_LOCAL1|Which syslog facility level to use
 \.
 
 -- Unused at the moment:
-COPY bucardo.bucardo_config(setting,value,about)
+COPY bucardo.bucardo_config(name,setting,about)
 FROM STDIN
 WITH DELIMITER '|';
 autosync_ddl|newcol|Which DDL changing conditions do we try to remedy automatically?
@@ -493,7 +493,7 @@ CREATE TABLE bucardo.customname (
 );
 
 ALTER TABLE bucardo.customname ADD CONSTRAINT customname_sane_name
-  CHECK (newname ~ E'^[a-zA-Z0-9_.~]+$');
+  CHECK (newname ~ E'^[a-zA-Z 0-9_.~]+$');
 
 ALTER TABLE bucardo.customname
   ADD CONSTRAINT customname_db_fk
@@ -630,6 +630,10 @@ BEGIN
       || '!'
       || SUBSTRING(MD5(tname) FROM 1 FOR 10);
   END IF;
+
+  -- We let Postgres worry about the quoting details
+  SELECT INTO newname quote_ident(newname);
+
   RETURN newname;
 END;
 $bc$;
@@ -648,6 +652,7 @@ AS $bc$
 ## Postgres: a connection string, username, password, and attribs
 ## Drizzle: a connection string, username, and password
 ## Mongo: "foo: bar" style connection information, one per line
+## MariaDB: a connection string, username, and password
 ## MySQL: a connection string, username, and password
 ## Oracle: a connection string, username, and password
 ## Redis: "foo: bar" style connection information, one per line
@@ -740,7 +745,7 @@ if ($dbtype eq 'mongo') {
    return $connstring;
 }
 
-if ($dbtype eq 'mysql') {
+if ($dbtype eq 'mysql' or $dbtype eq 'mariadb') {
 
     length $db{name} or elog(ERROR, qq{Database name is mandatory\n});
     length $db{user} or elog(ERROR, qq{Database username is mandatory\n});
@@ -753,7 +758,7 @@ if ($dbtype eq 'mysql') {
 
     return "$dbtype\n$connstring\n$db{user}\n$db{pass}";
 
-} ## end mysql
+} ## end mysql/mariadb
 
 if ($dbtype eq 'oracle') {
 
@@ -1090,24 +1095,7 @@ CREATE TRIGGER validate_goat
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 -- this is spaced so the func starts at at at even lint for debugging help
-
 CREATE OR REPLACE FUNCTION bucardo.validate_sync(text,integer)
 RETURNS TEXT
 LANGUAGE plperlu
@@ -1222,10 +1210,9 @@ if ($role{source} < 1) {
     die "Invalid database group: at least one database must have a role of 'source'!\n";
 }
 
-## If we have at least one target (or more than one source), we must have PKs on each table
-my $fullcopyonly = 1;
-if ($role{target} >= 1 or $role{source} > 1) { ## in other words, not just fullcopy
-    $fullcopyonly = 0;
+## Unless we are fullcopy, we must have PKs on each table
+my $is_fullcopy = (! $role{target} and $role{fullcopy}) ? 1 : 0;
+if (! $is_fullcopy) {
     for my $schema (sort keys %goat) {
         for my $table (sort keys %{$goat{$schema}}) {
             next if $goat{$schema}{$table}{reltype} ne 'table';
@@ -1284,7 +1271,7 @@ for my $dbname (sort { ($db{$b}{role} eq 'source') <=> ($db{$a}{role} eq 'source
     next if $db{$dbname}{dbtype} =~ /flat/;
 
     ## Skip if this is a non-supported database
-    next if $db{$dbname}{dbtype} =~ /drizzle|mongo|mysql|oracle|redis|sqlite/;
+    next if $db{$dbname}{dbtype} =~ /drizzle|mariadb|mongo|mysql|oracle|redis|sqlite/;
 
     ## Figure out how to connect to this database
     my $rv = spi_exec_query("SELECT bucardo.db_getconn('$dbname') AS conn");
@@ -1372,7 +1359,7 @@ for my $dbname (sort { ($db{$b}{role} eq 'source') <=> ($db{$a}{role} eq 'source
     ## Unless we are strictly fullcopy, put plpgsql in place on all source dbs
     ## We also will need a bucardo schema
     my $role = $db{$dbname}{role};
-    if ($role eq 'source' and ! $fullcopyonly) {
+    if ($role eq 'source' and ! $is_fullcopy) {
         ## Perform the check for plpgsql
         $SQL = q{SELECT count(*) FROM pg_language WHERE lanname = 'plpgsql'};
         my $count = $dbh->selectall_arrayref($SQL)->[0][0];
@@ -1454,6 +1441,34 @@ BEGIN
       || '!'
       || SUBSTRING(MD5(tname) FROM 1 FOR 10);
   END IF;
+  -- We let Postgres worry about the quoting details
+  SELECT INTO newname quote_ident(newname);
+  RETURN newname;
+END;
+\$clone\$;
+
+          };
+          run_sql($SQL,$dbh);
+
+              $SQL = qq{
+                        CREATE OR REPLACE FUNCTION bucardo.bucardo_tablename_maker(TEXT,TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+IMMUTABLE
+AS \$clone\$
+DECLARE
+  newname TEXT;
+BEGIN
+  SELECT INTO newname bucardo.bucardo_tablename_maker(\$1);
+
+  -- If it has quotes around it, we expand the quotes to include the prefix
+  IF (POSITION('"' IN newname) >= 1) THEN
+    newname = REPLACE(newname, '"', '');
+    newname = '"' || \$2 || newname || '"';
+  ELSE
+    newname = \$2 || newname;
+  END IF;
+
   RETURN newname;
 END;
 \$clone\$;
@@ -1517,23 +1532,26 @@ END;
                   SECURITY DEFINER
                   AS \$clone\$
                   DECLARE
-                    deltaname TEXT;
+                    mytable TEXT;
                     myst TEXT;
                   BEGIN
                     INSERT INTO bucardo.bucardo_truncate_trigger(tablename,sname,tname,sync)
                       VALUES (TG_RELID, TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_ARGV[0]);
 
-                    SELECT INTO deltaname
-                      bucardo.bucardo_tablename_maker(TG_TABLE_SCHEMA || '_' || TG_TABLE_NAME);
-
-                    myst = 'TRUNCATE TABLE bucardo.delta_' || deltaname;
+                    SELECT INTO mytable
+                      bucardo.bucardo_tablename_maker(TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, 'delta_');
+                    myst = 'TRUNCATE TABLE bucardo.' || mytable;
                     EXECUTE myst;
 
-                    myst = 'TRUNCATE TABLE bucardo.track_' || deltaname;
+                    SELECT INTO mytable
+                      bucardo.bucardo_tablename_maker(TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, 'track_');
+                    myst = 'TRUNCATE TABLE bucardo.' || mytable;
                     EXECUTE myst;
 
                     -- Not strictly necessary, but nice to have a clean slate
-                    myst = 'TRUNCATE TABLE bucardo.stage_' || deltaname;
+                    SELECT INTO mytable
+                      bucardo.bucardo_tablename_maker(TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, 'stage_');
+                    myst = 'TRUNCATE TABLE bucardo.' || mytable;
                     EXECUTE myst;
 
                     RETURN NEW;
@@ -1748,7 +1766,6 @@ SELECT 'Fixme'::TEXT;
                     AS
                     \$clone\$
                     DECLARE
-                      maker TEXT;
                       deltatable TEXT;
                       tracktable TEXT;
                       myst TEXT;
@@ -1773,12 +1790,10 @@ SELECT 'Fixme'::TEXT;
                       END IF;
 
                       -- Figure out the names of the delta and track tables for this relation
-                      SELECT INTO maker
-                        bucardo.bucardo_tablename_maker(\$2);
                       SELECT INTO deltatable
-                        'delta_' || maker;
+                        bucardo.bucardo_tablename_maker(\$2, 'delta_');
                       SELECT INTO tracktable
-                        'track_' || maker;
+                        bucardo.bucardo_tablename_maker(\$2, 'track_');
                     
                       -- Delete all txntimes from the delta table that:
                       -- 1) Have been used by all syncs listed in bucardo_delta_targets
@@ -1868,7 +1883,9 @@ SELECT 'Fixme'::TEXT;
         if ($count < 1) {
             ## Check for older version of bucardo_sequences table
             $SQL = q{SELECT count(*) FROM pg_attribute WHERE attname = 'targetname' }
-                .q{ AND attrelid = 'bucardo.bucardo_sequences'::regclass};
+                .q{ AND attrelid = (SELECT c.oid FROM pg_class c, pg_namespace n }
+                .q{ WHERE n.oid = c.relnamespace AND n.nspname = 'bucardo' }
+                .q{ AND c.relname = 'bucardo_sequences')};
             $count = $dbh->selectall_arrayref($SQL)->[0][0];
             if ($count < 1) {
                 warn "Dropping older version of bucardo_sequences, then recreating empty\n";
@@ -2091,7 +2108,7 @@ SELECT 'Fixme'::TEXT;
             next if $role ne 'source';
 
             ## If this is a fullcopy only sync, also don't need to go any further
-            next if $fullcopyonly;
+            next if $is_fullcopy;
 
             ## This is a source database and we need to track changes.
             ## First step: a way to add things to the bucardo_delta table
@@ -2104,11 +2121,11 @@ SELECT 'Fixme'::TEXT;
                         ? "btrunc_$syncname"
                             : sprintf 'bucardo_note_trunc_%d', int (rand(88888) + 11111);
                 $sth = $sth{haztrig};
-                $count = $sth->execute("$schema.$table",$trunctrig);
+                $count = $sth->execute(qq{"$schema"."$table"},$trunctrig);
                 if ($count < 1) {
                     $SQL = qq{
           CREATE TRIGGER "$trunctrig"
-          AFTER TRUNCATE ON $schema.$table
+          AFTER TRUNCATE ON "$schema"."$table"
           FOR EACH STATEMENT EXECUTE PROCEDURE bucardo.bucardo_note_truncation('$syncname')
         };
                     run_sql($SQL,$dbh);
@@ -2120,18 +2137,43 @@ SELECT 'Fixme'::TEXT;
             ## Create this table if needed, with one column per PK columns
             $sth = $sth{haztable};
             my $delta_table = "delta_$makername";
-            $count = $sth->execute('bucardo',$delta_table);
+            my $index1_name = "dex1_$makername";
+            my $index2_name = "dex2_$makername";
+            my $deltafunc = "delta_$makername";
+            my $track_table = "track_$makername";
+            my $index3_name = "dex3_$makername";
+            my $stage_table = "stage_$makername";
+            ## Need to account for quoted versions, e.g. names with spaces
+            if ($makername =~ s/"//g) {
+              $delta_table = qq{"delta_$makername"};
+              $index1_name = qq{"dex1_$makername"};
+              $index2_name = qq{"dex2_$makername"};
+              $deltafunc = qq{"delta_$makername"};
+              $track_table = qq{"track_$makername"};
+              $index3_name = qq{"dex3_$makername"};
+              $stage_table = qq{"stage_$makername"};
+            }
+            ## Also need non-quoted versions to feed to execute()
+            (my $noquote_delta_table = $delta_table) =~ s/^"(.+)"$/$1/;
+            (my $noquote_index1_name = $index1_name) =~ s/^"(.+)"$/$1/;
+            (my $noquote_index2_name = $index2_name) =~ s/^"(.+)"$/$1/;
+            (my $noquote_deltafunc = $deltafunc) =~ s/^"(.+)"$/$1/;
+            (my $noquote_track_table = $track_table) =~ s/^"(.+)"$/$1/;
+            (my $noquote_index3_name = $index3_name) =~ s/^"(.+)"$/$1/;
+            (my $noquote_stage_table = $stage_table) =~ s/^"(.+)"$/$1/;
+
+            $count = $sth->execute('bucardo',$noquote_delta_table);
             if ($count < 1) {
                ## Create that table!
                my $pkcols = join ',' => map { qq{"$_"} } split (/\|/ => $tinfo->{pkey});
                $SQL = qq{
-                   CREATE TABLE bucardo."$delta_table"
+                   CREATE TABLE bucardo.$delta_table
                      AS SELECT $pkcols, now()::TIMESTAMPTZ AS txntime
-                        FROM $schema.$table LIMIT 0
+                        FROM "$schema"."$table" LIMIT 0
                };
                run_sql($SQL,$dbh);
                $SQL = qq{
-                   ALTER TABLE bucardo."$delta_table"
+                   ALTER TABLE bucardo.$delta_table
                      ALTER txntime SET NOT NULL,
                      ALTER txntime SET DEFAULT now()
                };
@@ -2139,9 +2181,8 @@ SELECT 'Fixme'::TEXT;
             }
 
             ## Need an index on the txntime column
-            my $index1_name = "dex1_$makername";
             $sth = $sth{hazindex};
-            $count = $sth->execute('bucardo',$index1_name);
+            $count = $sth->execute('bucardo',$noquote_index1_name);
             $sth->finish();
             if ($count < 1) {
                 $SQL = qq{CREATE INDEX $index1_name ON bucardo.$delta_table(txntime)};
@@ -2149,9 +2190,8 @@ SELECT 'Fixme'::TEXT;
             }
 
             ## Need an index on all other columns
-            my $index2_name = "dex2_$makername";
             $sth = $sth{hazindex};
-            $count = $sth->execute('bucardo',$index2_name);
+            $count = $sth->execute('bucardo',$noquote_index2_name);
             $sth->finish();
             if ($count < 1) {
                 my $pkcols = join ',' => map { qq{"$_"} } split (/\|/ => $tinfo->{pkey});
@@ -2164,19 +2204,18 @@ SELECT 'Fixme'::TEXT;
             ## Trigger function to add any changed primary key rows to this new table
             ## TODO: Check for too long of a name
             ## Function is same as the table name?
-            my $deltafunc = "delta_$makername";
 
             my @pkeys = split (/\|/ => $tinfo->{pkey});
 
             $sth = $sth{hazfunc};
-            $count = $sth->execute('bucardo', $deltafunc);
+            $count = $sth->execute('bucardo', $noquote_deltafunc);
             $sth->finish();
             if ($count < 1) {
                  my $new = join ',' => map { qq{NEW."$_"} } @pkeys;
                  my $old = join ',' => map { qq{OLD."$_"} } @pkeys;
                  my $clause = join ' OR ' => map { qq{OLD."$_" <> NEW."$_"} } @pkeys;
                 $SQL = qq{
-        CREATE OR REPLACE FUNCTION bucardo."$deltafunc"()
+        CREATE OR REPLACE FUNCTION bucardo.$deltafunc()
         RETURNS TRIGGER
         LANGUAGE plpgsql
         SECURITY DEFINER
@@ -2232,27 +2271,26 @@ SELECT 'Fixme'::TEXT;
             }
 
             $sth = $sth{haztrig};
-            $count = $sth->execute("$schema.$table", 'bucardo_delta');
+            $count = $sth->execute(qq{"$schema"."$table"}, 'bucardo_delta');
             $sth->finish();
             my $func = $customdeltafunc || $deltafunc;
             if ($count < 1) {
                 $SQL = qq{
         CREATE TRIGGER bucardo_delta
-        AFTER INSERT OR UPDATE OR DELETE ON $schema.$table
-        FOR EACH ROW EXECUTE PROCEDURE bucardo."$func"()
+        AFTER INSERT OR UPDATE OR DELETE ON "$schema"."$table"
+        FOR EACH ROW EXECUTE PROCEDURE bucardo.$func()
       };
                 run_sql($SQL,$dbh);
             }
 
 
             ## Now the 'track' table
-            my $track_table = "track_$makername";
             $sth = $sth{haztable};
-            $count = $sth->execute('bucardo',$track_table);
+            $count = $sth->execute('bucardo',$noquote_track_table);
             $sth->finish();
             if ($count < 1) {
                 $SQL = qq{
-                   CREATE TABLE bucardo."$track_table" (
+                   CREATE TABLE bucardo.$track_table (
                       txntime    TIMESTAMPTZ,
                       target     TEXT
                    );
@@ -2262,8 +2300,7 @@ SELECT 'Fixme'::TEXT;
 
             ## Need to index both columns of the txntime table
             $sth = $sth{hazindex};
-            my $index3_name = "dex3_$makername";
-            $count = $sth->execute('bucardo', $index3_name);
+            $count = $sth->execute('bucardo', $noquote_index3_name);
             $sth->finish();
             if ($count < 1) {
                 $SQL = qq{CREATE INDEX $index3_name ON bucardo.$track_table(target, txntime)};
@@ -2271,14 +2308,13 @@ SELECT 'Fixme'::TEXT;
             }
 
             ## The 'stage' table, which feeds 'track' once targets have committed
-            my $stage_table = "stage_$makername";
             $sth = $sth{haztable};
-            $count = $sth->execute('bucardo',$stage_table);
+            $count = $sth->execute('bucardo',$noquote_stage_table);
             $sth->finish();
             if ($count < 1) {
                 my $unlogged = $dbh->{pg_server_version} >= 90100 ? 'UNLOGGED' : '';
                 $SQL = qq{
-                   CREATE $unlogged TABLE bucardo."$stage_table" (
+                   CREATE $unlogged TABLE bucardo.$stage_table (
                       txntime    TIMESTAMPTZ,
                       target     TEXT
                    );
@@ -2322,7 +2358,7 @@ SELECT 'Fixme'::TEXT;
             ## Skip if ping is false
             $info->{ping} eq 'f' and next TABLE;
             $sth = $sth{haztrig};
-            $count = $sth->execute("$schema.$table", $kickfunc);
+            $count = $sth->execute(qq{"$schema"."$table"}, $kickfunc);
             $sth->finish();
             if ($count < 1) {
                 my $ttrig = $dbh->{pg_server_version} >= 80400 ? ' OR TRUNCATE' : '';
@@ -2353,7 +2389,7 @@ SELECT 'Fixme'::TEXT;
 
 ## Gather information from bucardo_config
 my $config;
-$SQL = 'SELECT setting,value FROM bucardo_config';
+$SQL = 'SELECT name,setting FROM bucardo_config';
 $rv = spi_exec_query($SQL);
 for my $row (@{$rv->{rows}}) {
     $config->{$row->{setting}} = $row->{value};
@@ -2434,7 +2470,7 @@ AS $bc$
     }
     else {
         my $old = $_TD->{old};
-        for my $x (qw(name source targetdb targetgroup synctype ping)) {
+        for my $x (qw(name source targetdb targetgroup ping)) {
             elog(DEBUG, "Checking on $x");
             if (! defined $old->{$x}) {
                 next if ! defined $new->{$x};
@@ -2568,9 +2604,9 @@ CREATE TABLE bucardo.upgrade_log (
 COMMENT ON TABLE bucardo.upgrade_log IS $$Historical record of upgrade actions$$;
 
 INSERT INTO bucardo.upgrade_log(action,summary,version)
-  SELECT 'Initial install', '', value
+  SELECT 'Initial install', '', setting
   FROM bucardo.bucardo_config
-  WHERE setting = 'bucardo_version';
+  WHERE name = 'bucardo_version';
 
 -- Allow users to insert messages in the Bucardo logs
 

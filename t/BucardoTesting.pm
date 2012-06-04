@@ -9,6 +9,7 @@ package BucardoTesting;
 use strict;
 use warnings;
 use DBI;
+use DBD::Pg;
 use Time::HiRes qw/sleep gettimeofday tv_interval/;
 use Cwd;
 use Data::Dumper;
@@ -18,9 +19,13 @@ use vars qw/$SQL $sth $count $COM %dbh/;
 my $DEBUG = $ENV{BUCARDO_DEBUG} || 0;
 
 use base 'Exporter';
-our @EXPORT = qw/%tabletype %tabletypemysql %tabletypeoracle %tabletypesqlite %sequences %val 
+our @EXPORT = qw/%tabletype %tabletypemysql %tabletypemariadb %tabletypeoracle %tabletypesqlite
+                 %sequences %val
                  compare_tables bc_deeply clear_notices wait_for_notice
                  $location $oldherd_msg $newherd_msg $addtable_msg $deltable_msg $nomatch_msg/;
+
+## Special global vars for munging the data
+my (%gsth, %gdbh);
 
 my $dbname = 'bucardo_test';
 
@@ -41,7 +46,7 @@ my $total_errors = 0;
 my %timing;
 
 ## If true, turns off the epoch "time" output at the end of each testing output line
-my $notime = 0;
+my $notime = 1;
 
 my $user = qx{whoami};
 chomp $user;
@@ -60,7 +65,7 @@ our %tabletype =
     (
      'bucardo_test1'  => 'SMALLINT',
      'bucardo_test2'  => 'INT',
-     'bucardo_test3'  => 'BIGINT',
+     'Bucardo_test3'  => 'BIGINT',
      'bucardo_test4'  => 'TEXT',
      'bucardo_test5'  => 'DATE',
      'bucardo_test6'  => 'TIMESTAMP',
@@ -68,13 +73,14 @@ our %tabletype =
      'bucardo_test8'  => 'BYTEA',
      'bucardo_test9'  => 'int_unsigned',
      'bucardo_test10' => 'TIMESTAMPTZ',
+     'bucardo space test' => 'INT',
      );
 
 our %tabletypemysql =
     (
      'bucardo_test1'  => 'SMALLINT',
      'bucardo_test2'  => 'INT',
-     'bucardo_test3'  => 'BIGINT',
+     'Bucardo_test3'  => 'BIGINT',
      'bucardo_test4'  => 'VARCHAR(1000)',
      'bucardo_test5'  => 'DATE',
      'bucardo_test6'  => 'DATETIME',
@@ -82,13 +88,29 @@ our %tabletypemysql =
      'bucardo_test8'  => 'VARBINARY(1000)',
      'bucardo_test9'  => 'INTEGER UNSIGNED',
      'bucardo_test10' => 'DATETIME',
+     'bucardo space test' => 'INT',
+     );
+
+our %tabletypemariadb =
+    (
+     'bucardo_test1'  => 'SMALLINT',
+     'bucardo_test2'  => 'INT',
+     'Bucardo_test3'  => 'BIGINT',
+     'bucardo_test4'  => 'VARCHAR(1000)',
+     'bucardo_test5'  => 'DATE',
+     'bucardo_test6'  => 'DATETIME',
+     'bucardo_test7'  => 'NUMERIC(5,1)',
+     'bucardo_test8'  => 'VARBINARY(1000)',
+     'bucardo_test9'  => 'INTEGER UNSIGNED',
+     'bucardo_test10' => 'DATETIME',
+     'bucardo space test' => 'INT',
      );
 
 our %tabletypeoracle =
     (
      'bucardo_test1'  => 'SMALLINT',
      'bucardo_test2'  => 'INT',
-     'bucardo_test3'  => 'BIGINT',
+     'Bucardo_test3'  => 'BIGINT',
      'bucardo_test4'  => 'NVARCHAR2(1000)',
      'bucardo_test5'  => 'DATE',
      'bucardo_test6'  => 'TIMESTAMP',
@@ -96,13 +118,14 @@ our %tabletypeoracle =
      'bucardo_test8'  => 'BLOB',
      'bucardo_test9'  => 'INTEGER',
      'bucardo_test10' => 'TIMESTAMP WITH TIME ZONE',
+     'bucardo space test' => 'INT',
      );
 
 our %tabletypesqlite =
     (
      'bucardo_test1'  => 'SMALLINT',
      'bucardo_test2'  => 'INT',
-     'bucardo_test3'  => 'BIGINT',
+     'Bucardo_test3'  => 'BIGINT',
      'bucardo_test4'  => 'VARCHAR(1000)',
      'bucardo_test5'  => 'DATE',
      'bucardo_test6'  => 'DATETIME',
@@ -110,6 +133,7 @@ our %tabletypesqlite =
      'bucardo_test8'  => 'VARBINARY(1000)',
      'bucardo_test9'  => 'INTEGER UNSIGNED',
      'bucardo_test10' => 'DATETIME',
+     'bucardo space test' => 'INT',
      );
 
 
@@ -119,8 +143,7 @@ our %sequences =
     (
     'bucardo_test_seq1' => '',
     'bucardo_test_seq2' => '',
-
-    'bucardo_test_seq3' => '',
+    'Bucardo_test_seq3' => '',
     );
 
 my %debug = (
@@ -207,7 +230,7 @@ my $TIMEOUT_SYNCWAIT = 3;
 ## How long to sleep between checks for sync being done?
 my $TIMEOUT_SLEEP = 0.1;
 ## How long to wait for a notice to be issued?
-my $TIMEOUT_NOTICE = 2;
+my $TIMEOUT_NOTICE = 4;
 
 ## Bail if the bucardo file does not exist / does not compile
 for my $file (qw/bucardo Bucardo.pm/) {
@@ -286,6 +309,12 @@ sub new {
         die qq{Could not find bucardo\n};
     }
 
+    ## Handle both old and new way of setting location
+    if ($location eq 'setup' and $arg->{location}) {
+        $location = $self->{location} = $arg->{location};
+    }
+
+
     return $self;
 
 } ## end of new
@@ -340,7 +369,7 @@ sub empty_cluster {
         $dbh = $self->connect_database($clustername, $dbname);
         ## Remove any of our known schemas
         my @slist;
-        for my $sname (qw/ public bucardo freezer /) {
+        for my $sname (qw/ public bucardo freezer tschema /) {
             push @slist => $sname if $self->drop_schema($dbh, $sname);
         }
         debug(qq{Schemas dropped from $dbname on $clustername: } . join ',' => @slist);
@@ -622,6 +651,9 @@ sub repopulate_cluster {
 
     $self->add_test_schema($dbh);
 
+    ## Store our names away
+    $gdbh{$clustername} = $dbh;
+
     return $dbh;
 
 } ## end of repopulate_cluster
@@ -703,13 +735,13 @@ sub add_test_schema {
 
         ## Does the table already exist? If so, drop it.
         if (table_exists($dbh => $table)) {
-            $dbh->do("DROP TABLE $table");
+            $dbh->do(qq{DROP TABLE "$table"});
         }
 
         my $pkeyname = $table =~ /test5/ ? q{"id space"} : 'id';
         my $pkindex = $table =~ /test2/ ? '' : 'PRIMARY KEY';
         $SQL = qq{
-            CREATE TABLE $table (
+            CREATE TABLE "$table" (
                 $pkeyname    $tabletype{$table} NOT NULL $pkindex};
         $SQL .= $table =~ /X/ ? "\n)" : qq{,
                 data1 TEXT                   NULL,
@@ -725,13 +757,13 @@ sub add_test_schema {
         $tcount++;
 
         if ($table =~ /test2/) {
-            $dbh->do("ALTER TABLE $table ADD CONSTRAINT multipk PRIMARY KEY ($pkeyname,data1)");
+            $dbh->do(qq{ALTER TABLE "$table" ADD CONSTRAINT multipk PRIMARY KEY ($pkeyname,data1)});
         }
 
         ## Create a trigger to test trigger supression during syncs
         $SQL = qq{
-            CREATE TRIGGER bctrig_$table
-            AFTER INSERT OR UPDATE ON $table
+            CREATE TRIGGER "bctrig_$table"
+            AFTER INSERT OR UPDATE ON "$table"
             FOR EACH ROW EXECUTE PROCEDURE trigger_test()
             };
         $table =~ /0/ and ($SQL =~ s/trigger_test/trigger_test_zero/);
@@ -739,8 +771,8 @@ sub add_test_schema {
 
         ## Create a rule to test rule supression during syncs
         $SQL = qq{
-            CREATE OR REPLACE RULE bcrule_$table
-            AS ON INSERT TO $table
+            CREATE OR REPLACE RULE "bcrule_$table"
+            AS ON INSERT TO "$table"
             DO ALSO INSERT INTO droptest(name,type) VALUES ('$table','rule')
             };
         $table =~ /0/ and $SQL =~ s/NEW.inty/0/;
@@ -892,8 +924,7 @@ sub ctl {
     };
 
     if ($@ =~ /Alarum/ or $info =~ /Alarum/) {
-        warn "bucardo timed out: $args\n";
-        exit;
+        return "Timed out";
     }
     if ($@) {
         return "Error running bucardo: $@\n";
@@ -909,7 +940,7 @@ sub ctl {
 sub restart_bucardo {
 
     ## Start Bucardo, but stop first if it is already running
-    ## Arguments:
+    ## Arguments: one, two, or three
     ## 1. database handle to the bucardo_control_test db
     ## 2. The notice we wait for, defaults to: bucardo_started
     ## 3. The message to give to the "pass" function, defaults to: Bucardo was started
@@ -917,23 +948,21 @@ sub restart_bucardo {
 
     my ($self,$dbh,$notice,$passmsg) = @_;
 
+    my $line = (caller)[2];
+
     $notice ||= 'bucardo_started';
-    $passmsg ||= 'Bucardo was started';
+    $passmsg ||= "Bucardo was started (caller line $line)";
 
     $self->stop_bucardo();
 
     ## Because the stop signal arrives before the PID is removed, sleep a bit
     sleep 2;
 
-    pass('Starting up Bucardo');
-    if ($dbh->{pg_server_version} >= 999990000) {
-        $dbh->do('LISTEN bucardo');
-    }
-    else {
-        $dbh->do('LISTEN bucardo_boot');
-        $dbh->do('LISTEN bucardo_started');
-        $dbh->do('LISTEN bucardo_nosyncs');
-    }
+    pass("Starting up Bucardo (caller line $line)");
+    $dbh->do('LISTEN bucardo');
+    $dbh->do('LISTEN bucardo_boot');
+    $dbh->do("LISTEN $notice");
+    $dbh->do('LISTEN bucardo_nosyncs');
     $dbh->commit();
 
     $self->ctl('start testing');
@@ -1020,7 +1049,7 @@ sub setup_bucardo {
     $dbh = $self->connect_database($clustername, 'bucardo');
 
     ## Make some adjustments
-    $sth = $dbh->prepare('UPDATE bucardo.bucardo_config SET value = $2 WHERE setting = $1');
+    $sth = $dbh->prepare('UPDATE bucardo.bucardo_config SET setting = $2 WHERE name = $1');
     $count = $sth->execute('piddir' => $PIDDIR);
     $count = $sth->execute('reason_file' => "$PIDDIR/reason");
     $count = $sth->execute('sendmail_file' => 'debug.sendmail.txt');
@@ -1068,6 +1097,7 @@ sub wait_for_notice {
     ## 3. Seconds we sleep between checks
     ## 4. Boolean: bail out if not found (defaults to true)
 
+    my $self = shift;
     my $dbh = shift;
     my $text = shift;
     my $timeout = shift || $TIMEOUT_NOTICE;
@@ -1081,10 +1111,7 @@ sub wait_for_notice {
       N: {
             while ($n = $dbh->func('pg_notifies')) {
                 my ($name, $pid, $payload) = @$n;
-                if ($dbh->{pg_server_version} >= 9999990000) {
-                    next if $name ne 'bucardo';
-                    $name = $payload;
-                }
+                $name = $payload if length $payload;
                 if ($name eq $text) {
                     last N;
                 }
@@ -1100,7 +1127,8 @@ sub wait_for_notice {
     if ($@) {
         if ($@ =~ /Lookout/o) {
             my $line = (caller)[2];
-            my $notice = qq{Gave up waiting for notice "$text": timed out at $timeout from line $line};
+            my $now = scalar localtime;
+            my $notice = qq{Gave up waiting for notice "$text": timed out at $timeout from line $line. Time=$now};
             if ($bail) {
                 Test::More::BAIL_OUT ($notice);
             }
@@ -1214,11 +1242,11 @@ sub empty_test_database {
     }
 
     for my $table (sort keys %tabletype) {
-        $dbh->do("TRUNCATE TABLE $table");
+        $dbh->do(qq{TRUNCATE TABLE "$table"});
     }
 
     for my $table (@tables2empty) {
-        $dbh->do("TRUNCATE TABLE $table");
+        $dbh->do(qq{TRUNCATE TABLE "$table"});
     }
 
     if ($dbh->{pg_server_version} >= 80300) {
@@ -1326,88 +1354,6 @@ sub t {
 
 } ## end of t
 
-sub add_bucardo_schema_to_database {
-
-    ## Parses the bucardo.schema file and creates the database
-    ## Assumes the schema 'bucardo' does not exist yet
-    ## First argument is a database handle
-
-    my $dbh = shift;
-
-    if (schema_exists($dbh => 'bucardo')) {
-        return;
-    }
-
-    my $schema_file = 'bucardo.schema';
-    -e $schema_file or die qq{Cannot find the file "$schema_file"!};
-    open my $fh, '<', $schema_file or die qq{Could not open "$schema_file": $!\n};
-    my $sql='';
-    my (%copy,%copydata);
-    my ($start,$copy,$insidecopy) = (0,0,0);
-    while (<$fh>) {
-        if (!$start) {
-            next unless /ON_ERROR_STOP on/;
-            $start = 1;
-            next;
-        }
-        next if /^\\[^\.]/; ## Avoid psql meta-commands at top of file
-        if (1==$insidecopy) {
-            $copy{$copy} .= $_;
-            if (/;/) {
-                $insidecopy = 2;
-            }
-        }
-        elsif (2==$insidecopy) {
-            if (/^\\\./) {
-                $insidecopy = 0;
-            }
-            else {
-                push @{$copydata{$copy}}, $_;
-            }
-        }
-        elsif (/^\s*(COPY bucardo.*)/) {
-            $copy{++$copy} = $1;
-            $insidecopy = 1;
-        }
-        else {
-            $sql .= $_;
-        }
-    }
-    close $fh or die qq{Could not close "$schema_file": $!\n};
-
-    $dbh->do("SET escape_string_warning = 'off'");
-
-    $dbh->{pg_server_prepare} = 0;
-
-    unless ($ENV{BUCARDO_TEST_NOCREATEDB}) {
-        $dbh->do('CREATE schema bucardo');
-        $dbh->do('CREATE schema freezer');
-
-        $dbh->do($sql);
-
-        $count = 1;
-        while ($count <= $copy) {
-            $dbh->do($copy{$count});
-            for my $copyline (@{$copydata{$count}}) {
-                $dbh->pg_putline($copyline);
-            }
-            $dbh->pg_endcopy();
-            $count++;
-        }
-    }
-
-    $dbh->commit();
-
-    ## Make some adjustments
-    $sth = $dbh->prepare('UPDATE bucardo.bucardo_config SET value = $2 WHERE setting = $1');
-    $count = $sth->execute('piddir' => $PIDDIR);
-    $count = $sth->execute('reason_file' => "$PIDDIR/reason");
-    $count = $sth->execute('audit_pid' => 1);
-    $dbh->commit();
-
-} ## end of add_bucardo_schema_to_database
-
-
 
 sub add_test_tables_to_herd {
 
@@ -1514,6 +1460,263 @@ sub drop_database {
     }
     return;
 }
+
+
+sub add_row_to_database {
+
+    ## Add a row to each table in one of the databases
+    ## Arguments: three
+    ## 1. Database name to use
+    ## 2. Value to use (lookup, not the direct value)
+    ## 3. Do we commit or not? Boolean, defaults to true
+    ## Returns: undef
+
+    my ($self, $dbname, $xval, $commit) = @_;
+
+    $commit = 1 if ! defined $commit;
+
+    my $dbh = $gdbh{$dbname} or die "No such database: $dbname";
+
+    ## Loop through each table we know about
+    for my $table (sort keys %tabletype) {
+
+        ## Look up the actual value to use
+        my $type = $tabletype{$table};
+        my $value = $val{$type}{$xval};
+
+        ## Prepare it if we have not already
+        if (! exists $gsth{$dbh}{insert}{$xval}{$table}) {
+
+            ## Handle odd pkeys
+            my $pkey = $table =~ /test5/ ? q{"id space"} : 'id';
+
+            ## Put some standard values in, plus a single placeholder
+            my $SQL = qq{INSERT INTO "$table"($pkey,data1,inty,booly) VALUES (?,'foo',$xval,'true')};
+            $gsth{$dbh}{insert}{$xval}{$table} = $dbh->prepare($SQL);
+
+            ## If this is a bytea, we need to tell DBD::Pg about it
+            if ('BYTEA' eq $type) {
+                $gsth{$dbh}{insert}{$xval}{$table}->bind_param(1, undef, {pg_type => PG_BYTEA});
+            }
+
+        }
+
+        ## Execute!
+        $gsth{$dbh}{insert}{$xval}{$table}->execute($value);
+
+    }
+
+    $dbh->commit() if $commit;
+
+    return undef;
+
+} ## end of add_row_to_database
+
+
+sub remove_row_from_database {
+
+    ## Delete a row from each table in one of the databases
+    ## Arguments: three
+    ## 1. Database name to use
+    ## 2. Value to use (lookup, not the direct value). Can be an arrayref.
+    ## 3. Do we commit or not? Boolean, defaults to true
+    ## Returns: undef
+
+    my ($self, $dbname, $val, $commit) = @_;
+
+    $commit = 1 if ! defined $commit;
+
+    my $dbh = $gdbh{$dbname} or die "No such database: $dbname";
+
+    ## Loop through each table we know about
+    for my $table (sort keys %tabletype) {
+
+        ## Prepare it if we have not already
+        if (! exists $gsth{$dbh}{delete}{$table}) {
+
+            ## Delete, based on the inty
+            my $SQL = qq{DELETE FROM "$table" WHERE inty = ?};
+            $gsth{$dbh}{delete}{$table} = $dbh->prepare($SQL);
+
+        }
+
+        ## Execute it.
+        if (ref $val) {
+            for (@$val) {
+                $gsth{$dbh}{delete}{$table}->execute($_);
+            }
+        }
+        else {
+            $gsth{$dbh}{delete}{$table}->execute($val);
+        }
+
+    }
+
+    $dbh->commit() if $commit;
+
+    return undef;
+
+} ## end of remove_row_from_database
+
+
+sub truncate_all_tables {
+
+    ## Truncate all the tables
+    ## Arguments: two
+    ## 1. Database to use
+    ## 3. Do we commit or not? Boolean, defaults to true
+    ## Returns: undef
+
+    my ($self, $dbname, $commit) = @_;
+
+    $commit = 1 if ! defined $commit;
+
+    my $dbh = $gdbh{$dbname} or die "No such database: $dbname";
+
+    ## Loop through each table we know about
+    for my $table (sort keys %tabletype) {
+        $dbh->do(qq{TRUNCATE Table ONLY "$table"});
+    }
+
+    $dbh->commit() if $commit;
+
+    return undef;
+
+} ## end of truncate_all_tables
+
+
+sub check_for_row {
+
+    ## Check that a given row is on the database as expected: checks the inty column only
+    ## Arguments: two or three or four
+    ## 1. The result we are expecting, as an arrayref
+    ## 2. A list of database names (should be inside gdbh)
+    ## 3. Optional text to append to output message
+    ## 4. Optional tables to limit checking to
+    ## Returns: undef
+
+    my ($self, $res, $dblist, $text, $filter) = @_;
+
+    ## Get largest tablename
+    my $maxtable = 1;
+    for my $table (keys %tabletype) {
+        $maxtable = length $table if length $table > $maxtable;
+    }
+
+    for my $dbname (@$dblist) {
+
+        my $dbh = $gdbh{$dbname} or die "Invalid database name: $dbname";
+
+        my $maxdbtable = $maxtable + 1 + length $dbname;
+
+        for my $table (sort keys %tabletype) {
+
+            ## Allow skipping tables
+            if (defined $filter) {
+                my $f = $filter;
+                if ($f =~ s/^\!//) {
+                    next if $table =~ /$f$/;
+                }
+                else {
+                    next if $table !~ /$f$/;
+                }
+            }
+            ## Handle odd pkeys
+            my $pkey = $table =~ /test5/ ? q{"id space"} : 'id';
+
+            my $type = $tabletype{$table};
+            my $t = sprintf qq{%-*s copy ok (%s)},
+                $maxdbtable,
+                "$dbname.$table",
+                    $type;
+
+            ## Change the message if no rows
+            if (ref $res eq 'ARRAY' and ! defined $res->[0]) {
+                $t = sprintf qq{No rows as expected in %-*s for pkey type %s},
+                    $maxdbtable,
+                    "$dbname.$table",
+                    $type;
+            }
+
+            if (defined $text and length $text) {
+                $t .= " $text";
+            }
+
+            my $SQL = qq{SELECT inty FROM "$table" ORDER BY inty};
+            $table =~ /X/ and $SQL =~ s/inty/$pkey/;
+
+            bc_deeply($res, $dbh, $SQL, $t, (caller)[2]);
+        }
+    }
+
+    return;
+
+} ## end of check_for_row
+
+
+sub check_sequences_same {
+
+    ## Check that sequences are the same across all databases
+    ## Arguments: one
+    ## 1. A list of database names (should be inside gdbh)
+    ## Returns: undef
+
+    my ($self, $dblist) = @_;
+
+    for my $seq (sort keys %sequences) {
+
+        $SQL = "SELECT * FROM $seq";
+
+        ## The first we come across will be the standard for the others
+        my (%firstone, $firstdb);
+
+        ## Store failure messages
+        my @msg;
+
+        for my $dbname (@$dblist) {
+
+            my $dbh = $gdbh{$dbname} or die "Invalid database name: $dbname";
+
+            my $sth = $dbh->prepare($SQL);
+            $sth->execute();
+            my $info = $sth->fetchall_arrayref({})->[0];
+
+            if (! defined $firstone{$seq}) {
+                $firstone{$seq} = $info;
+                $firstdb = $dbname;
+                next;
+            }
+
+            ## Compare certain items
+            for my $item (qw/ last_value start_value increment_by min_value max_value is_cycled is_called/) {
+                my ($uno,$dos) = ($firstone{$seq}->{$item}, $info->{$item});
+                if ($uno ne $dos) {
+                    push @msg, "$item is different on $firstdb vs $dbname: $uno vs $dos";
+                }
+            }
+
+        } ## end each sequence
+
+        if (@msg) {
+            Test::More::fail("Sequence $seq NOT the same");
+            for (@msg) {
+                Test::More::diag($_);
+            }
+        }
+        else {
+            Test::More::pass("Sequence $seq is the same across all databases");
+        }
+
+    } ## end each database
+
+
+    return;
+
+
+} ## end of check_sequences_same
+
+
+
 
 ## Hack to override some Test::More methods
 ## no critic

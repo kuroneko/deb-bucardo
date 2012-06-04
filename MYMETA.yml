@@ -1,0 +1,41 @@
+---
+abstract: 'Postgres multi-master replication system'
+author:
+  - 'Greg Sabino Mullane <greg@endpoint.com>'
+build_requires:
+  ExtUtils::MakeMaker: 0
+dynamic_config: 0
+generated_by: 'emacs, CPAN::Meta::Converter version 2.112621'
+license: bsd
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
+name: Bucardo
+provides:
+  Bucardo:
+    file: Bucardo.pm
+    version: v4.99.5
+  bucardo:
+    file: bucardo
+    version: v4.99.5
+requires:
+  DBD::Pg: 2.0
+  DBI: 1.51
+  DBIx::Safe: v1.2.4
+  ExtUtils::MakeMaker: 6.32
+  File::Spec: 0
+  IO::Handle: 1.24
+  MIME::Base64: 0
+  Net::SMTP: 0
+  Sys::Hostname: 1.11
+  Sys::Syslog: 0.13
+  Test::Harness: 2.03
+  Test::More: 0.61
+  boolean: 0
+resources:
+  bugtracker: http://bucardo.org/bugzilla/
+  homepage: http://bucardo.org/index.html
+  license: http://bucardo.org/license.html
+  repository: http://bucardo.org/repo.html
+  x_MailingList: http://bucardo.org/list.html
+version: 4.99.5

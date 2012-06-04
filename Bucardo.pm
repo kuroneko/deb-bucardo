@@ -5,7 +5,7 @@
 ##
 ## This script should only be called via the 'bucardo' program
 ##
-## Copyright 2006-2011 Greg Sabino Mullane <greg@endpoint.com>
+## Copyright 2006-2012 Greg Sabino Mullane <greg@endpoint.com>
 ##
 ## Please visit http://bucardo.org for more information
 
@@ -15,7 +15,7 @@ use strict;
 use warnings;
 use utf8;
 
-our $VERSION = '4.99.3';
+our $VERSION = '4.99.5';
 
 use DBI 1.51;                               ## How Perl talks to databases
 use DBD::Pg 2.0   qw( :async             ); ## How Perl talks to Postgres databases
@@ -470,6 +470,7 @@ sub start_mcp {
     $self->glog("bucardo: $old0", LOG_WARN);
     $self->glog('Bucardo.pm: ' . $INC{'Bucardo.pm'}, LOG_WARN);
     $self->glog((sprintf 'OS: %s  Perl: %s %vd', $^O, $^X, $^V), LOG_WARN);
+
     ## Get a integer version of the DBD::Pg version, for later comparisons
     if ($DBD::Pg::VERSION !~ /(\d+)\.(\d+)\.(\d+)/) {
         die "Could not parse the DBD::Pg version: was $DBD::Pg::VERSION\n";
@@ -489,17 +490,20 @@ sub start_mcp {
     ## Again with the password trick
     $self->{dbpass} = '<not shown>'; ## already saved as $oldpass above
     my $objdump = "Bucardo object:\n";
+
     ## Get the maximum key length for pretty formatting
     my $maxlen = 5;
     for (keys %$self) {
         $maxlen = length($_) if length($_) > $maxlen;
     }
+
     ## Print each object, aligned, and show 'undef' for undefined values
     ## Yes, this prints things like HASH(0x8fbfc84), but we're okay with that
     for (sort keys %$self) {
         $objdump .= sprintf " %-*s => %s\n", $maxlen, $_, (defined $self->{$_}) ? qq{'$self->{$_}'} : 'undef';
     }
     $self->glog($objdump, LOG_TERSE);
+
     ## Restore the password
     $self->{dbpass} = $oldpass;
 
@@ -517,7 +521,7 @@ sub start_mcp {
 
     ## Loop through and remove each file found, making a note in the log
     for my $pidfile (sort @pidfiles) {
-        my $fullfile = File::Spec->catfile( $self->{debugdir} => $pidfile );
+        my $fullfile = File::Spec->catfile( $piddir => $pidfile );
         ## Do not erase our own file
         next if $fullfile eq $self->{pidfile};
         ## Everything else can get removed
@@ -646,18 +650,61 @@ sub start_mcp {
     ## Let any listeners know we have gotten this far
     $self->db_notify($masterdbh, 'started', 1);
 
-    ## Kick all syncs that may have sent a notice while we were down.
+    ## For optimization later on, we need to know which syncs are 'fullcopy'
     for my $syncname (keys %{ $self->{sync} }) {
+
         my $s = $self->{sync}{$syncname};
 
-        ## Start ina non-kicked mode
+        ## Skip inactive syncs
+        next unless $s->{mcp_active};
+
+        ## Walk through each database and check the roles, discarding inactive dbs
+        my %rolecount;
+        for my $db (values %{ $s->{db} }) {
+            next if $db->{status} ne 'active';
+            $rolecount{$db->{role}}++;
+        }
+
+        ## Default to being fullcopy
+        $s->{fullcopy} = 1;
+
+        ## We cannot be a fullcopy sync if:
+        if ($rolecount{'target'}           ## there are any target dbs
+            or $rolecount{'source'} > 1    ## there is more than one source db
+            or ! $rolecount{'fullcopy'}) { ## there are no fullcopy dbs
+            $s->{fullcopy} = 0;
+        }
+    }
+
+
+    ## Because a sync may have gotten a notice while we were down,
+    ## we auto-kick all eligible syncs
+    ## We also need to see if we can prevent the VAC daemon from running,
+    ## if there are no databases with bucardo schemas
+    $self->{needsvac} = 0;
+    for my $syncname (keys %{ $self->{sync} }) {
+
+        my $s = $self->{sync}{$syncname};
+
+        ## Default to starting in a non-kicked mode
         $s->{kick_on_startup} = 0;
 
         ## Skip inactive syncs
         next unless $s->{mcp_active};
 
         ## Skip fullcopy syncs
-        next if $s->{synctype} eq 'fullcopy';
+        next if $s->{fullcopy};
+
+        ## Right now, the vac daemon is only useful for source Postgres databases
+        ## Of course, it is not needed for fullcopy syncs
+        for my $db (values %{ $s->{db} }) {
+            if ($db->{status} eq 'active'
+                and $db->{dbtype} eq 'postgres'
+                and $db->{role} eq 'source') {
+                $db->{needsvac}++;
+                $self->{needsvac} = 1;
+            }
+        }
 
         ## Skip if ping is false
         next if ! $s->{ping};
@@ -723,7 +770,8 @@ sub mcp_main {
         }
 
         ## Startup the VAC daemon as needed
-        if ($config{bucardo_vac}) {
+        ## May be off via user configuration, or because of no valid databases
+        if ($config{bucardo_vac} and $self->{needsvac}) {
 
             ## Check on it occasionally (different than the running time)
             if (time() - $lastvaccheck >= $config{mcp_vactime}) {
@@ -1016,7 +1064,7 @@ sub mcp_main {
             next if ! $s->{stayalive} and ! $s->{kick_on_startup};
 
             ## If this is a fullcopy sync, skip unless it is being kicked
-            next if $s->{synctype} eq 'fullcopy' and ! $s->{kick_on_startup};
+            next if $s->{fullcopy} and ! $s->{kick_on_startup};
 
             ## If this is a previous stayalive, see if it is active, kick if needed
             if ($s->{stayalive} and $s->{controller}) {
@@ -1170,8 +1218,8 @@ sub start_controller {
     $self->{logprefix} = 'CTL';
 
     ## Extract some of the more common items into local vars
-    my ($syncname,$limitdbs,$kidsalive,$dbinfo, $synctype, $kicked,) = @$sync{qw(
-           name    limitdbs  kidsalive  dbs     synctype kick_on_startup)};
+    my ($syncname,$limitdbs,$kidsalive,$dbinfo, $kicked,) = @$sync{qw(
+           name    limitdbs  kidsalive  dbs     kick_on_startup)};
 
     ## Set our process name
     $0 = qq{Bucardo Controller.$self->{extraname} Sync "$syncname" for herd "$sync->{herd}" to dbs "$sync->{dbs}"};
@@ -1194,7 +1242,7 @@ sub start_controller {
 
     ## Log some startup information, and squirrel some away for later emailing
     my $mailmsg = "$msg\n";
-    $msg = qq{  stayalive: $sync->{stayalive} checksecs: $sync->{checksecs} limitdbs: $limitdbs kicked: $kicked};
+    $msg = qq{  stayalive: $sync->{stayalive} checksecs: $sync->{checksecs} kicked: $kicked};
     $self->glog($msg, LOG_NORMAL);
     $mailmsg .= "$msg\n";
 
@@ -1426,7 +1474,7 @@ sub start_controller {
 
         ## Overwrites the MCP database handles
         ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
-        $self->glog(qq{Connected to database "$dbname" with backend PID of $x->{backend}}, LOG_NORMAL);
+        $self->glog(qq{Database "$dbname" backend PID: $x->{backend}}, LOG_NORMAL);
         $self->{pidmap}{$x->{backend}} = "DB $dbname";
     }
 
@@ -1564,6 +1612,10 @@ sub start_controller {
             elsif ($x->{dbtype} eq 'postgres'
                    or $x->{dbtype} eq 'flatpg') {
                 $g->{newname}{$syncname}{$dbname} = "$S.$T";
+            }
+            ## Some always get the raw table name
+            elsif ($x->{dbtype} eq 'redis') {
+                $g->{newname}{$syncname}{$dbname} = $g->{tablename};
             }
             else {
                 $g->{newname}{$syncname}{$dbname} = $T;
@@ -1896,25 +1948,10 @@ sub start_kid {
         @dbs_postgres, @dbs_drizzle, @dbs_mongo, @dbs_mysql, @dbs_oracle,
         @dbs_redis, @dbs_sqlite);
 
-    ## Used to weed out all but one source if targets are all fullcopy
+    ## Used to weed out all but one source if in onetimecopy mode
     my $found_first_source = 0;
 
-    ## Quick check to see if all targets are fullcopy
-    ## If onetimecopy is set, this is forced true
-    my $alltargets_fullcopy = 1;
-    if (! $sync->{onetimecopy}) {
-        for my $dbname (sort keys %{ $sync->{db} }) {
-            $x = $sync->{db}{$dbname};
-            if ($x->{role} eq 'target') {
-                $alltargets_fullcopy = 0;
-                last;
-            }
-        }
-    }
-
     for my $dbname (sort keys %{ $sync->{db} }) {
-
-        ## Order the above by priority to allow fine-tuning of the single fullcopy source?
 
         $x = $sync->{db}{$dbname};
 
@@ -1923,9 +1960,8 @@ sub start_kid {
         ## If this is a onetimecopy sync, the fullcopy targets are dead to us
         next if $sync->{onetimecopy} and $x->{role} eq 'fullcopy';
 
-        ## If this is a onetimecopy sync, or if all targets are fullcopy,
-        ## we only need to connect to a single source
-        if ($x->{role} eq 'source' and $alltargets_fullcopy) {
+        ## If this is a onetimecopy sync, we only need to connect to a single source
+        if ($sync->{onetimecopy} and $x->{role} eq 'source') {
             next if $found_first_source;
             $found_first_source = 1;
         }
@@ -1935,19 +1971,19 @@ sub start_kid {
         ## Is this a SQL database?
         $x->{does_sql} = 0;
 
-        ## Can they do truncate?
+        ## Can it do truncate?
         $x->{does_truncate} = 0;
 
-        ## Can they do savepoints (and roll them back)?
+        ## Can it do savepoints (and roll them back)?
         $x->{does_savepoints} = 0;
 
-        ## Do they support truncate cascade?
+        ## Does it support truncate cascade?
         $x->{does_cascade} = 0;
 
-        ## Do they support a LIMIT clause?
+        ## Does it support a LIMIT clause?
         $x->{does_limit} = 0;
 
-        ## Can they be queried?
+        ## Can it be queried?
         $x->{does_append_only} = 0;
 
         ## Start clumping into groups and adjust the attributes
@@ -1976,8 +2012,8 @@ sub start_kid {
             push @dbs_mongo => $dbname;
         }
 
-        ## MySQL
-        if ('mysql' eq $x->{dbtype}) {
+        ## MySQL (and MariaDB)
+        if ('mysql' eq $x->{dbtype} or 'mariadb' eq $x->{dbtype}) {
             push @dbs_mysql => $dbname;
             $x->{does_sql}        = 1;
             $x->{does_truncate}   = 1;
@@ -2015,8 +2051,6 @@ sub start_kid {
         ## Everyone goes into this bucket
         push @dbs => $dbname;
 
-        ## Some of these may change later on depending on fullcopy and onetimecopy settings
-
         ## Databases we read data from
         push @dbs_source => $dbname
             if $x->{role} eq 'source';
@@ -2025,28 +2059,27 @@ sub start_kid {
         push @dbs_target => $dbname
             if $x->{role} ne 'source';
 
-        ## Databases that get written to
-        ## This is all of them, unless we are in fullcopy only mode
+        ## Databases that (potentially) get written to
+        ## This is all of them, unless we are a source
+        ## and a fullcopy sync or in onetimecopy mode
         push @dbs_write => $dbname
-            if ! $alltargets_fullcopy
+            if (!$sync->{fullcopy} and !$sync->{onetimecopy})
                 or $x->{role} ne 'source';
 
         ## Databases that get deltas
         ## If in onetimecopy mode, this is always forced to be empty
+        ## Likewise, no point in populating if this is a fullcopy sync
         push @dbs_delta => $dbname
-            if $x->{role} eq 'target' and ! $sync->{onetimecopy};
+            if $x->{role} eq 'source'
+                and ! $sync->{onetimecopy}
+                    and ! $sync->{fullcopy};
 
         ## Databases that get the full monty
         ## In normal mode, this means a role of 'fullcopy'
         ## In onetimecopy mode, this means a role of 'target'
-        if ($sync->{onetimecopy}) {
-            push @dbs_fullcopy => $dbname
-                if $x->{role} eq 'target';
-        }
-        else {
-            push @dbs_fullcopy => $dbname
-                if $x->{role} eq 'fullcopy';
-        }
+        push @dbs_fullcopy => $dbname
+            if ($sync->{onetimecopy} and $x->{role} eq 'target')
+                or ($sync->{fullcopy} and $x->{role} eq 'fullcopy');
 
         ## Non-fullcopy databases. Basically dbs_source + dbs_target
         push @dbs_non_fullcopy => $dbname
@@ -2056,6 +2089,7 @@ sub start_kid {
         push @dbs_dbi => $dbname
             if $x->{dbtype} eq 'postgres'
             or $x->{dbtype} eq 'drizzle'
+            or $x->{dbtype} eq 'mariadb'
             or $x->{dbtype} eq 'mysql'
             or $x->{dbtype} eq 'oracle'
             or $x->{dbtype} eq 'sqlite';
@@ -2521,7 +2555,7 @@ sub start_kid {
 
         } ## end postgres
 
-        elsif ($x->{dbtype} eq 'mysql') {
+        elsif ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
 
             ## Serialize for this session
             $xdbh->do('SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE');
@@ -2531,7 +2565,7 @@ sub start_kid {
             $xdbh->do(q{SET time_zone = '+0:00'});
             $xdbh->commit();
 
-        } ## end mysql
+        } ## end mysql/mariadb
 
     }
 
@@ -2553,13 +2587,13 @@ sub start_kid {
 
         } ## end postgres
 
-        elsif ($x->{dbtype} eq 'mysql') {
+        elsif ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
 
             ## No foreign key checks, please
             $xdbh->do('SET foreign_key_checks = 0');
             $xdbh->commit();
 
-        } ## end mysql
+        } ## end mysql/mariadb
 
     }
 
@@ -2716,11 +2750,26 @@ sub start_kid {
         $dmlcount{truncates} = 0;
         $dmlcount{conflicts} = 0;
 
-        ## Reset both of the above at a per-database level
+        ## Reset all of our truncate stuff
+        $self->{has_truncation} = 0;
+        delete $self->{truncateinfo};
+
+        ## Reset some things at the per-database level
         for my $dbname (keys %{ $sync->{db} }) {
+
+            ## This must be set, as it is used by the standard_conflict below
             $deltacount{$dbname} = 0;
             $dmlcount{allinserts}{$dbname} = 0;
             $dmlcount{alldeletes}{$dbname} = 0;
+
+            $x = $sync->{db}{$dbname};
+            delete $x->{truncatewinner};
+
+        }
+
+        ## Reset things at the goat level
+        for my $g (@$goatlist) {
+            delete $g->{truncatewinner};
         }
 
         ## Run all 'before_txn' code
@@ -2762,13 +2811,13 @@ sub start_kid {
             $x->{dbh}->rollback();
 
             if ($x->{dbtype} eq 'postgres') {
-                $x->{dbh}->do('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE');
-                $self->glog(qq{Set db "$dbname" to repeatable read read write}, LOG_DEBUG);
+                $x->{dbh}->do('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE');
+                $self->glog(qq{Set database "$dbname" to serializable read write}, LOG_DEBUG);
             }
 
-            if ($x->{dbtype} eq 'mysql') {
+            if ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
                 $x->{dbh}->do('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
-                $self->glog(qq{Set db "$dbname" to serializable}, LOG_DEBUG);
+                $self->glog(qq{Set database "$dbname" to serializable}, LOG_DEBUG);
             }
 
             if ($x->{dbtype} eq 'drizzle') {
@@ -2778,12 +2827,18 @@ sub start_kid {
             if ($x->{dbtype} eq 'oracle') {
                 $x->{dbh}->do('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
                 ## READ WRITE - can we set serializable and read write at the same time??
-                $self->glog(qq{Set db "$dbname" to serializable and read write}, LOG_DEBUG);
+                $self->glog(qq{Set database "$dbname" to serializable and read write}, LOG_DEBUG);
             }
 
             if ($x->{dbtype} eq 'sqlite') {
                 ## Nothing needed here, the default seems okay
             }
+
+            if ($x->{dbtype} eq 'redis') {
+                ## Implement MULTI, when the driver supports it
+                ##$x->{dbh}->multi();
+            }
+
         }
 
         ## We may want to lock all the tables. Use sparingly
@@ -2821,7 +2876,7 @@ sub start_kid {
                         $self->glog("Database $dbname: Locking table $com", LOG_TERSE);
                         $x->{dbh}->do("LOCK TABLE $com");
                     }
-                    elsif ('mysql' eq $x->{dbtype} or 'drizzle' eq $x->{dbtype}) {
+                    elsif ('mysql' eq $x->{dbtype} or 'drizzle' eq $x->{dbtype} or 'mariadb' eq $x->{dbtype}) {
                         my $com = "$tname WRITE";
                         $self->glog("Database $dbname: Locking table $com", LOG_TERSE);
                         $x->{dbh}->do("LOCK TABLE $com");
@@ -2854,27 +2909,25 @@ sub start_kid {
             ## We will never reach this while in onetimecopy mode as @dbs_delta is emptied
 
             ## Check if any tables were truncated on all source databases
-            ## Store the result in $self->{truncateinfo}
+            ## If so, set $self->{has_truncation}; store results in $self->{truncateinfo}
             ## First level keys are schema then table name
             ## Third level is maxtime and maxdb, showing the "winner" for each table
-            delete $self->{truncateinfo};
 
-            $SQL = 'SELECT sname, tname, MAX(EXTRACT(epoch FROM cdate)) FROM bucardo.bucardo_truncate_trigger '
+            $SQL = 'SELECT quote_ident(sname), quote_ident(tname), MAX(EXTRACT(epoch FROM cdate))'
+                   . ' FROM bucardo.bucardo_truncate_trigger '
                    . ' WHERE sync = ? AND replicated IS NULL GROUP BY 1,2';
 
             for my $dbname (@dbs_source) {
 
                 $x = $sync->{db}{$dbname};
 
-                ## Remove our previous truncation flag
-                delete $x->{truncatewinner};
-
                 ## Grab the latest truncation time for each table, for this source database
                 $self->glog(qq{Checking truncate_trigger table on database "$dbname"}, LOG_VERBOSE);
                 $sth = $x->{dbh}->prepare($SQL);
-                $count = $sth->execute($syncname);
+                $self->{has_truncation} += $sth->execute($syncname);
                 for my $row (@{ $sth->fetchall_arrayref() }) {
                     my ($s,$t,$time) = @{ $row };
+                    ## Store if this is the new winner
                     if (! exists $self->{truncateinfo}{$s}{$t}{maxtime}
                             or $time > $self->{truncateinfo}{$s}{$t}{maxtime}) {
                         $self->{truncateinfo}{$s}{$t}{maxtime} = $time;
@@ -2885,7 +2938,7 @@ sub start_kid {
             } ## end each source database, checking for truncations
 
             ## Now go through and mark the winner within the "x" hash, for easy skipping later on
-            if (exists $self->{truncateinfo}) {
+            if ($self->{has_truncation}) {
                 for my $s (keys %{ $self->{truncateinfo} }) {
                     for my $t (keys %{ $self->{truncateinfo}{$s} }) {
                         my $dbname = $self->{truncateinfo}{$s}{$t}{maxdb};
@@ -2897,9 +2950,18 @@ sub start_kid {
                 ## Set the truncate count
                 my $number = @dbs_non_fullcopy; ## not the best estimate: corner cases
                 $dmlcount{truncate} = $number - 1;
+
+                ## Now map this back to our goatlist
+                for my $g (@$goatlist) {
+                    next if $g->{reltype} ne 'table';
+                    ($S,$T) = ($g->{safeschema},$g->{safetable});
+                    if (exists $self->{truncateinfo}{$S}{$T}) {
+                        $g->{truncatewinner} = $self->{truncateinfo}{$S}{$T}{maxdb};
+                    }
+                }
             }
 
-            ## First, handle all the sequences
+            ## Next, handle all the sequences
             for my $g (@$goatlist) {
 
                 next if $g->{reltype} ne 'sequence';
@@ -2943,9 +3005,9 @@ sub start_kid {
                     next if $x->{dbtype} ne 'postgres';
 
                     $x->{adjustsequence} = 1;
-
-                    $deltacount{sequences} += $self->adjust_sequence($g, $sync, $S, $T, $syncname);
                 }
+
+                $deltacount{sequences} += $self->adjust_sequence($g, $sync, $S, $T, $syncname);
 
             } ## end of handling sequences
 
@@ -2969,30 +3031,23 @@ sub start_kid {
                 ## This is the meat of Bucardo:
                 for my $dbname (@dbs_source) {
 
-                    $x = $sync->{db}{$dbname};
-
                     ## If we had a truncation, we only get deltas from the "winning" source
-                    if (exists $self->{truncateinfo}{$S}{$T}) {
-                        if (! exists $x->{truncatewinner}{$S}{$T}) {
-                            $self->glog("Skipping deltas from database $dbname, as some other source has truncated",
-                                        LOG_NORMAL);
-                            next;
-                        }
-                    }
+                    ## We still need these, as we want to respect changes made after the truncation!
+                    next if exists $g->{truncatewinner} and $g->{truncatewinner} ne $dbname;
 
                     ## Gets all relevant rows from bucardo_deltas: runs asynchronously
                     $sth{getdelta}{$dbname}{$g}->execute();
+
                 }
 
                 ## Grab all results as they finish.
                 ## Order does not really matter here, except for consistency in the logs
                 for my $dbname (@dbs_source) {
 
-                    $x = $sync->{db}{$dbname};
-
                     ## Skip if truncating and this one is not the winner
-                    next if exists $self->{truncateinfo}{$S}{$T}
-                        and ! exists $x->{truncatewinner}{$S}{$T};
+                    next if exists $g->{truncatewinner} and $g->{truncatewinner} ne $dbname;
+
+                    $x = $sync->{db}{$dbname};
 
                     ## pg_result tells us to wait for the query to finish
                     $count = $x->{dbh}->pg_result();
@@ -3024,10 +3079,10 @@ sub start_kid {
 
                 for my $dbname (@dbs_source) {
 
-                    $x = $sync->{db}{$dbname};
+                    ## Skip if truncating and this one is not the winner
+                    next if exists $g->{truncatewinner} and $g->{truncatewinner} ne $dbname;
 
-                    next if exists $self->{truncateinfo}{$S}{$T}
-                        and ! exists $x->{truncatewinner}{$S}{$T};
+                    $x = $sync->{db}{$dbname};
 
                     $self->glog((sprintf q{Delta count for %-*s : %*d},
                                  $self->{maxdbstname},
@@ -3055,7 +3110,8 @@ sub start_kid {
 
                 for my $dbname (@dbs_source) {
 
-                    $x = $sync->{db}{$dbname};
+                    ## Skip if truncating and deltacount is thus not set
+                    next if ! exists $deltacount{db}{$dbname};
 
                     $self->glog((sprintf q{Delta count for %-*s: %*d},
                                 $self->{maxdbname} + 2,
@@ -3069,8 +3125,7 @@ sub start_kid {
             ## update the syncrun and dbrun tables, notify listeners,
             ## then either re-loop or leave
 
-            if (! $deltacount{all}
-                    and ! exists $self->{truncateinfo}) {
+            if (! $deltacount{all} and ! $self->{has_truncation}) {
 
                ## If we modified the bucardo_sequences table, save the change
                 if ($deltacount{sequences}) {
@@ -3083,9 +3138,6 @@ sub start_kid {
 
                     $x = $sync->{db}{$dbname};
 
-                    ## We never do native fullcopy targets here
-                    next if $x->{type} eq 'fullcopy';
-
                     $x->{dbh}->rollback();
                 }
 
@@ -3095,8 +3147,7 @@ sub start_kid {
                     $x = $sync->{db}{$dbname};
 
                     ## We never do native fullcopy targets here
-                    ## ZZZ Where/when are the fullcopys removed?
-                    next if $x->{type} eq 'fullcopy';
+                    next if $x->{role} eq 'fullcopy';
 
                     $sth = $sth{dbrun_delete};
                     $sth->execute($syncname, $dbname);
@@ -3124,25 +3175,24 @@ sub start_kid {
             ## Only need to turn off triggers and rules once via pg_class
             my $disabled_via_pg_class = 0;
 
-            ## Cached epoch value per database for the standard conflict:
-            delete $self->{dbhightime};
+            ## The overall winning database for conflicts
+            delete $self->{conflictwinner};
 
             ## Do each goat in turn
 
           PUSHDELTA_GOAT: for my $g (@$goatlist) {
 
-                ($S,$T) = ($g->{safeschema},$g->{safetable});
-
                 ## No need to proceed unless we're a table
                 next if $g->{reltype} ne 'table';
 
                 ## Skip if we've already handled this via fullcopy
-                ## XXX truncate work
                 next if $g->{source}{needstruncation};
 
+                ($S,$T) = ($g->{safeschema},$g->{safetable});
+
                 ## Skip this table if no source rows have changed
-                next if ! $deltacount{table}{$S}{$T}
-                    and ! exists $self->{truncateinfo}{$S}{$T};
+                ## However, we still need to go on in the case of a truncation
+                next if ! $deltacount{table}{$S}{$T} and ! exists $g->{truncatewinner};
 
                 ## How many times this goat has handled an exception?
                 $g->{exceptions} ||= 0;
@@ -3174,14 +3224,17 @@ sub start_kid {
                 ## it's now time to gather the actual data
                 my %deltabin;
 
-                ## If we had a truncate, make sure all databases have at least a bare deltabin entry
-                if (exists $self->{truncateinfo}) {
-                    for my $dbname (@dbs_source) {
+                for my $dbname (@dbs_source) {
+
+                    $x = $sync->{db}{$dbname};
+
+                    ## Skip if we are truncating and this is not the winner
+                    next if exists $g->{truncatewinner} and $g->{truncatewinner} ne $dbname;
+
+                    ## If this is a truncation, we always want the deltabin to exist, even if empty!
+                    if (exists $g->{truncatewinner}) {
                         $deltabin{$dbname} = {};
                     }
-                }
-
-                for my $dbname (@dbs_source) {
 
                     ## Skip if we know we have no rows - and thus have issued a finish()
                     next if ! $deltacount{dbtable}{$dbname}{$S}{$T};
@@ -3189,17 +3242,17 @@ sub start_kid {
                     ## Create an empty hash to hold the primary key information
                     $deltabin{$dbname} = {};
 
-                    while ($x = $sth{getdelta}{$dbname}{$g}->fetchrow_arrayref()) {
+                    while (my $y = $sth{getdelta}{$dbname}{$g}->fetchrow_arrayref()) {
                         ## Join all primary keys together with \0, put into hash as key
                         ## XXX: Using \0 is not unique for binaries
                         if (!$g->{hasbinarypk}) {
-                            $deltabin{$dbname}{join "\0" => @$x} = 1;
+                            $deltabin{$dbname}{join "\0" => @$y} = 1;
                         }
                         else {
                             my $decodename = '';
 
                             my @pk;
-                            for my $row (@$x) {
+                            for my $row (@$y) {
                                 push @pk => $row;
                             }
                             $deltabin{$dbname}{join "\0" => @pk} = 1;
@@ -3288,16 +3341,29 @@ sub start_kid {
                     }
 
                     ## If we are grabbing the 'latest', figure out which it is
+                    ## For this handler, we want to treat all the tables in the sync
+                    ## as deeply linked to each other, and this we have one winning
+                    ## database for *all* tables in the sync.
+                    ## Thus, the only things arriving from other databases will be inserts
                     elsif ('bucardo_latest' eq $g->{standard_conflict}) {
 
-                        ## If this is the first time with a conflict, grab all values
-                        ## We want the latest txntime across all tables for each database
-                        if (! exists $self->{dbhightime}) {
-                            for my $dbname (keys %{ $self->{db_hasconflict} }) {
+                        ## We only need to figure out the winning database once
+                        ## The winner is the latest one to touch any of our tables
+                        ## In theory, this is a little crappy.
+                        ## In practice, it works out quite well. :)
+                        if (! exists $self->{conflictwinner}) {
+
+                            for my $dbname (@dbs_delta) {
+
                                 $x = $sync->{db}{$dbname};
 
-                                $self->{dbhightime}{$dbname} = 0;
+                                ## Start by assuming this DB has no changes
+                                $x->{lastmod} = 0;
+
                                 for my $g (@$goatlist) {
+
+                                    ## This only makes sense for tables
+                                    next if $g->{reltype} ne 'table';
 
                                     ## Prep our SQL: find the epoch of the latest transaction for this table
                                     if (!exists $g->{sql_max_delta}) {
@@ -3306,88 +3372,141 @@ sub start_kid {
                                     }
                                     $sth = $x->{dbh}->prepare($g->{sql_max_delta});
                                     $count = $sth->execute();
-                                    my $epoch = 0;
-                                    if ($count < 1) { ## No rows at all!
+                                    if ($count < 1) { ## No changes means we keep the default of "0"
                                         $sth->finish();
                                     }
                                     else {
-                                        $epoch = $sth->fetchall_arrayref()->[0][0];
+                                        ## Keep in mind we don't really care which table this is
+                                        my $epoch = $sth->fetchall_arrayref()->[0][0];
+                                        if ($epoch > $x->{lastmod}) {
+                                            $x->{lastmod} = $epoch;
+                                        }
                                     }
-                                    if ($epoch > $self->{dbhightime}{$dbname}) {
-                                        $self->{dbhightime}{$dbname} = $epoch;
-                                    }
+
+                                } ## end checking each table in the sync
+
+                            } ## end checking each source database
+
+                            ## Now we declare the overall winner
+                            ## We sort the database names so even in the (very!) unlikely
+                            ## chance of a tie, the same database always wins
+                            my $highest = -1;
+                            for my $dbname (sort @dbs_delta) {
+
+                                $x = $sync->{db}{$dbname};
+
+                                if ($x->{lastmod} > $highest) {
+                                    $highest = $x->{lastmod};
+                                    $self->{conflictwinner} = $dbname;
                                 }
                             }
-                        }
 
-                        ## Walk through each pkey conflict and declare a winner
-                        for my $key (keys %conflict) {
-                            ## Highest one wins
-                            my $highest = 0;
-                            ## The name of the winning database
-                            my $winner;
-                            for my $dbname (sort keys %{ $conflict{$key} }) {
-                                ## We sort the database names so even in the (very!) unlikely
-                                ## chance of a tie, the same database always wins
+                            ## We now have a winning database inside self -> conflictwinner
+                            ## This means we do not need to update %conflict at all
 
-                                if ($self->{dbhightime}{$dbname} > $highest) {
-                                    $highest = $self->{dbhightime}{$dbname};
-                                    $winner = $dbname;
-                                }
-                            }
-                            if (! defined $winner) {
-                                die "Could not determine a winner using 'latest' standard_conflict for $S.$T";
-                            }
-                            $conflict{$key} = $winner;
-                        }
+                        } ## end conflictwinner not set yet
+
                     }
                     else {
 
                         ## Use the standard conflict: a list of database names
+                        ## Basically, we use the first valid one we find
+                        ## The only reason *not* to use an entry is if it had
+                        ## no updates at all for this run. Note: this does not
+                        ## mean no conflicts, it means no insert/update/delete
 
-                        ## Optimize for a single database name
-                        my $sc = $g->{standard_conflict};
-                        if (index($sc, ' ') < 1) {
-                            ## Sanity check
-                            if (! exists $deltabin{$sc}) {
-                                die "Invalid standard_conflict '$sc' used for $S.$T";
-                            }
-                            for my $key (keys %conflict) {
-                                $conflict{$key} = $sc;
-                            }
-                        }
-                        ## Not a single name? See which one wins for each key
-                        else {
-                            my @dbs = split / +/ => $sc;
-                            ## Make sure they all exist
-                            for my $db (@dbs) {
-                                if (! exists $deltabin{$db}) {
-                                    die qq{Invalid database "$db" found in standard conflict for $S.$T};
+                        if (! exists $self->{conflictwinner}) {
+
+                            ## Optimize for a single database name
+                            my $sc = $g->{standard_conflict};
+                            if (index($sc, ' ') < 1) {
+                                ## Sanity check
+                                if (! exists $deltacount{$sc}) {
+                                    die "Invalid standard_conflict '$sc' used for $S.$T";
                                 }
+                                $self->{conflictwinner} = $sc;
                             }
-                            ## Loop through each collision and set the winning database
-                            for my $key (keys %conflict) {
-                                my $winner;
-                                ## Check each database in order to see if it has this key
-                                for my $db (@dbs) {
-                                    if (exists $conflict{$key}{$db}) {
-                                        $winner = $db;
-                                        last;
+                            else {
+                                ## Have more than one, so figure out the best one to use
+                                my @dbs = split / +/ => $sc;
+                                ## Make sure they all exist
+                                for my $dbname (@dbs) {
+                                    if (! exists $deltacount{$dbname}) {
+                                        die qq{Invalid database "$dbname" found in standard conflict for $S.$T};
                                     }
                                 }
-                                $conflict{$key} = $winner;
+
+                                ## Check each candidate in turn
+                                ## It wins, unless it has no changes at all
+                                for my $dbname (@dbs) {
+
+                                    my $found_delta = 0;
+
+                                    ## Walk through but stop at the first found delta
+                                    for my $g (@$goatlist) {
+
+                                        ## This only makes sense for tables
+                                        next if $g->{reltype} ne 'table';
+
+                                        ## Prep our SQL: find the epoch of the latest transaction for this table
+                                        if (!exists $g->{sql_got_delta}) {
+                                            ## We need to know if any have run since the last time we ran this sync
+                                            ## In other words, any deltas newer than the highest track entry
+                                            $SQL = qq{SELECT COUNT(*) FROM bucardo.$g->{deltatable} d }
+                                                 . qq{WHERE d.txntime > }
+                                                 . qq{(SELECT MAX(txntime) FROM bucardo.$g->{tracktable} }
+                                                 . qq{WHERE target = '$x->{TARGETNAME}')};
+                                            $g->{sql_got_delta} = $SQL;
+                                        }
+                                        $sth = $x->{dbh}->prepare($g->{sql_got_delta});
+                                        $count = $sth->execute();
+                                        $sth->finish();
+                                        if ($count >= 1) {
+                                            $found_delta = 1;
+                                            last;
+                                        }
+                                    }
+
+                                    if (! $found_delta) {
+                                        $self->glog("No rows changed, so discarding conflict winner '$dbname'", LOG_VERBOSE);
+                                        next;
+                                    }
+
+                                    $self->{conflictwinner} = $dbname;
+                                    last;
+
+                                }
+
+                                ## No match at all? Must be a non-inclusive list
+                                if (! exists $self->{conflictwinner}) {
+                                    die qq{Invalid standard conflict '$sc': no matching database found!};
+                                }
                             }
-                        }
+                        } ## end conflictwinner not set yet
+
                     } ## end standard conflict
 
-                    ## At this point, %conflict should hold the keys and the winning database
+                    ## At this point, conflictwinner should be set, OR
+                    ## %conflict should hold the winning database per key
                     ## Walk through and apply to the %deltabin hash
+
+                    ## We want to walk through each primary key for this table
+                    ## We figure out who the winning database is
+                    ## Then we remove all rows for all databases with this key
+                    ## Finally, we add the winning databases/key combo to deltabin
+                    ## We do it this way as we cannot be sure that the combo existed.
+                    ## It could be the case that the winning database made
+                    ## no changes to this table!
                     for my $key (keys %conflict) {
-                        my $winner = $conflict{$key};
+                        my $winner = $self->{conflictwinner} || $conflict{$key};
+
+                        ## Delete everyone for this primary key
                         for my $dbname (keys %deltabin) {
-                            next if $winner eq $dbname;
                             delete $deltabin{$dbname}{$key};
                         }
+
+                        ## Add (or re-add) the winning one
+                        $deltabin{$winner}{$key} = 1;
                     }
 
                     $self->glog('Conflicts have been resolved', LOG_NORMAL);
@@ -3395,6 +3514,7 @@ sub start_kid {
                 } ## end if have conflicts
 
                 ## At this point, %deltabin should contain a single copy of each primary key
+                ## It may even be empty if we are truncating
 
                 ## We need to figure out how many sources we have for some later optimizations
                 my $numsources = keys %deltabin;
@@ -3403,9 +3523,11 @@ sub start_kid {
                 ## If there is only one source, then it will *not* get written to
                 ## If there is more than one source, then everyone gets written to!
                 for my $dbname (keys %{ $sync->{db} }) {
+
                     $x = $sync->{db}{$dbname};
 
                     ## Again: everyone is written to unless there is a single source
+                    ## A truncation source may have an empty deltabin, but it will exist
                     $x->{writtento} = (1==$numsources and exists $deltabin{$dbname}) ? 0 : 1;
                     next if ! $x->{writtento};
 
@@ -3557,10 +3679,30 @@ sub start_kid {
                             ## to all other databases for this sync
                             for my $dbname1 (sort keys %deltabin) {
 
+                                ## If we are doing a truncate, delete everything from all other dbs!
+                                if (exists $g->{truncatewinner}) {
+
+                                    for my $dbnamet (@dbs) {
+
+                                        ## Exclude ourselves, which should be the only thing in deltabin!
+                                        next if $dbname1 eq $dbnamet;
+
+                                        ## Grab the real target name
+                                        my $tname = $g->{newname}{$syncname}{$dbnamet};
+
+                                        $x = $sync->{db}{$dbnamet};
+
+                                        my $do_cascade = 0;
+                                        $self->truncate_table($x, $tname, $do_cascade);
+                                    }
+                                    ## We keep going, in case the source has post-truncation items
+                                }
+
                                 ## How many rows are we pushing around? If none, we done!
                                 my $rows = keys %{ $deltabin{$dbname1} };
                                 $self->glog("Rows to push from $dbname1.$S.$T: $rows", LOG_VERBOSE);
-                                next if ! $rows and ! exists $self->{truncateinfo}{$S}{$T};
+                                ## This also exits us if we are a truncate with no source rows
+                                next if ! $rows;
 
                                 ## Build the list of target databases we are pushing to
                                 my @pushdbs;
@@ -3640,6 +3782,13 @@ sub start_kid {
                         (my $err = $@) =~ s/\n/\\n/g;
 
                         ## If we have no exception code, we simply pass to our __DIE__ sub
+                        ## XXX If no handler, we want to rewind and try again ourselves
+                        ## XXX But this time, we want to enter a more aggressive conflict resolution mode
+                        ## XXX Specifically, we need to ensure that a single database "wins" and that
+                        ## XXX all table changes therein come from that database.
+                        ## XXX No need if we only have a single table, of course, or if there were 
+                        ## XXX no possible conflicting changes.
+                        ## XXX Finally, we skip if the firsst run already had a canonical winner
                         if (!$g->{has_exception_code}) {
                             $self->glog("Warning! Aborting due to exception for $S.$T:$pkval Error was $err", LOG_WARN);
                             die "$err\n";
@@ -3721,12 +3870,10 @@ sub start_kid {
 
                         ## The custom code wants to try again
 
-                        ## Make sure the database connections are still clean
-                        for my $dbname (@dbs_non_fullcopy) {
+                        ## Make sure the Postres database connections are still clean
+                        for my $dbname (@dbs_postgres) {
 
                             $x = $sync->{db}{$dbname};
-
-                            next if $x->{dbtype} ne 'postgres';
 
                             my $ping = $sync->{db}{$dbname}{dbh}->ping();
                             if ($ping !~ /^[123]$/o) {
@@ -3844,7 +3991,7 @@ sub start_kid {
                 $sourcename = $dbname;
                 $sourcedbh = $x->{dbh};
                 $sourcex = $x;
-                $self->glog("For fullcopy, we are using source database $sourcename", LOG_VERBOSE);
+                $self->glog(qq{For fullcopy, we are using source database "$sourcename"}, LOG_VERBOSE);
                 last;
 
             }
@@ -3898,9 +4045,6 @@ sub start_kid {
                     for my $dbname (@dbs_fullcopy) {
 
                         $x = $sync->{db}{$dbname};
-
-                        ## Skip if this is an original fullcopy target
-                        next if $x->{dbtype} eq 'fullcopy';
 
                         my $tname = $g->{newname}{$syncname}{$dbname};
 
@@ -3957,7 +4101,7 @@ sub start_kid {
                             }
                         }
 
-                        if ($x->{dbtype} eq 'mysql') {
+                        if ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
                             $SQL = "ALTER TABLE $tname DISABLE KEYS";
                             $self->glog("Disabling keys for $tname on $dbname", LOG_NORMAL);
                             $x->{dbh}->do($SQL);
@@ -4019,7 +4163,7 @@ sub start_kid {
 
                     } ## end postgres
 
-                    $self->glog(qq{Emptying out "$dbname.$tname" using $sync->{deletemethod}}, LOG_VERBOSE);
+                    $self->glog(qq{Emptying out $dbname.$tname using $sync->{deletemethod}}, LOG_VERBOSE);
                     my $use_delete = 1;
 
                     ## By hook or by crook, empty this table
@@ -4085,7 +4229,7 @@ sub start_kid {
                             $self->pretty_time(tv_interval($t0), 'day'), $tname)), LOG_NORMAL);
                     }
 
-                    if ($x->{dbtype} eq 'mysql') {
+                    if ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
                         $SQL = "ALTER TABLE $tname ENABLE KEYS";
                         $self->glog("Enabling keys for $tname on $dbname", LOG_NORMAL);
                         $x->{dbh}->do($SQL);
@@ -4113,7 +4257,7 @@ sub start_kid {
         } ## end have some fullcopy targets
 
         ## Close filehandles for any flatfile databases
-        for my $dbname (keys %{ $sync->{db} }) { ## ZZZ Use a dbs_flat?
+        for my $dbname (keys %{ $sync->{db} }) {
             $x = $sync->{db}{$dbname};
 
             next if $x->{dbtype} !~ /flat/o;
@@ -4194,7 +4338,7 @@ sub start_kid {
                 $self->glog(qq{Enabling triggers and rules on $dbname via pg_class}, LOG_VERBOSE);
                 $x->{dbh}->do($SQL{enable_trigrules});
             }
-            elsif ($x->{dbtype} eq 'mysql') {
+            elsif ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
 
                 $self->glog(qq{Turning foreign key checks back on for $dbname}, LOG_VERBOSE);
                 $x->{dbh}->do('SET foreign_key_checks = 1');
@@ -4215,6 +4359,10 @@ sub start_kid {
             for my $dbname (@dbs_dbi) {
                 $sync->{db}{$dbname}{dbh}->rollback();
             }
+            for my $dbname (@dbs_redis) {
+                ## Implement DISCARD when the client supports it
+                ##$sync->{db}{$dbname}{dbh}->discard();
+            }
             $maindbh->rollback();
         }
         else {
@@ -4230,6 +4378,10 @@ sub start_kid {
             for my $dbname (@dbs_dbi) {
                 next if $x->{writtento};
                 $sync->{db}{$dbname}{dbh}->commit();
+            }
+            for my $dbname (@dbs_redis) {
+                ## Implement EXEC when the client supports it
+                ## $sync->{db}{$dbname}{dbh}->exec();
             }
             $self->glog(q{All databases committed}, LOG_VERBOSE);
         }
@@ -4283,11 +4435,11 @@ sub start_kid {
         my $synctime = sprintf '%.2f', tv_interval($kid_start_time);
         $self->glog((sprintf 'Total time for sync "%s" (%s rows): %s%s',
                     $syncname,
-                    $deltacount{all},
+                    $dmlcount{inserts},
                     pretty_time($synctime),
                     $synctime < 120 ? '' : " ($synctime seconds)",),
                     ## We don't want to output a "finished" if no changes made unless verbose
-                    $deltacount{all} ? LOG_NORMAL : LOG_VERBOSE);
+                    $dmlcount{allinserts}{target} ? LOG_NORMAL : LOG_VERBOSE);
 
         ## Update our rate information as needed
         if ($sync->{track_rates}) {
@@ -4406,6 +4558,7 @@ sub start_kid {
     }
 
     if ($sync->{onetimecopy}) {
+        ## XXX
         ## We need the MCP and CTL to pick up the new setting. This is the easiest way:
         ## First we sleep a second, to make sure the CTL has picked up the syncdone 
         ## signal. It may resurrect a kid, but it will at least have the correct onetimecopy
@@ -4490,7 +4643,7 @@ sub connect_database {
 
             return $backend, $dbh;
         }
-        elsif ('mysql' eq $dbtype) {
+        elsif ('mysql' eq $dbtype or 'mariadb' eq $dbtype) {
             $dsn = "dbi:mysql:database=$d->{dbname}";
         }
         elsif ('oracle' eq $dbtype) {
@@ -4602,26 +4755,26 @@ sub reload_config_database {
         DEBUG   => 4,
     );
 
-    $SQL = 'SELECT setting,value,about,type,name FROM bucardo_config';
+    $SQL = 'SELECT name,setting,about,type,name FROM bucardo_config';
     $sth = $self->{masterdbh}->prepare($SQL);
     $sth->execute();
     for my $row (@{$sth->fetchall_arrayref({})}) {
         ## Things from an rc file can override the value in the db
-        my $value = exists $self->{$row->{setting}} ? $self->{$row->{setting}} : $row->{value};
-        if ($row->{setting} eq 'log_level') {
-            my $newvalue = $log_level_number{uc $value};
+        my $setting = exists $self->{$row->{name}} ? $self->{$row->{name}} : $row->{setting};
+        if ($row->{name} eq 'log_level') {
+            my $newvalue = $log_level_number{uc $setting};
             if (! defined $newvalue) {
                 die "Invalid log_level!\n";
             }
             $config{log_level_number} = $newvalue;
         }
         if (defined $row->{type}) {
-            $config{$row->{type}}{$row->{name}}{$row->{setting}} = $value;
+            $config{$row->{type}}{$row->{name}}{$row->{setting}} = $setting;
             $config_about{$row->{type}}{$row->{name}}{$row->{setting}} = $row->{about};
         }
         else {
-            $config{$row->{setting}} = $value;
-            $config_about{$row->{setting}} = $row->{about};
+            $config{$row->{name}} = $setting;
+            $config_about{$row->{name}} = $row->{about};
         }
     }
     $self->{masterdbh}->commit();
@@ -4832,7 +4985,7 @@ sub show_db_version_and_time {
 sub get_dbs {
 
     ## Fetch a hashref of everything in the db table
-    ## Used by start_controller(), connect_database()
+    ## Used by connect_database()
     ## Calls commit on the masterdbh
     ## Arguments: none
     ## Returns: hashref
@@ -5289,8 +5442,7 @@ sub validate_sync {
     $count = $sth->execute($s->{dbs});
     $s->{db} = $sth->fetchall_hashref('name');
 
-    ## We don't have synctypes anymore, but it is helpful to know if we are fullcopy
-    ## In this case, fullcopy means no target databases
+    ## Figure out what role each database will play in this sync
     my %role = ( source => 0, target => 0, fullcopy => 0);
 
     ## Establish a connection to each database used
@@ -5332,7 +5484,7 @@ sub validate_sync {
             $self->show_db_version_and_time($x->{dbh}, qq{DB "$dbname" });
         }
 
-        ## Help figure out the synctype
+        ## Help figure out source vs target later on
         $role{$d->{role}}++;
 
         ## We want to grab the first source we find and populate $sourcename and $srcdbh
@@ -5342,10 +5494,6 @@ sub validate_sync {
         }
 
     } ## end each database
-
-    ## If we found no target roles but have at least one fullcopy, mark the sync as fullcopy
-    $s->{synctype} = ($role{target} < 1 and $role{fullcopy} >= 1 and $role{source} == 1)
-        ? 'fullcopy' : 'delta';
 
     ## If we have more than one source, then everyone is a target
     ## Otherwise, only non-source databases are
@@ -5489,7 +5637,7 @@ sub validate_sync {
     } ## end each goat
 
     ## There are things that a fullcopy sync does not do
-    if ($s->{synctype} eq 'fullcopy') {
+    if ($s->{fullcopy}) {
         $s->{track_rates} = 0;
     }
 
@@ -5516,9 +5664,9 @@ sub validate_sync {
         ## Check the source table, save escaped versions of the names
 
         $sth = $sth{checktable};
-        $count = $sth->execute("$g->{schemaname}.$g->{tablename}");
+        $count = $sth->execute(qq{"$g->{schemaname}"."$g->{tablename}"});
         if ($count != 1) {
-            my $msg = qq{Could not find $g->{reltype} "$g->{schemaname}.$g->{tablename}"\n};
+            my $msg = qq{Could not find $g->{reltype} "$g->{schemaname}"."$g->{tablename}"\n};
             $self->glog($msg, LOG_WARN);
             warn $msg;
             return 0;
@@ -5571,16 +5719,23 @@ sub validate_sync {
             $sth = $self->{masterdbh}->prepare($SQL);
             $sth->execute($S.'_'.$T);
             $g->{makername} = $sth->fetchall_arrayref()->[0][0];
-            $g->{deltatable} = "delta_$g->{makername}";
-            $g->{tracktable} = "track_$g->{makername}";
-            $g->{stagetable} = "stage_$g->{makername}";
+            if ($g->{makername} =~ s/"//g) {
+                $g->{deltatable} = qq{"delta_$g->{makername}"};
+                $g->{tracktable} = qq{"track_$g->{makername}"};
+                $g->{stagetable} = qq{"stage_$g->{makername}"};
+            }
+            else {
+                $g->{deltatable} = "delta_$g->{makername}";
+                $g->{tracktable} = "track_$g->{makername}";
+                $g->{stagetable} = "stage_$g->{makername}";
+            }
 
             ## Turn off the search path, to help the checks below match up
             $srcdbh->do('SET LOCAL search_path = pg_catalog');
 
             ## Check the source columns, and save them
             $sth = $sth{checkcols};
-            $sth->execute("$g->{schemaname}.$g->{tablename}");
+            $sth->execute(qq{"$g->{schemaname}"."$g->{tablename}"});
             $colinfo = $sth->fetchall_hashref('attname');
             ## Allow for 'dead' columns in the attnum ordering
             $x=1;
@@ -5636,10 +5791,11 @@ sub validate_sync {
         next if $g->{reltype} ne 'table';
 
         ## Customselect may be null, so force to a false value
+        ## XXX Customselect has been superceded by customcols
         $g->{customselect} ||= '';
         my $do_customselect = ($g->{customselect} and $s->{usecustomselect}) ? 1 : 0;
         if ($do_customselect) {
-            if ($s->{synctype} ne 'fullcopy') {
+            if (! $s->{fullcopy}) {
                 my $msg = qq{Warning: Custom select can only be used for fullcopy\n};
                 $self->glog($msg, LOG_WARN);
                 warn $msg;
@@ -5668,8 +5824,8 @@ sub validate_sync {
             ## Redis is skipped because we can create keys on the fly
             next if $x->{dbtype} =~ /redis/o;
 
-            ## MySQL/Drizzle/Oracle/SQLite is skipped for now, but should be added later
-            next if $x->{dbtype} =~ /mysql|drizzle|oracle|sqlite/o;
+            ## MySQL/MariaDB/Drizzle/Oracle/SQLite is skipped for now, but should be added later
+            next if $x->{dbtype} =~ /mysql|mariadb|drizzle|oracle|sqlite/o;
 
             ## Respond to ping here and now for very impatient watchdog programs
             $maindbh->commit();
@@ -5709,16 +5865,6 @@ sub validate_sync {
 
             } ## end if sequence
 
-            ## Grab quoted information about the table on the remote database
-            #$sth = $dbh->prepare($SQL{checktable});
-            #$count = $sth->execute("$g->{schemaname}.$g->{tablename}");
-            #if ($count != 1) {
-            #    my $msg = qq{Could not find remote table $g->{schemaname}.$g->{tablename} on $dbname\n};
-            #    $self->glog($msg, LOG_TERSE);
-            #    warn $msg;
-            #    return 0;
-            #}
-
             ## Turn off the search path, to help the checks below match up
             $dbh->do('SET LOCAL search_path = pg_catalog');
 
@@ -5745,7 +5891,7 @@ sub validate_sync {
                 }
             }
 
-            $self->glog(qq{    Inspecting target $g->{reltype} "$RS.$RT" on database "$dbname"}, LOG_NORMAL);
+            $self->glog(qq{   Inspecting target $g->{reltype} "$RS.$RT" on database "$dbname"}, LOG_NORMAL);
 
             $sth->execute("$RS.$RT");
             my $targetcolinfo = $sth->fetchall_hashref('attname');
@@ -5803,7 +5949,7 @@ sub validate_sync {
                 my $fcol = $targetcolinfo->{$colname};
                 my $scol = $colinfo->{$colname};
 
-                $self->glog(qq{    Checking column on target database "$dbname": "$colname" ($scol->{ftype})}, LOG_VERBOSE);
+                $self->glog(qq{    Column on target database "$dbname": "$colname" ($scol->{ftype})}, LOG_DEBUG);
                 ## Always fatal: column on source but not target
                 if (! exists $targetcolinfo->{$colname}) {
                     $column_problems = 2;
@@ -5817,8 +5963,14 @@ sub validate_sync {
                 if ($scol->{ftype} ne $fcol->{ftype}) {
                     ## Carve out some known exceptions (but still warn about them)
                     ## Allowed: varchar == text
-                    if (($scol->{ftype} eq 'character varying' and $fcol->{ftype} eq 'text') or
-                            ($fcol->{ftype} eq 'character varying' and $scol->{ftype} eq 'text')) {
+                    ## Allowed: timestamp* == timestamp*
+                    if (
+                        ($scol->{ftype} eq 'character varying' and $fcol->{ftype} eq 'text')
+                        or
+                        ($scol->{ftype} eq 'text' and $fcol->{ftype} eq 'character varying')
+                        or
+                        ($scol->{ftype} =~ /^timestamp/ and $fcol->{ftype} =~ /^timestamp/)
+                ) {
                         my $msg = qq{Source database for sync "$syncname" has column "$colname" of table "$t" as type "$scol->{ftype}", but target database "$dbname" has a type of "$fcol->{ftype}". You should really fix that.};
                         $self->glog("Warning: $msg", LOG_WARN);
                     }
@@ -5867,6 +6019,7 @@ sub validate_sync {
                     for ($scol_def, $fcol_def) {
                         s/\A\(//;
                         s/\)\z//;
+                        s/\)::/::/;
                     }
                     my $msg;
                     if ($scol_def eq $fcol_def) {
@@ -5963,7 +6116,7 @@ sub activate_sync {
     $self->{sync}{$syncname}{mcp_active} = 1;
 
     ## Let any listeners know we are done
-    $self->db_notify($maindbh, "activated_sync_$syncname");
+    $self->db_notify($maindbh, "activated_sync_$syncname", 1);
     ## We don't need to listen for activation requests anymore
     $self->db_unlisten($maindbh, "activate_sync_$syncname", '', 1);
     ## But we do need to listen for deactivate and kick requests
@@ -6122,6 +6275,10 @@ sub fork_vac {
     if ($newpid) { ## We are the parent
         $self->glog(qq{Created VAC $newpid}, LOG_NORMAL);
         $self->{vacpid} = $newpid;
+        ## We sleep a bit here to increase the chance that the database connections
+        ## below are disassociated before the MCP can come back and possibly
+        ## kill the VAC, causing bad double-free libpq/libc errors
+        sleep 0.5;
         return;
     }
 
@@ -6131,10 +6288,12 @@ sub fork_vac {
     $self->{masterdbh}->{InactiveDestroy} = 1;
     $self->{masterdbh} = 0;
 
+    ## We also need to disassociate ourselves from any open database connections
     for my $dbname (keys %{ $self->{sdb} }) {
         $x = $self->{sdb}{$dbname};
         next if $x->{dbtype} =~ /flat|mongo|redis/o;
         $x->{dbh}->{InactiveDestroy} = 1;
+        $x->{dbh} = 0;
     }
 
     ## Prefix all log lines with this TLA (was MCP)
@@ -6158,9 +6317,6 @@ sub fork_vac {
     };
 
     ## From this point forward, we want to die gracefully
-    #$SIG{TERM} = 'IGNORE';
-
-    ## From this point forward, we want to die gracefully
     $SIG{__DIE__} = sub {
 
         ## Arguments: one
@@ -6173,12 +6329,11 @@ sub fork_vac {
         my $line = (caller)[2];
 
         ## Don't issue a warning if this was simply a MCP request
-        my $warn = $diemsg =~ /MCP request/ ? '' : 'Warning! ';
+        my $warn = $diemsg =~ /MCP request|not needed/ ? '' : 'Warning! ';
         $self->glog(qq{${warn}VAC was killed at line $line: $diemsg}, LOG_WARN);
 
         ## Not a whole lot of cleanup to do on this one: just shut database connections and leave
-
-        ## TODO: Disconnect from all databases
+        $self->{masterdbh}->disconnect();
 
         ## Remove our pid file
         unlink $self->{vacpidfile} or $self->glog("Warning! Failed to unlink $self->{vacpidfile}", LOG_WARN);
@@ -6208,8 +6363,10 @@ sub fork_vac {
 
         $x = $self->{sdb}{$dbname};
 
-        ## Source only, of course: nobody else has delta and track tables
-        next if $x->{role} ne 'source';
+        ## We looped through all the syncs earlier to determine which databases
+        ## really need to be vacuumed. The criteria:
+        ## not a fullcopy sync, dbtype is postgres, role is source
+        next if ! $x->{needsvac};
 
         ## Overwrites the MCP database handles
         ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
@@ -6267,14 +6424,31 @@ sub fork_vac {
 
             $lastvacrun = time();
 
+            ## If there are no valid backends, we want to stop running entirely
+            my $valid_backends = 0;
+
             ## Kick each one off async
             for my $dbname (sort keys %{ $self->{sdb}} ) {
 
                 $x = $self->{sdb}{$dbname};
 
-                next if $x->{role} ne 'source';
+                next if ! $x->{needsvac};
 
                 my $xdbh = $x->{dbh};
+
+                ## Safety check: if the bucardo schema is not there, we don't want to vacuum
+                if (! exists $x->{hasschema}) {
+                    $SQL = q{SELECT count(*) FROM pg_namespace WHERE nspname = 'bucardo'};
+                    $x->{hasschema} = $xdbh->selectall_arrayref($SQL)->[0][0];
+                    if (! $x->{hasschema} ) {
+                        $self->glog("Warning! Cannot vacuum db $dbname unless we have a bucardo schema", LOG_WARN);
+                    }
+                }
+
+                ## No schema? We've already complained, so skip it silently
+                next if ! $x->{hasschema};
+
+                $valid_backends++;
 
                 ## Async please
                 $self->glog(qq{Running bucardo_purge_delta on database "$dbname"}, LOG_VERBOSE);
@@ -6284,12 +6458,27 @@ sub fork_vac {
 
             } ## end each source database
 
-            ## Kick each one off async
+            ## If we found no backends, we can leave right away, and not run again
+            if (! $valid_backends) {
+
+                $self->glog("Warning! No valid backends, so disabling the VAC daemon", LOG_WARN);
+
+                $config{bucardo_vac} = 0;
+
+                ## Caught by handler above
+                die "Not needed";
+
+            }
+
+            ## Finish each one up
             for my $dbname (sort keys %{ $self->{sdb}} ) {
 
                 $x = $self->{sdb}{$dbname};
 
-                next if $x->{role} ne 'source';
+                ## As above, skip if not a source or no schema available
+                next if ! $x->{needsvac};
+
+                next if ! $x->{hasschema};
 
                 my $xdbh = $x->{dbh};
 
@@ -6520,7 +6709,12 @@ sub cleanup_mcp {
         next if $pidfile eq 'bucardo.mcp.pid'; ## That's us!
         my $pfile = File::Spec->catfile( $piddir => $pidfile );
         if (-e $pfile) {
-            $self->kill_bucardo_pidfile($pfile);
+            $self->glog("Trying to kill stale PID file $pidfile", LOG_DEBUG);
+            my $result = $self->kill_bucardo_pidfile($pfile);
+            if ($result == -4) { ## kill 0 indicates that PID is no more
+                $self->glog("PID from $pidfile is gone, removing file", LOG_NORMAL);
+                unlink $pfile;
+            }
         }
     }
 
@@ -6769,7 +6963,8 @@ sub signal_pid_files {
     my $signalled = 0;
 
     ## Open the directory that contains our PID files
-    opendir my $dh, $config{piddir} or die qq{Could not opendir "$config{piddir}": $!\n};
+    my $piddir = $config{piddir};
+    opendir my $dh, $piddir or die qq{Could not opendir "$piddir": $!\n};
     my ($name, $fh);
     while (defined ($name = readdir($dh))) {
 
@@ -6779,7 +6974,7 @@ sub signal_pid_files {
         $self->glog(qq{Attempting to signal PID from file "$name"}, LOG_TERSE);
 
         ## File must be readable
-        my $cfile = File::Spec->catfile( $config{piddir} => $name );
+        my $cfile = File::Spec->catfile( $piddir => $name );
         if (! open $fh, '<', $cfile) {
             $self->glog(qq{Could not open $cfile: $!}, LOG_WARN);
             next;
@@ -6806,7 +7001,7 @@ sub signal_pid_files {
 
     } ## end each file in the pid directory
 
-    closedir $dh or warn qq{Warning! Could not closedir "$config{piddir}": $!\n};
+    closedir $dh or warn qq{Warning! Could not closedir "$piddir": $!\n};
 
     return $signalled;
 
@@ -6835,7 +7030,7 @@ sub cleanup_controller {
     }
 
     ## Ask all kids to exit as well
-    my $exitname = "kid_stop_$self->{syncname}";
+    my $exitname = "kid_stopsync_$self->{syncname}";
     $self->{masterdbh}->rollback();
     $self->db_notify($self->{masterdbh}, $exitname);
 
@@ -7008,7 +7203,6 @@ sub run_ctl_custom_code {
 
     $input = {
         sourcedbh  => $sync->{safe_sourcedbh},
-        synctype   => $sync->{synctype},
         syncname   => $sync->{name},
         goatlist   => $sync->{goatlist},
         sourcename => $sync->{sourcedb},
@@ -7133,7 +7327,7 @@ sub get_deadlock_details {
         next if $1 == $pid;
         my ($process,$locktype,$relation) = ($1,$2,$3);
         ## Fetch the relation name
-        my $getname = $dldbh->prepare('SELECT relname FROM pg_class WHERE oid = ?');
+        my $getname = $dldbh->prepare(q{SELECT nspname||'.'||relname FROM pg_class c, pg_namespace n ON (n.oid=c.relnamespace) WHERE c.oid = ?});
         $getname->execute($relation);
         my $relname = $getname->fetchall_arrayref()->[0][0];
 
@@ -7151,7 +7345,7 @@ SELECT
   CASE WHEN query_start IS NULL THEN '?' ELSE
     TO_CHAR(query_start, 'HH24:MI:SS (YYYY-MM-DD)') END AS query_started,
   CASE WHEN query_start IS NULL THEN '?' ELSE
-    TO_CHAR($clock_timestamp - query_start, 'HH24:MI:SS') END AS query_age
+    TO_CHAR($clock_timestamp - query_start, 'HH24:MI:SS') END AS query_age,
   COALESCE(host(client_addr)::text,''::text) AS ip,
   CASE WHEN client_port <= 0 THEN 0 ELSE client_port END AS port,
   usename AS user
@@ -7354,9 +7548,11 @@ sub adjust_sequence {
 
     ## Walk through all Postgres databases and set the sequence
     for my $dbname (sort keys %{ $sync->{db} }) {
+
         next if $dbname eq $winner; ## Natch
 
         $x = $sync->{db}{$dbname};
+
         next if $x->{dbtype} ne 'postgres';
 
         next if ! $x->{adjustsequence};
@@ -7390,7 +7586,10 @@ sub adjust_sequence {
             ## Skip if these items are the exact same
             next if exists $targetinfo->{last_value} and $sourceinfo->{$name} eq $targetinfo->{$name};
 
-            $self->glog("Sequence $S.$T has a different $name value: was $targetinfo->{$name}, now $sourceinfo->{$name}", LOG_VERBOSE);
+            ## Fullcopy will not have this, and we won't report it
+            if (exists $targetinfo->{last_value}) {
+                $self->glog("Sequence $S.$T has a different $name value: was $targetinfo->{$name}, now $sourceinfo->{$name}", LOG_VERBOSE);
+            }
 
             ## If this is a boolean setting, we want to simply prepend a 'NO' for false
             if ($syntax =~ s/BOOL //) {
@@ -7607,13 +7806,14 @@ sub truncate_table {
         $tname,
         ($cascade and $x->{does_cascade}) ? ' CASCADE' : '';
         my $truncate_ok = 0;
+
         eval {
             $x->{dbh}->do($SQL);
             $truncate_ok = 1;
         };
         if (! $truncate_ok) {
             $x->{does_savepoints} and $x->{dbh}->do('ROLLBACK TO truncate_attempt');
-            $self->glog("Truncate error: $@", LOG_NORMAL);
+            $self->glog("Truncate error for db $x->{name}.$x->{dbname}.$tname: $@", LOG_NORMAL);
             return 0;
         }
         else {
@@ -7629,7 +7829,9 @@ sub truncate_table {
     }
 
     elsif ('redis' eq $x->{dbtype}) {
-        ## Do nothing here yet
+        ## No real equivalent here, as we do not map tables 1:1 to redis keys
+        ## In theory, we could walk through all keys and delete ones that match the table
+        ## We will hold off until someone actually needs that, however :)
         return 1;
     }
 
@@ -7660,7 +7862,7 @@ sub delete_table {
         $count = $res->{n};
     }
     elsif ('redis' eq $x->{dbtype}) {
-        ## Do nothing here yet
+        ## Nothing relevant here, as the table is only part of the key name
     }
     else {
         die "Do not know how to delete a dbtype of $x->{dbtype}";
@@ -7700,6 +7902,11 @@ sub delete_rows {
 
     my $newname = $goat->{newname}{$self->{syncname}};
 
+    ## Have we already truncated this table? If yes, skip and reset the flag
+    if (exists $goat->{truncatewinner}) {
+        return 0;
+    }
+
     ## Are we truncating?
     if (exists $self->{truncateinfo}{$S}{$T}) {
 
@@ -7715,7 +7922,7 @@ sub delete_rows {
             ## sync (herd), and we have turned all FKs off
             if ('postgres' eq $type) {
                 my $tdbh = $t->{dbh};
-                $tdbh->do("TRUNCATE TABLE $tname", { pg_async => PG_ASYNC });
+                $tdbh->do("TRUNCATE table $tname", { pg_async => PG_ASYNC });
             } ## end postgres database
             ## For all other SQL databases, we simply truncate
             elsif ($x->{does_sql}) {
@@ -7754,6 +7961,11 @@ sub delete_rows {
 
     } ## end truncation
 
+    ## The number of items before we break it into a separate statement
+    ## This is inexact, as we don't know how large each key is,
+    ## but should be good enough as long as not set too high.
+    my $chunksize = $config{statement_chunk_size} || 10_000;
+
     ## Setup our deletion SQL as needed
     my %SQL;
     for my $t (@$deldb) {
@@ -7768,7 +7980,7 @@ sub delete_rows {
         if ('postgres' eq $type) {
             $sqltype = (1 == $numpks) ? 'ANY' : 'PGIN';
         }
-        elsif ('mysql' eq $type or 'drizzle' eq $type) {
+        elsif ('mysql' eq $type or 'drizzle' eq $type or 'mariadb' eq $type) {
             $sqltype = 'MYIN';
         }
         elsif ('oracle' eq $type) {
@@ -7789,11 +8001,6 @@ sub delete_rows {
 
         ## We may want to break this up into separate rounds if large
         my $round = 0;
-
-        ## The number of items before we break it into a separate statement
-        ## This is inexact, as we don't know how large each key is,
-        ## but should be good enough as long as not set too high.
-        my $chunksize = $config{statement_chunk_size} || 10_000;
 
         ## Internal counter of how many items we've processed this round
         my $roundtotal = 0;
@@ -7931,41 +8138,124 @@ sub delete_rows {
         } ## end postgres database
 
         if ('mongo' eq $type) {
+
+            ## Grab the collection name and store it
             $self->{collection} = $t->{dbh}->get_collection($tname);
 
-            ## We want the 'raw' versions of the primary keys
+            ## Because we may have multi-column primary keys, and each key may need modifying,
+            ## we have to put everything into an array of arrays.
+            ## The first level is the primary key number, the next is the actual values
+            my @delkeys = [];
 
-            ## If this is a binary pkey, we need to decode it
-            my $delkeys = [];
+            ## The pkcolsraw variable is a simple comma-separated list of PK column names
+            ## The rows variable is a hash with the PK values as keys (the values can be ignored)
+
+            ## Binary PKs are easy: all we have to do is decode
+            ## We can assume that binary PK means not a multi-column PK
             if ($goat->{hasbinarypkey}) {
-                for my $k (keys %$rows) {
-                    push @$delkeys => decode_base64($k);
-                }
+                @{ $delkeys[0] } = map { decode_base64($_) } keys %$rows;
             }
             else {
-                ## Need to make sure we send non-strings as the correct type
-                if ($goat->{columnhash}{$pkcolsraw}{ftype} =~ /smallint|integer|bigint/o) {
-                    $delkeys = [ map { int $_ } keys %$rows ];
+
+                ## Break apart the primary keys into an array of arrays
+                my @fullrow = map { [split '\0'] } keys %$rows;
+
+                ## Which primary key column we are currently using
+                my $pknum = 0;
+
+                ## Walk through each column making up the primary key
+                for my $realpkname (split /,/ => $pkcolsraw) {
+
+                    ## Grab what type this column is
+                    ## We need to map non-strings to correct types as best we can
+                    my $type = $goat->{columnhash}{$realpkname}{ftype};
+
+                    ## For integers, we simply force to a Perlish int
+                    if ($type =~ /smallint|integer|bigint/o) {
+                        @{ $delkeys[$pknum] } = map { int $_->[$pknum] } @fullrow;
+                    }
+                    ## Non-integer numbers get set via the strtod command from the 'POSIX' module
+                    elsif ($type =~ /real|double|numeric/o) {
+                        @{ $delkeys[$pknum] } = map { strtod $_->[$pknum] } @fullrow;
+                    }
+                    ## Boolean becomes true Perlish booleans via the 'boolean' module
+                    elsif ($type eq 'boolean') {
+                        @{ $delkeys[$pknum] } = map { $_->[$pknum] eq 't' ? true : false } @fullrow;
+                    }
+                    ## Everything else gets a direct mapping
+                    else {
+                        @{ $delkeys[$pknum] } = map { $_->[$pknum] } @fullrow;
+                    }
+                    $pknum++;
                 }
-                elsif ($goat->{columnhash}{$pkcolsraw}{ftype} eq 'boolean') {
-                    $delkeys = [ map { $_ eq 't' ? true : false } keys %$rows ];
-                }
-                elsif ($goat->{columnhash}{$pkcolsraw}{ftype} =~ /real|double|numeric/o) {
-                    $delkeys = [ map { strtod $_ } keys %$rows ];
+            } ## end of multi-column PKs
+
+            ## How many items we end up actually deleting
+            $count{$t} = 0;
+
+            ## We may need to batch these to keep the total message size reasonable
+            my $max = keys %$rows;
+            $max--;
+
+            ## The bottom of our current array slice
+            my $bottom = 0;
+
+            ## This loop limits the size of our delete requests to mongodb
+          MONGODEL: {
+                ## Calculate the current top of the array slice
+                my $top = $bottom + $chunksize;
+
+                ## Stop at the total number of rows
+                $top = $max if $top > $max;
+
+                ## If we have a single key, we can use the '$in' syntax
+                if ($numpks <= 1) {
+                    my @newarray = @{ $delkeys[0] }[$bottom..$top];
+                    my $result = $self->{collection}->remove(
+                        {$pkcolsraw => { '$in' => \@newarray }}, { safe => 1 });
+                    $count{$t} += $result->{n};
                 }
                 else {
-                    $delkeys = [keys %$rows];
+                    ## For multi-column primary keys, we cannot use '$in', sadly.
+                    ## Thus, we will just call delete once per row
+
+                    ## Put the names into an easy to access array
+                    my @realpknames = split /,/ => $pkcolsraw;
+
+                    my @find;
+
+                    ## Which row we are currently processing
+                    my $numrows = scalar keys %$rows;
+                    for my $rownumber (0..$numrows-1) {
+                        for my $pknum (0..$numpks-1) {
+                            push @find => $realpknames[$pknum], $delkeys[$pknum][$rownumber];
+                        }
+                    }
+
+                    my $result = $self->{collection}->remove(
+                        { '$and' => \@find }, { safe => 1 });
+
+                    $count{$t} += $result->{n};
+
+                    ## We do not need to loop, as we just went 1 by 1 through the whole list
+                    last MONGODEL;
+
                 }
+
+                ## Bail out of the loop if we've hit the max
+                last MONGODEL if $top >= $max;
+
+                ## Assign the bottom of our array slice to be above the current top
+                $bottom = $top + 1;
+
+                redo MONGODEL;
             }
 
-            my $result = $self->{collection}->remove
-                ({$pkcolsraw => { '$in' => $delkeys }}, { safe => 1 } );
-            $count{$t} = $result->{n};
             $self->glog("Mongo objects removed from $tname: $count{$t}", LOG_VERBOSE);
             next;
         }
 
-        if ('mysql' eq $type or 'drizzle' eq $type) {
+        if ('mysql' eq $type or 'drizzle' eq $type or 'mariadb' eq $type) {
             my $tdbh = $t->{dbh};
             for (@{ $SQL{MYIN} }) {
                 ($count{$t} += $tdbh->do($_)) =~ s/0E0/0/o;
@@ -7982,7 +8272,15 @@ sub delete_rows {
         }
 
         if ('redis' eq $type) {
-            ## TODO
+            ## We need to remove the entire tablename:pkey:column for each column we know about
+            my $cols = $goat->{cols};
+            for my $pk (keys %$rows) {
+                ## If this is a multi-column primary key, change our null delimiter to a colon
+                if ($goat->{numpkcols} > 1) {
+                    $pk =~ s{\0}{:}go;
+                }
+                $count = $t->{dbh}->del("$tname:$pk");
+            }
             next;
         }
 
@@ -8160,7 +8458,9 @@ sub push_rows {
 
             ## The columns we are pushing to, both as an arrayref and a CSV:
             my $cols = $goat->{tcolumns}{$SELECT};
-            my $columnlist = '(' . (join ',', map { $t->{dbh}->quote_identifier($_) } @$cols) . ')';
+            my $columnlist = $t->{does_sql} ? 
+                ('(' . (join ',', map { $t->{dbh}->quote_identifier($_) } @$cols) . ')')
+              : ('(' . (join ',', map { $_ } @$cols) . ')');
 
             my $type = $t->{dbtype};
 
@@ -8183,9 +8483,10 @@ sub push_rows {
                 $self->{collection} = $t->{dbh}->get_collection($tname);
             }
             elsif ('redis' eq $type) {
-                ## TODO
+                ## No prep needed, other than to reset our count of changes
+                $t->{redis} = 0;
             }
-            elsif ('mysql' eq $type or 'drizzle' eq $type) {
+            elsif ('mysql' eq $type or 'drizzle' eq $type or 'mariadb' eq $type) {
                 my $tgtcmd = "INSERT INTO $tname$columnlist VALUES (";
                 $tgtcmd .= '?,' x @$cols;
                 $tgtcmd =~ s/,$/)/o;
@@ -8218,7 +8519,7 @@ sub push_rows {
         my $pcount = @pkvals;
 
         ## Loop through each chunk of primary keys to copy over
-       for my $pkvs (@pkvals) {
+        for my $pkvs (@pkvals) {
 
             ## Message to prepend to the statement if chunking
             my $pre = $pcount <= 1 ? '' : "/* $loop of $pcount */";
@@ -8236,7 +8537,7 @@ sub push_rows {
             $fromdbh->do($srccmd);
 
             my $buffer = '';
-            $self->glog(qq{Begin push of $S.$T rows from database "$fromname"}, LOG_VERBOSE);
+            $self->glog(qq{Copying from $fromname.$S.$T}, LOG_VERBOSE);
 
             ## Loop through all changed rows on the source, and push to the target(s)
             my $multirow = 0;
@@ -8257,6 +8558,7 @@ sub push_rows {
 
                     my $type = $t->{dbtype};
                     my $cols = $goat->{tcolumns}{$SELECT};
+                    my $tname = $newname->{$t->{name}};
 
                     chomp $buffer;
 
@@ -8288,7 +8590,11 @@ sub push_rows {
                         }
                         ## Coerce non-strings into different objects
                         for my $key (keys %$object) {
-                            if ($goat->{columnhash}{$key}{ftype} =~ /smallint|integer|bigint/o) {
+                            ## Since mongo is schemaless, don't set null columns in the mongo doc
+                            if (!defined($object->{$key})) {
+                                delete $object->{$key};
+                            }
+                            elsif ($goat->{columnhash}{$key}{ftype} =~ /smallint|integer|bigint/o) {
                                 $object->{$key} = int $object->{$key};
                             }
                             elsif ($goat->{columnhash}{$key}{ftype} eq 'boolean') {
@@ -8302,8 +8608,9 @@ sub push_rows {
                         }
                         $self->{collection}->insert($object, { safe => 1 });
                     }
-                    ## For MySQL, Drizzle, Oracle, and SQLite, do some basic INSERTs
+                    ## For MySQL, MariaDB, Drizzle, Oracle, and SQLite, do some basic INSERTs
                     elsif ('mysql' eq $type
+                            or 'mariadb' eq $type
                             or 'drizzle' eq $type
                             or 'oracle' eq $type
                             or 'sqlite' eq $type) {
@@ -8318,7 +8625,25 @@ sub push_rows {
                         $count += $t->{sth}->execute(@cols);
                     }
                     elsif ('redis' eq $type) {
-                        ## TODO
+                        ## We are going to set a Redis hash, in which the key is "tablename:pkeyvalue"
+                        my @colvals = map { $_ = undef if $_ eq '\\N'; $_; } split /\t/ => $buffer;
+                        my @pkey;
+                        for (1 .. $goat->{numpkcols}) {
+                            push @pkey => shift @colvals;
+                        }
+                        my $pkeyval = join ':' => @pkey;
+                        ## Build a list of non-null key/value pairs to set in the hash
+                        my @add;
+                        my $x = $goat->{numpkcols} - 1;
+                        for my $val (@colvals) {
+                            $x++;
+                            next if ! defined $val;
+                            push @add, $cols->[$x], $val;
+                        }
+
+                        $t->{dbh}->hmset("$tname:$pkeyval", @add);
+                        $count++;
+                        $t->{redis}++;
                     }
 
                 } ## end each target
@@ -8355,6 +8680,9 @@ sub push_rows {
             elsif ('flatsql' eq $type) {
                 print {$t->{filehandle}} ";\n\n";
             }
+            elsif ('redis' eq $type) {
+                $self->glog(qq{Rows copied to Redis $t->{name}.$tname:<pkeyvalue>: $t->{redis}}, LOG_VERBOSE);
+            }
         }
 
     } ## end of each clause in the source command list
@@ -8390,7 +8718,7 @@ sub vacuum_table {
         my $total_time = sprintf '%.2f', tv_interval($start_time);
         $self->glog("Vacuum complete. Time: $total_time", LOG_VERBOSE);
     }
-    elsif ('mysql' eq $dbtype or 'drizzle' eq $dbtype) {
+    elsif ('mysql' eq $dbtype or 'drizzle' eq $dbtype or 'mariadb' eq $dbtype) {
         ## Optimize the table
         $self->glog("Optimizing $tablename", LOG_VERBOSE);
 
@@ -8410,7 +8738,7 @@ sub vacuum_table {
         $self->glog("Vacuum complete. Time: $total_time", LOG_VERBOSE);
     }
     elsif ('redis' eq $dbtype) {
-        # Use BGWRITEAOF ?
+        # Nothing to do, really
     }
     elsif ('mongodb' eq $dbtype) {
         # Use db.repairDatabase() ?
@@ -8440,24 +8768,21 @@ sub analyze_table {
     ## XXX Return output from analyze as a LOG_VERBOSE or LOG_DEBUG?
 
     if ('postgres' eq $dbtype) {
-        $self->glog("Analyzing $dbname.$tablename", LOG_VERBOSE);
         $ldbh->do("ANALYZE $tablename");
         my $total_time = sprintf '%.2f', tv_interval($start_time);
-        $self->glog("Analyze complete. Time: $total_time", LOG_VERBOSE);
+        $self->glog("Analyze complete for $dbname.$tablename. Time: $total_time", LOG_VERBOSE);
         $ldbh->commit();
     }
     elsif ('sqlite' eq $dbtype) {
-        $self->glog("Analyzing $dbname.$tablename", LOG_VERBOSE);
         $ldbh->do("ANALYZE $tablename");
         my $total_time = sprintf '%.2f', tv_interval($start_time);
-        $self->glog("Analyze complete. Time: $total_time", LOG_VERBOSE);
+        $self->glog("Analyze complete for $dbname.$tablename. Time: $total_time", LOG_VERBOSE);
         $ldbh->commit();
     }
-    elsif ('mysql' eq $dbtype or 'drizzle' eq $dbtype) {
-        $self->glog("Analyzing $tablename", LOG_VERBOSE);
+    elsif ('mysql' eq $dbtype or 'drizzle' eq $dbtype or 'mariadb' eq $dbtype) {
         $ldbh->do("ANALYZE TABLE $tablename");
         my $total_time = sprintf '%.2f', tv_interval($start_time);
-        $self->glog("Analyze complete. Time: $total_time", LOG_VERBOSE);
+        $self->glog("Analyze complete for $tablename. Time: $total_time", LOG_VERBOSE);
         $ldbh->commit();
     }
     else {
@@ -8678,7 +9003,7 @@ Bucardo - Postgres multi-master replication system
 
 =head1 VERSION
 
-This document describes version 4.99.3 of Bucardo
+This document describes version 4.99.5 of Bucardo
 
 =head1 WEBSITE
 
@@ -8720,7 +9045,7 @@ Greg Sabino Mullane <greg@endpoint.com>
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright (c) 2005-2011 Greg Sabino Mullane <greg@endpoint.com>.
+Copyright (c) 2005-2012 Greg Sabino Mullane <greg@endpoint.com>.
 
 This software is free to use: see the LICENSE file for details.
 

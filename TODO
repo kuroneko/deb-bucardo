@@ -5,14 +5,15 @@ Version 5:
 
 * Fix quoting bug reported by Sean M. Pappalardo
 * Fix need for password argument when using md5
-* Get pkonly working with 'bucardo add all tables'
 * Get Drizzle tests verified as working
 * Get bucardo-report working again
 * Note 8.2 minimum requirement somewhere (probably from COPY (select))
-* Make sure sequences are working
+* Get some solid tests for the makedelta system
 
 These range the gamut from wildly speculative ideas to must-have features.
 
+- Allow one log file per sync
+- Handle the case where newly created databases do not have a public schema
 - Add DB2 as a target
 - Do table locking up front for fullcopy syncs, to reduce deadlock windows
 - Allow creation of schema on first fullcopy as an option
