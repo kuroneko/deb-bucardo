@@ -1,3 +1,13 @@
+bucardo (4.99.5-1) unstable; urgency=low
+
+  * Imported Upstream version 4.99.5
+  * Added VCS information
+  * Do not ship a bucardo directory in /var/run. It gets created by the init
+    script anyway.
+  * Removed recommendation of postgresql-plperl-9.0.
+
+ -- Michael Meskes <meskes@debian.org>  Mon, 04 Jun 2012 11:44:00 +0200
+
 bucardo (4.99.3-1) unstable; urgency=low
 
   * Imported Upstream version 4.99.3
