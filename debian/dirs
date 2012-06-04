@@ -1,4 +1,3 @@
 usr/share/man/man1
 var/log/bucardo
 var/lib/bucardo
-var/run/bucardo
