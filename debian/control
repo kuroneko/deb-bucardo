@@ -12,7 +12,7 @@ Vcs-Browser: http://git.debian.org/?p=pkg-postgresql/bucardo.git
 Package: bucardo
 Architecture: all
 Depends: ${misc:Depends}, adduser, perl (>= 5.10.0), libdbix-safe-perl, libdbd-pg-perl, libboolean-perl
-Recommends: postgresql-plperl-8.4 | postgresql-plperl-9.1
+Recommends: postgresql-plperl
 Description: asynchronous replication system for PostgreSQL
  Bucardo is an asynchronous PostgreSQL replication system, allowing for both
  multi-master and multi-slave operations.
