@@ -49,14 +49,14 @@ for my $name (qw/ A B C /) {
     like ($res, qr/Added database "$name"/, $t);
 }
 
-## Put all pk tables into a herd
+## Put all pk tables into a relgroup
 $t = q{Adding all PK tables on the master works};
-$res = $bct->ctl(q{bucardo add tables '*bucardo*test*' '*Bucardo*test*' db=A herd=therd pkonly});
-like ($res, qr/Created the herd named "therd".*are now part of/s, $t);
+$res = $bct->ctl(q{bucardo add tables '*bucardo*test*' '*Bucardo*test*' db=A relgroup=trelgroup pkonly});
+like ($res, qr/Created the relgroup named "trelgroup".*are now part of/s, $t);
 
-## Add all sequences, and add them to the newly created herd
+## Add all sequences, and add them to the newly created relgroup
 $t = q{Adding all sequences on the master works};
-$res = $bct->ctl("bucardo add all sequences herd=therd");
+$res = $bct->ctl("bucardo add all sequences relgroup=trelgroup");
 like ($res, qr/New sequences added: \d/, $t);
 
 ## Create a new database group going from A to B and C
@@ -66,7 +66,7 @@ like ($res, qr/Created database group "pg"/, $t);
 
 ## Create a new sync
 $t = q{Created a new sync};
-$res = $bct->ctl(q{ bucardo add sync dtest herd=therd dbs=pg ping=false });
+$res = $bct->ctl(q{ bucardo add sync dtest relgroup=trelgroup dbs=pg autokick=false });
 like ($res, qr/Added sync "dtest"/, $t);
 
 ## Make sure the bucardo_delta and bucardo_track tables are empty
@@ -103,11 +103,11 @@ for my $table (sort keys %tabletype) {
     $count = $dbhA->do($SQL);
     is ($count, '0E0', $t);
 
-	my $pkeyname = $table =~ /test5/ ? q{"id space"} : 'id';
+    my $pkeyname = $table =~ /test5/ ? q{"id space"} : 'id';
 
     $t = "The delta table $deltatable contains the correct id";
     $SQL = qq{SELECT $pkeyname FROM bucardo."$deltatable"};
-    $dbhA->do(q{SET TIME ZONE 'GMT'});
+    $dbhA->do(q{SET TIME ZONE 'UTC'});
     $res = $dbhA->selectall_arrayref($SQL);
     my $type = $tabletype{$table};
     my $val1 = $val{$type}{1};

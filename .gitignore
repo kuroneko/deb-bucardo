@@ -1,6 +1,7 @@
 ## Build constructs:
 Makefile
 Makefile.old
+MANIFEST.bak
 *.gz
 blib/
 none/
@@ -15,7 +16,7 @@ MYMETA.*
 
 ## Git stuff
 *.blame
-*.patch
+/*.patch
 *.diff
 *.orig
 *.rej
@@ -24,6 +25,7 @@ MYMETA.*
 bucardo_test_database_*
 *.log
 log.bucardo
+bucardo.restart.reason.*
 test.*
 
 ## Temporary files:

@@ -1,9 +1,13 @@
-bucardo (4.99.5-2) UNRELEASED; urgency=low
+bucardo (4.99.6-1) unstable; urgency=low
 
+  [ Christoph Berg ]
   * Change recommends to postgresql-plperl without an explicit postgresql
     version.
 
- -- Christoph Berg <myon@debian.org>  Thu, 19 Jul 2012 15:44:21 +0200
+  [ Michael Meskes ]
+  * Imported Upstream version 4.99.6
+
+ -- Michael Meskes <meskes@debian.org>  Tue, 08 Jan 2013 13:19:39 +0100
 
 bucardo (4.99.5-1) unstable; urgency=low
 

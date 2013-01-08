@@ -33,8 +33,8 @@ my $dbname = 'bucardo_test';
 our $addtable_msg = 'Added the following tables';
 our $deltable_msg = 'Removed the following tables';
 our $nomatch_msg = 'Did not find matches for the following terms';
-our $oldherd_msg = 'The following tables are now part of the herd';
-our $newherd_msg = 'The following tables are now part of the herd';
+our $oldherd_msg = 'The following tables are now part of the relgroup';
+our $newherd_msg = 'The following tables are now part of the relgroup';
 
 our $location = 'setup';
 my $testmsg  = ' ?';
@@ -243,7 +243,7 @@ for my $file (qw/bucardo Bucardo.pm/) {
         $ENV{BUCARDO_TEST} = 0;
     };
     if ($@) {
-        die "Cannot run unless $file compiles cleanly\n";
+        die "Cannot run unless $file compiles cleanly: $@\n";
     }
 }
 
@@ -254,7 +254,7 @@ for (1..30) {
     $val{SMALLINT}{$_} = $_;
     $val{INT}{$_} = 1234567+$_;
     $val{BIGINT}{$_} = 7777777777 + $_;
-    $val{TEXT}{$_} = $val{'VARCHAR(1000)'}{$_} = "bc$_";
+    $val{TEXT}{$_} = $val{'VARCHAR(1000)'}{$_} = "bc'$_";
     $val{DATE}{$_} = sprintf '2001-10-%02d', $_;
     $val{TIMESTAMP}{$_} = $val{DATE}{$_} . ' 12:34:56';
     $val{NUMERIC}{$_} = $val{'NUMERIC(5,1)'}{$_} = 0.7 + $_;
@@ -414,6 +414,7 @@ sub create_cluster {
     debug(qq{Running $localinitdb for cluster "$clustername"});
 
     my $res = qx{$localinitdb -D $dirname 2>&1};
+    die $res if $? != 0;
     if ($DEBUG) {
         warn Dumper $res;
     }
@@ -607,7 +608,7 @@ sub connect_database {
         }
     }
 
-    $dbh->do('SET TIME ZONE GMT');
+    $dbh->do(q{SET TIME ZONE 'UTC'});
 
     $dbh->commit();
 
@@ -813,6 +814,48 @@ ALTER TABLE bucardo_fkey1
 
 } ## end of add_test_schema
 
+sub mock_serialization_failure {
+    my ($self, $dbh, $table) = @_;
+    return if $dbh->{pg_server_version} < 80401;
+    $table ||= 'bucardo_test1';
+
+    # Mock a serialization failure on every other INSERT. Runs only when
+    # `session_replica_role` is "replica", which it true for Bucardo targets.
+    $dbh->do(qq{
+        DROP SEQUENCE IF EXISTS serial_seq;
+        CREATE SEQUENCE serial_seq;
+
+        CREATE OR REPLACE FUNCTION mock_serial_fail(
+        ) RETURNS trigger LANGUAGE plpgsql AS \$_\$
+        BEGIN
+            IF nextval('serial_seq') % 2 = 0 THEN RETURN NEW; END IF;
+            RAISE EXCEPTION 'Serialization error'
+                  USING ERRCODE = 'serialization_failure';
+        END;
+        \$_\$;
+
+        CREATE TRIGGER mock_serial_fail AFTER INSERT ON "$table"
+            FOR EACH ROW EXECUTE PROCEDURE mock_serial_fail();
+        ALTER TABLE "$table" ENABLE REPLICA TRIGGER mock_serial_fail;
+    });
+    $dbh->commit;
+
+    return 1;
+} ## end of mock_serialization_failure
+
+sub unmock_serialization_failure {
+    my ($self, $dbh, $table) = @_;
+    return if $dbh->{pg_server_version} < 80401;
+    $table ||= 'bucardo_test1';
+
+    $dbh->do(qq{
+        DROP TRIGGER IF EXISTS mock_serial_fail ON "$table";
+        DROP FUNCTION IF EXISTS mock_serial_fail();
+        DROP SEQUENCE IF EXISTS serial_seq;
+    });
+
+    return 1;
+} ## end of unmock_serialization_failure
 
 sub add_test_databases {
 
@@ -840,18 +883,19 @@ sub add_db_args {
     ## Arguments:
     ## 1. Name of a cluster
     ## Returns: DSN-like string to connect to that cluster
-    ## May return string or array dependig on how it was called
+    ## Allows for "same" databases o the form X# e.g. A1, B1
+    ## May return string or array depending on how it was called
 
     my $self = shift;
     my $clustername = shift or die;
+
+    $clustername =~ s/\d+$//;
 
     ## Build the DSN to connect with
     my $info = $pgver{$clustername};
     my $dbport = $info->{port};
     my $dbhost = getcwd . "/$info->{dirname}/socket";
     my $dsn = "dbi:Pg:dbname=$dbname;port=$dbport;host=$dbhost";
-
-    my $arg = 
 
     return wantarray
         ? ($user,$dbport,$dbhost)
@@ -898,7 +942,7 @@ sub ctl {
         next unless exists $bc->{$val} and length $bc->{$val};
         $connopts .= " --db$arg=$bc->{$val}";
     }
-    $connopts .= " --dbname=bucardo --debugfile=1";
+    $connopts .= " --dbname=bucardo --log-dest .";
     $connopts .= " --dbuser=$user";
     ## Just hard-code these, no sense in multiple Bucardo base dbs yet:
     $connopts .= " --dbport=58921";
@@ -911,7 +955,7 @@ sub ctl {
     $args =~ s/^\s+//s;
 
     ## Allow the caller to look better
-    $args =~ s/^bucardo//;
+    $args =~ s/^bucardo\s+//;
 
     ## Set a timeout
     alarm 0;
@@ -920,11 +964,13 @@ sub ctl {
         alarm $ALARM_BUCARDO;
         debug("Connection options: $connopts Args: $args", 3);
         $info = qx{$ctl $connopts $args 2>&1};
+        debug("Exit value: $?", 3);
+        die $info if $? != 0;
         alarm 0;
     };
 
     if ($@ =~ /Alarum/ or $info =~ /Alarum/) {
-        return "Timed out";
+        return __PACKAGE__ . ' timeout hit, giving up';
     }
     if ($@) {
         return "Error running bucardo: $@\n";
@@ -965,13 +1011,14 @@ sub restart_bucardo {
     $dbh->do('LISTEN bucardo_nosyncs');
     $dbh->commit();
 
-    $self->ctl('start testing');
+    my $output = $self->ctl('start --exit-on-nosync testing');
 
     my $bail = 30;
     my $n;
   WAITFORIT: {
         if ($bail--<0) {
-            die "Bucardo did not start, but we waited!\n";
+            $output =~ s/^/#     /gmx;
+            die "Bucardo did not start, but we waited! Start output:\n\n$output\n";
         }
         while ($n = $dbh->func('pg_notifies')) {
             my ($name, $pid, $payload) = @$n;
@@ -1018,7 +1065,8 @@ sub setup_bucardo {
     my $dbh = $self->connect_database($clustername, 'postgres');
     if (database_exists($dbh,'bucardo')) {
         ## Kick off all other people
-        $SQL = q{SELECT procpid FROM pg_stat_activity WHERE datname = 'bucardo' and procpid <> pg_backend_pid()};
+        my $pidcol = $dbh->{pg_server_version} >= 90200 ? 'pid' : 'procpid';
+        $SQL = qq{SELECT $pidcol FROM pg_stat_activity WHERE datname = 'bucardo' and $pidcol <> pg_backend_pid()};
         for my $row (@{$dbh->selectall_arrayref($SQL)}) {
             my $pid = $row->[0];
             $SQL = 'SELECT pg_terminate_backend(?)';
@@ -1096,6 +1144,7 @@ sub wait_for_notice {
     ## 2. Seconds until we give up
     ## 3. Seconds we sleep between checks
     ## 4. Boolean: bail out if not found (defaults to true)
+    ## Returns true if the NOTIFY was recieved.
 
     my $self = shift;
     my $dbh = shift;
@@ -1138,7 +1187,7 @@ sub wait_for_notice {
             return;
         }
     }
-    return;
+    return 1;
 
 } ## end of wait_for_notice
 
@@ -1258,6 +1307,10 @@ sub empty_test_database {
 
 } ## end of empty_test_database
 
+END {
+#    __PACKAGE__->shutdown_cluster($_) for keys %pgver;
+}
+
 sub shutdown_cluster {
 
     ## Shutdown a cluster if running
@@ -1272,25 +1325,8 @@ sub shutdown_cluster {
 
     my $pidfile = "$dirname/postmaster.pid";
     return if ! -e $pidfile;
-
-    open my $fh, '<', $pidfile or die qq{Could not open "$pidfile": $!\n};
-    <$fh> =~ /(\d+)/ or die qq{No PID found in file "$pidfile"\n};
-    my $pid = $1;
-    close $fh or die qq{Could not close "$pidfile": $!\n};
-    ## Make sure it's still around
-    $count = kill 0 => $pid;
-    if ($count != 1) {
-        debug("Removing $pidfile");
-        unlink $pidfile;
-    }
-    $count = kill 15 => $pid;
-    {
-        $count = kill 0 => $pid;
-        last if $count != 1;
-        sleep 0.2;
-        redo;
-    }
-
+    my @cmd = ($pg_ctl, '-D', $dirname, '-s', '-m', 'fast', 'stop');
+    system(@cmd) == 0 or die "@cmd failed: $?\n";
     return;
 
 } ## end of shutdown_cluster
@@ -1407,6 +1443,7 @@ sub bc_deeply {
         die "bc_deeply failed from line $line. SQL=$sql\n$@\n";
     }
 
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
     return is_deeply($got,$exp,$msg,$oline||(caller)[2]);
 
 } ## end of bc_deeply
@@ -1645,6 +1682,7 @@ sub check_for_row {
             my $SQL = qq{SELECT inty FROM "$table" ORDER BY inty};
             $table =~ /X/ and $SQL =~ s/inty/$pkey/;
 
+            local $Test::Builder::Level = $Test::Builder::Level + 1;
             bc_deeply($res, $dbh, $SQL, $t, (caller)[2]);
         }
     }
@@ -1722,7 +1760,9 @@ sub check_sequences_same {
 ## no critic
 
 sub is_deeply {
+
     t($_[2],$_[3] || (caller)[2]);
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
     my $rv = Test::More::is_deeply($_[0],$_[1],$testmsg);
     return $rv if $rv;
     if ($bail_on_error and ++$total_errors => $bail_on_error) {
@@ -1735,6 +1775,7 @@ sub is_deeply {
 } ## end of is_deeply
 sub like($$;$) {
     t($_[2],(caller)[2]);
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
     my $rv = Test::More::like($_[0],$_[1],$testmsg);
     return $rv if $rv;
     if ($bail_on_error and ++$total_errors => $bail_on_error) {
@@ -1747,10 +1788,12 @@ sub like($$;$) {
 } ## end of like
 sub pass(;$) {
     t($_[0],$_[1]||(caller)[2]);
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
     Test::More::pass($testmsg);
 } ## end of pass
 sub is($$;$) {
     t($_[2],(caller)[2]);
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
     my $rv = Test::More::is($_[0],$_[1],$testmsg);
     return $rv if $rv;
     ## Where exactly did this fail?
@@ -1783,6 +1826,7 @@ sub is($$;$) {
 sub isa_ok($$;$) {
     t("Object isa $_[1]",(caller)[2]);
     my ($name, $type, $msg) = ($_[0],$_[1]);
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
     if (ref $name and ref $name eq $type) {
         Test::More::pass($testmsg);
         return;
@@ -1793,6 +1837,7 @@ sub isa_ok($$;$) {
 } ## end of isa_ok
 sub ok($;$) {
     t($_[1]||$testmsg);
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
     my $rv = Test::More::ok($_[0],$testmsg);
     return $rv if $rv;
     if ($bail_on_error and ++$total_errors => $bail_on_error) {

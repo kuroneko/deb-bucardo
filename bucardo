@@ -22,7 +22,7 @@ use POSIX qw/ceil setsid localeconv/;
 use Data::Dumper 'Dumper';
 $Data::Dumper::Indent = 1;
 
-our $VERSION = '4.99.5';
+our $VERSION = '4.99.6';
 
 ## For the tests, we want to check that it compiles without actually doing anything
 return 1 if $ENV{BUCARDO_TEST};
@@ -57,7 +57,7 @@ if (exists $ENV{PATH} and $progname =~ m{(.+)/(.+)}) {
 }
 
 ## We must have at least one argument to do anything
-help() unless @ARGV;
+help(1) unless @ARGV;
 
 ## Default arguments - most are for the bc constructor
 my $bcargs = {
@@ -69,27 +69,20 @@ my $bcargs = {
               dbpass       => '',
               sendmail     => 0,
               extraname    => '',
-              debugfilesep => 0,
-              debugdir     => '.',
-              debugname    => '',
-              debugsyslog  => 1,
-              debugfile    => 1,
-              cleandebugs  => 0,
+              logseparate  => 0,
+              logextension => '',
+              logclean     => 0,
               batch        => 0,
           };
 
 ## These options must come before the GetOptions call
-for my $arg (@ARGV) {
-    if ($arg eq '--no-bucardorc') {
-        $bcargs->{'no-bucardorc'} = 1;
-    }
-    if ($arg =~ /--bucardorc=(.+)/) {
-        $bcargs->{'bucardorc'} = $1;
-    }
-    if ($arg =~ /^-+\?$/) {
-        help();
-    }
-}
+my @opts = @ARGV;
+Getopt::Long::Configure(qw(pass_through));
+GetOptions(
+    $bcargs,
+    'no-bucardorc',
+    'bucardorc=s',
+);
 
 ## Values are first read from a .bucardorc, either in the current dir, or the home dir.
 ## If those do not exist, check for a global rc file
@@ -125,40 +118,47 @@ if (defined $file) {
     close $rc or die;
 }
 
+Getopt::Long::Configure(qw(no_pass_through));
 GetOptions ## no critic (ProhibitCallsToUndeclaredSubs)
     ($bcargs,
      'verbose+',
      'vv',
      'quiet+',
      'notimer',
-     'help',
-     'debug',
+     'help|?',
+     'debug!',
      'version',
      'sort=i',
-     'showdays',
+     'showdays|show-days',
      'compress',
      'retry=i',
-     'retrysleep=i',
+     'retrysleep|retry-sleep=i',
      'batch',
      'dryrun|dry-run',
      'confirm',
      'tsep=s',
+     'exit-on-nosync!',
 
      ## These are sent to the constructor:
      'bcverbose',
-     'dbport=i',
-     'dbhost=s',
-     'dbname=s',
-     'dbuser=s',
-     'dbpass=s',
+     'dbport|db-port|p=i',
+     'dbhost|db-host|h=s',
+     'dbname|db-name|d=s',
+     'dbuser|db-user|U=s',
+     'dbpass|db-pass|P=s',
      'sendmail=i',
-     'extraname=s',
-     'debugfilesep',
-     'debugname=s',
-     'debugsyslog=i',
-     'debugdir=s',
-     'debugfile=i',
-     'cleandebugs=i',
+     'extraname|extra-name=s',
+
+     'debugsyslog=i', # legacy
+     'debugdir=s',    # legacy
+     'debugfile=i',   # legacy
+     'cleandebugs=i', # legacy
+
+
+     'logdest|log-dest|log-destination=s@', # stderr, syslog, or file path
+     'logseparate|log-sep|log-separate|debugfilesep!',
+     'logextension|log-extension|log-ext|debugname=s',
+     'logclean|log-clean!',
 
      ## Used internally
      'force',
@@ -166,13 +166,9 @@ GetOptions ## no critic (ProhibitCallsToUndeclaredSubs)
      'exclude-schema|N=s@',
      'table|t=s@',
      'exclude-table|T=s@',
-     'db=s',
-     'herd=s',
-     'piddir=s',
-     ## These two already handled above, but need to be here so GetOptions is happy:
-     'bucardorc=s',
-     'no-bucardorc',
-
+     'db|database=s',
+     'herd|relgroup=s',
+     'piddir|pid-dir=s',
 ) or die "\n";
 
 ## If --help is set, ignore everything else, show help, then exit
@@ -183,6 +179,31 @@ if ($bcargs->{version}) {
     print "$progname version $VERSION\n";
     exit 0;
 }
+
+# Determine the logging destination.
+unless (exists $bcargs->{logdest}) {
+    if (exists $bcargs->{debugfile} && !delete $bcargs->{debugfile}) {
+        # Old --debugfile option can disable logging.
+        $bcargs->{logdest} = [];
+    }
+    elsif (my $dir = $bcargs->{debugdir}) {
+        # Old --debugdir option determins log directory.
+        $bcargs->{logdest} = [$dir];
+    }
+    else {
+        # Default value.
+        $bcargs->{logdest} = ['/var/log/bucardo'];
+    }
+
+    if ($bcargs->{debugsyslog}) {
+        # Old --debugsyslog option enables syslog logging.
+        push @{ $bcargs->{logdest} } => 'syslog';
+    }
+}
+
+# Handle legacy --cleandebugs option.
+$bcargs->{logclean} = 1
+    if delete $bcargs->{cleandebugs} && !exists $bcargs->{logclean};
 
 ## Sometimes we want to be as quiet as possible
 my $QUIET = delete $bcargs->{quiet};
@@ -208,7 +229,7 @@ my $NOTIMER = delete $bcargs->{notimer} || 0;
 my $verb = shift || '';
 
 ## No verb? Show a help message and exit
-help() unless $verb;
+help(1, "Missing required command\n") unless $verb;
 
 ## Standardize the verb as lowercase, and grab the rest of the args as the "nouns"
 $verb = lc $verb;
@@ -254,7 +275,7 @@ $dbh->commit();
 
 ## The reason file records startup and shutdown messages
 my $REASONFILE = get_config('reason_file') or die "Invalid reason_file!\n";
-my $REASONFILE_LOG = "$REASONFILE.log";
+(my $REASONFILE_LOG = $REASONFILE) =~ s{(?:[.][^.]+)?$}{.log};
 
 ## The directory Bucardo.pm writes PID and other information to
 my $PIDDIR = get_config('piddir') or die "Invalid piddir!\n";
@@ -300,7 +321,7 @@ ping() if $verb eq 'ping';
 superhelp() if $verb eq 'help';
 
 ## Make sure the Bucardo database has the latest schema
-upgrade() if $verb eq 'upgrade' or $verb eq 'uprgade';
+upgrade() if $verb eq 'upgrade' or $verb eq 'uprgade' or $verb eq 'ugprade';
 
 ## All the rest of the verbs require use of global information
 ## Thus, we load everything right now
@@ -316,7 +337,7 @@ start()         if $verb eq 'start' or $verb eq 'strt';
 restart()       if $verb eq 'restart';
 
 ## Reload the configuration file
-reload_config() if $verb eq 'reload_config';
+reload_config() if $verb eq 'reload' && $nouns eq 'config';
 
 ## Reload the whole daemon
 reload()        if $verb eq 'reload';
@@ -332,7 +353,7 @@ add_item()      if $verb eq 'add';
 remove_item()   if $verb eq 'remove' or $verb eq 'delete' or $verb eq 'del';
 
 ## Update something
-update_item()   if $verb eq 'update' or $verb eq 'upd';
+update_item()   if $verb eq 'update' or $verb eq 'upd' or $verb eq 'udpate';
 
 ## Inspect something
 inspect()       if $verb eq 'inspect';
@@ -352,7 +373,7 @@ purge()         if $verb eq 'purge';
 ## There are only a few valid verbs left, so we check for them now
 if ($verb ne 'kick' and $verb ne 'activate' and $verb ne 'deactivate') {
     ## Show help and exit
-    help();
+    help(1, qq{Unknown command "$verb"\n});
 }
 
 ## For all remaining verbs, we expect a list of syncs with an optional decimal "timeout"
@@ -440,7 +461,7 @@ vate_sync() if $verb eq 'activate' or $verb eq 'deactivate';
 kick() if $verb eq 'kick';
 
 ## If we reach here (and we should not), display help and exit
-help();
+help(1);
 
 exit;
 
@@ -528,8 +549,17 @@ sub check_version {
 
 } ## end of check_version
 
+sub _pod2usage {
+    require Pod::Usage;
+    Pod::Usage::pod2usage(
+        '-verbose' => 99,
+        '-exitval' => 2,
+        @_
+    );
+}
 
 sub help {
+    my ($exitval, $msg) = @_;
 
     ## Give detailed help about usage of this program
     ## Arguments: none
@@ -538,59 +568,13 @@ sub help {
     ## Nothing to do if we are being quiet
     exit 0 if $QUIET;
 
-    warn qq{Usage: $progname args
-  install         ** Installs the Bucardo database
-
-  start <reason>  ** Force any existing sync(s) to quit, then starts Bucardo
-
-  stop <reason>   ** Tell all Bucardo processes to stop permanently
-
-  list <type> [name]   ** View information about dbs, dbgroups, herds, syncs, tables, sequences, customnames, customcols, customcode or "all" of them
-  add <type> <name>    ** Add a db, dbgroup, herd, sync, table, sequence, customcode, customcols customname or customcode
-  remove <type> <name> ** Remove a db, dbgroup, herd, sync, table, sequence, customname, customcol or customcode
-
-  For detailed help on the above, prefix with a help like this:
-    $progname help add db
-
-  kick <syncname(s)> [timeout]
-                  ** Kick off one or more syncs, optionally wait for result (0 = wait until done)
-
-  ping [timeout]  ** Ping the MCP process for a response, return a Nagios-friendly string
-
-  status [--sort=col#]
-                  ** List information about all syncs
-
-  status syncname[s]
-                  ** List detailed information about one or more syncs
-
-  reload syncname[s]
-                 ** Reload a sync
-
-  validate syncname[s]
-                 ** Validate a sync
-
-  purge [database]
-                 ** Purge the delta and track tables
-
-  upgrade
-                 ** Upgrade Bucardo to the current version
-
-  message
-                 ** Write a message to the Bucardo logs
-
-  show [all|item]
-  set [item=value]
-                 ** View or set configuration parameters
-
-  reload_config   ** Force a running Bucardo to reload the bucardo_config table
-
-For more details, try 'man bucardo'
-};
-
-    exit 0;
+    _pod2usage(
+        '-message'  => $msg,
+        '-sections' => '^(?:USAGE|COMMANDS|OPTIONS)$',
+        '-exitval'  => $exitval || 0,
+    );
 
 } ## end of help
-
 
 sub superhelp {
 
@@ -601,207 +585,66 @@ sub superhelp {
     ## If there are no nouns, we can only show the generic help
     help() if ! @nouns;
 
-    ## Grab the first two words and standardize them
-    my $word1 = lc $nouns[0];
-    my $word2 = lc $nouns[1];
-    my $word3 = lc $nouns[2];
+    # Make sure all commands and actions, as well as their aliases, are here.
+    my %names = (
+        ( map { $_ => 'relgroup' } qw(relgroup herd) ),
+        ( map { $_ => 'db'       } qw(db database) ),
+        ( map { $_ => 'list'     } qw(l lsit liast lisy lit) ),
+        ( map { $_ => 'upgrade'  } qw(upgrade uprgade ugprade) ),
+        ( map { $_ => 'start'    } qw(start strt) ),
+        ( map { $_ => 'remove'   } qw(remove delete del) ),
+        ( map { $_ => 'update'   } qw(update upd udpate) ),
+        map { $_ => $_ } qw(
+            activate
+            add
+            all
+            config
+            customcode
+            customcol
+            customname
+            dbgroup
+            deactivate
+            help
+            inspect
+            install
+            kick
+            list
+            message
+            ping
+            purge
+            reload
+            reload
+            restart
+            sequence
+            sequences
+            set
+            show
+            status
+            stop
+            sync
+            table
+            tables
+            validate
+        )
+    );
 
-    ## Swap them out if the second one is 'all' and the third exists
-    if (defined $word2 and $word2 eq 'all' and defined $word3) {
-        $word2 = $word3;
-    }
-
-    ## Because usage() sometimes relies on the verb
-    $verb = $word1;
-
-    ## Standardize the 'thing' argument
-    $word2 = standardize_name($word2);
-
-    ## TODO: Write a test to ensure full coverage below
-
-    if ('add' eq $word1) {
-        if ('customcode' eq $word2) {
-            warn usage('add_customcode') . "\n";
-            exit 0;
-        }
-        if ('customname' eq $word2) {
-            warn usage('add_customname') . "\n";
-            exit 0;
-        }
-        if ('customcols' eq $word2) {
-            warn usage('add_customcols') . "\n";
-            exit 0;
-        }
-        if ('database' eq $word2) {
-            warn usage('add_database') . "\n";
-            exit 0;
-        }
-        if ('dbgroup' eq $word2) {
-            warn usage('add_dbgroup') . "\n";
-            exit 0;
-        }
-        if ('herd' eq $word2) {
-            warn usage('add_herd') . "\n";
-            exit 0;
-        }
-        if ('sync' eq $word2) {
-            warn usage('add_sync') . "\n";
-            exit 0;
-        }
-        if ('table' eq $word2) {
-            warn usage('add_table') . "\n";
-            exit 0;
-        }
-        if ('sequence' eq $word2) {
-            warn usage('add_sequence') . "\n";
-            exit 0;
-        }
-        warn usage('add') . "\n";
-        exit 0;
-    }
-    if ('config' eq $word1) {
-        warn usage('config') . "\n";
-        exit 0;
-    }
-    if ('inspect' eq $word1) {
-        if ('table' eq $word2) {
-            warn usage('inspect_table') . "\n";
-            exit 0;
-        }
-        if ('herd' eq $word2) {
-            warn usage('inspect_herd') . "\n";
-            exit 0;
-        }
-        if ('sync' eq $word2) {
-            warn usage('inspect_sync') . "\n";
-            exit 0;
-        }
-
-        warn usage('inspect') . "\n";
-        exit 0;
-    }
-    if ('kick' eq $word1) {
-        warn usage('kick') . "\n";
-        exit 0;
-    }
-    if ('list' eq $word1 or 'l' eq $word1 or 'liast' eq $word1) {
-        if ('customcode' eq $word2 or 'custom_code' eq $word2) {
-            warn usage('list_customcode') . "\n";
-            exit 0;
-        }
-        ## Keep dbg before db
-        if ('dbg' eq $word2 or 'dbgroup' eq $word2) {
-            warn usage('list_dbgroups') . "\n";
-            exit 0;
-        }
-        if ($word2 =~ /^(?:db|database)/) {
-            warn usage('list_databases') . "\n";
-            exit 0;
-        }
-        if ('herd' eq $word2) {
-            warn usage('list_herds') . "\n";
-            exit 0;
-        }
-        if ('sync' eq $word2) {
-            warn usage('list_syncs') . "\n";
-            exit 0;
-        }
-        if ('table' eq $word2 or 'tab' eq $word2) {
-            warn usage('list_tables') . "\n";
-            exit 0;
-        }
-        if ('sequence' eq $word2 or 'seq' eq $word2) {
-            warn usage('list_sequences') . "\n";
-            exit 0;
-        }
-        warn usage('list') . "\n";
-        exit 0;
-    }
-    if ('message' eq $word1) {
-        warn usage('message') . "\n";
-        exit 0;
-    }
-    if ('ping' eq $word1) {
-        warn usage('ping') . "\n";
-        exit 0;
-    }
-    if ('reload' eq $word1) {
-        warn usage('reload') . "\n";
-        exit 0;
-    }
-    if ('reload_config' eq $word1) {
-        warn usage('reload_config') . "\n";
-        exit 0;
-    }
-    if ('remove' eq $word1 or 'delete' eq $word1) {
-        if ('customcode' eq $word2 or 'custom_code' eq $word2) {
-            warn usage('remove_customcode') . "\n";
-            exit 0;
-        }
-        if ('db' eq $word2 or 'database' eq $word2) {
-            warn usage('remove_database') . "\n";
-            exit 0;
-        }
-        if ('dbg' eq $word2 or 'dbgroup' eq $word2) {
-            warn usage('remove_dbgroup') . "\n";
-            exit 0;
-        }
-        if ('herd' eq $word2) {
-            warn usage('remove_herd') . "\n";
-            exit 0;
-        }
-        if ('sync' eq $word2) {
-            warn usage('remove_sync') . "\n";
-            exit 0;
-        }
-        if ('table' eq $word2 or 'tab' eq $word2) {
-            warn usage('remove_table') . "\n";
-            exit 0;
-        }
-        if ('sequence' eq $word2 or 'seq' eq $word2) {
-            warn usage('remove_sequence') . "\n";
-            exit 0;
-        }
-        warn usage('remove') . "\n";
-        exit 0;
-    }
-    if ('restart' eq $word1) {
-        warn usage('restart') . "\n";
-        exit 0;
-    }
-    if ('start' eq $word1) {
-        warn usage('start') . "\n";
-        exit 0;
-    }
-    if ('status' eq $word1) {
-        warn usage('status') . "\n";
-        exit 0;
-    }
-    if ('stop' eq $word1) {
-        warn usage('stop') . "\n";
-        exit 0;
-    }
-    if ('update' eq $word1) {
-        warn usage('update') . "\n";
-        exit 0;
-    }
-    if ('upgrade' eq $word1) {
-        warn usage('upgrade') . "\n";
-        exit 0;
-    }
-    if ('validate' eq $word1) {
-        warn usage('validate') . "\n";
-        exit 0;
-    }
-    if ('purge' eq $word1) {
-        warn usage('purge') . "\n";
-        exit 0;
+    # Standardize names.
+    my @names;
+    for my $noun (@nouns) {
+        push @names => $names{ lc $noun } || $names{ standardize_name($noun) }
+            || help( 1, "Unknown command: " . join ' ' => @nouns );
     }
 
-    ## Generic fallthrough
-    help();
-
-    exit 0;
+    my @command = ($names[0]);
+    if (@names > 1) {
+        ## Actions are documented in Pod as "=head3 $action $command".
+        push @command, join ' ', @names;
+    }
+    else {
+        ## Don't show subsections for commands that have them.
+        push @command, => '!.+' if $names[0] eq 'add' || $names[0] eq 'update';
+    }
+    usage_exit(join('/' => @command), 0);
 
 } ## end of superhelp
 
@@ -904,6 +747,8 @@ sub start {
 
     ## Create a new Bucardo daemon
     require Bucardo;
+    $bcargs->{exit_on_nosync} = delete $bcargs->{'exit-on-nosync'}
+        if exists $bcargs->{'exit-on-nosync'};
     my $bc = Bucardo->new($bcargs);
 
     ## Verify that the version of Bucardo.pm matches our version
@@ -927,16 +772,19 @@ sub start {
     ## Disconnect from our local connection before we fork
     $dbh->disconnect();
 
+    ## Remove nouns from @opts.
+    ## XXX Will fail if an option value is the same as a noun.
+    my %remove = map { $_ => undef } @nouns;
+    @opts = grep { ! exists $remove{$_} } @opts;
+
     ## Fork and setsid to disassociate ourselves from the daemon
     if (fork) {
         ## We are the kid, do nothing
     }
     else {
-        close STDERR or warn "Could not close STDERR\n";
-        close STDOUT or warn "Could not close STDOUT\n";
         setsid() or die;
         ## Here we go!
-        $bc->start_mcp();
+        $bc->start_mcp( \@opts );
     }
 
     exit 0;
@@ -1072,12 +920,8 @@ sub reload {
     ## Arguments: none directly (but processes the nouns for a list of syncs)
     ## Returns: never, exits
 
-    my $usage = usage('reload');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'reload';
+    usage_exit($doc_section) unless @nouns;
 
     for my $syncname (@nouns) {
 
@@ -1126,12 +970,8 @@ sub validate {
     ## Arguments: none directly (but processes the nouns for a list of syncs)
     ## Returns: never, exits
 
-    my $usage = usage('validate');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 0;
-    }
+    my $doc_section = 'validate';
+    usage_exit($doc_section) unless @nouns;
 
     ## Build the list of syncs to validate
     my @synclist;
@@ -1198,7 +1038,7 @@ sub purge {
 
     ## TODO: databases, tables, timeslices
 
-    my $usage = usage('purge');
+    my $doc_section = 'purge';
 
     ## Nothing specific is the same as 'all'
     my $doall = 0;
@@ -1253,12 +1093,8 @@ sub add_item {
     ## Arguments: none directly (but processes the nouns)
     ## Returns: never, exits
 
-    my $usage = usage('add');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'add/!.+';
+    usage_exit($doc_section) unless @nouns;
 
     ## First word is the type of thing we are adding
     my $thing = shift @nouns;
@@ -1333,8 +1169,7 @@ sub add_item {
         exit 1;
     }
 
-    warn "$usage\n";
-    exit 1;
+    usage_exit($doc_section);
 
 } ## end of add_item
 
@@ -1346,13 +1181,10 @@ sub update_item {
     ## Arguments: none (but parses nouns)
     ## Returns: undef
 
-    my $usage = usage('update');
+    my $doc_section = 'update/!.+';
 
-    ## Must have at least two nouns
-    if ($#nouns < 2) {
-        warn "$usage\n";
-        exit 1;
-    }
+    ## Must have at least three nouns
+    usage_exit($doc_section) if @nouns < 3;
 
     ## What type of thing are we updating?
     my $thing = shift @nouns;
@@ -1360,20 +1192,20 @@ sub update_item {
     ## Account for variations and abbreviations
     $thing = standardize_name($thing);
 
-    ## These do return due to recursion, so we must exit afterwards
-    (update_customcode() or exit 1) if $thing eq 'customcode';
-    ## We do not update customname or customcols
-    ## The dbgroup must be checked before the database (dbg vs db)
-    (update_database(@nouns) or exit 1) if $thing eq 'database';
-    (update_dbgroup(@nouns)  or exit 1) if $thing eq 'dbgroup';
-    (update_herd(@nouns)     or exit 1) if $thing eq 'herd';
-    (update_sync(@nouns)     or exit 1) if $thing eq 'sync';
-    (update_table(@nouns)    or exit 1) if $thing eq 'table' or $thing eq 'sequence';
+    my $code = $thing eq 'customcode' ? \&update_customcode
+             : $thing eq 'database'   ? \&update_database
+             : $thing eq 'dbgroup'    ? \&update_dbgroup
+             : $thing eq 'relgroup'   ? \&update_herd
+             : $thing eq 'herd'       ? \&update_herd
+             : $thing eq 'sync'       ? \&update_sync
+             : $thing eq 'table'      ? \&update_table
+             : $thing eq 'sequence'   ? \&update_table
+             :                          usage_exit($doc_section)
+    ;
 
-    ## If we got this far, we have an unknown thing
-    warn "$usage\n";
-    exit 1;
-
+    ## The update function returns, due to recursion, so we must exit.
+    $code->(@nouns);
+    exit 0;
 } ## end of update_item
 
 
@@ -1383,12 +1215,8 @@ sub list_item {
     ## Arguments: none, but parses nouns
     ## Returns: 0 on success, -1 on error
 
-    my $usage = usage('list');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'list';
+    usage_exit($doc_section) unless @nouns;
 
     ## First word is the type if thing we are listing
     my $thing = shift @nouns;
@@ -1440,7 +1268,7 @@ sub list_item {
                 print "-- customcols:\n";   list_customcols();
                 print "-- dbgroups:\n";     list_dbgroups();
                 print "-- databases:\n";    list_databases();
-                print "-- herds:\n";        list_herds();
+                print "-- relgroup:\n";     list_herds();
                 print "-- syncs:\n";        list_syncs();
                 print "-- tables:\n";       list_tables();
                 print "-- sequences:\n";    list_sequences();
@@ -1450,8 +1278,7 @@ sub list_item {
 
         ## catch all
         ## Cannot list anything else
-        warn "$usage\n";
-        exit 1;
+        usage_exit($doc_section);
 
     } # SWITCH
 
@@ -1465,12 +1292,8 @@ sub remove_item {
     ## Arguments: none, but parses nouns
     ## Returns: never, exits
 
-    my $usage = usage('remove');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     ## First word is the type if thing we are removing
     my $thing = shift @nouns;
@@ -1491,8 +1314,7 @@ sub remove_item {
     remove_sequence()   if $thing eq 'sequence';
 
     ## Do not know how to remove anything else
-    warn "$usage\n";
-    exit 1;
+    usage_exit($doc_section);
 
 } ## end of remove_item
 
@@ -1512,16 +1334,13 @@ sub add_database {
     ## Example: bucardo add db nyc1 dbname=nyc1 dbhost=nyc1.example.com dbgroup=sales
 
     ## Grab our generic usage message
-    my $usage = usage('add_database');
+    my $doc_section = 'add/add db';
 
     ## The first word is the internal name (bucardo.db.name)
     my $item_name = shift @nouns || '';
 
     ## No name is a problem
-    if (! length $item_name) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) unless length $item_name;
 
     ## Inputs and aliases, database column name, flags, default value
     my $validcols = qq{
@@ -1546,8 +1365,11 @@ sub add_database {
     ## TODO: See if makedelta still needed
     ## If so, add to wiki page: http://bucardo.org/wiki/Bucardo/add_database#Optional_arguments
 
-    my ($dbcols,$cols,$phs,$vals,$extra)
-        = process_simple_args({cols => $validcols, list => \@nouns, usage => $usage});
+    my ( $dbcols, $cols, $phs, $vals, $extra ) = process_simple_args({
+        cols        => $validcols,
+        list        => \@nouns,
+        doc_section => $doc_section,
+    });
 
     ## Must have a database name
     if (! exists $vals->{dbname}) {
@@ -1575,9 +1397,6 @@ sub add_database {
         $evalok = 1;
     };
     if (! $evalok) {
-        if ($@ =~ /"db_dsn_unique"/) {
-            die qq{Cannot add database: already have a connection with the same parameters\n};
-        }
         if ($@ =~ /"db_name_sane"/) {
             die qq{Invalid name: you cannot refer to this database as "$item_name"\n};
         }
@@ -1641,6 +1460,7 @@ sub add_database {
 
         ## Handle all of the ones that do not use standard DBI first
 
+        my @users;
         if ('mongo' eq $dbtype) {
 
             my $dsn = {};
@@ -1683,8 +1503,8 @@ sub add_database {
 
         ## Anything else must be something with a standard DBI driver
         else {
-
           DBICONNTEST: {
+              push @users => $user;
                 eval {
                     $testdbh = DBI->connect($dsn, $user, $pass, {AutoCommit=>0,RaiseError=>1,PrintError=>0});
                     $evalok = 1;
@@ -1704,11 +1524,12 @@ sub add_database {
                 goto DBICONNTEST;
             }
 
+            my $as = join ' or ', @users;
             if ($bcargs->{force}) {
-                print "Connection to $fullname failed, but will add anyway.\nError was: $@\n\n";
+                print "Connection to $fullname as $as failed, but will add anyway.\nError was: $@\n\n";
             }
             else {
-                die "Connection to $fullname failed. You may force add it with the --force argument. Error was: $@\n\n";
+                die "Connection to $fullname as $as failed. You may force add it with the --force argument. Error was: $@\n\n";
             }
         }
         else {
@@ -1790,14 +1611,8 @@ sub remove_database {
     ## Returns: undef
     ## Example: bucardo remove db nyc1 nyc2 --force
 
-    ## Grab our generic usage message
-    my $usage = usage('remove_database');
-
-    ## Must have at least one name
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     ## Make sure all named databases exist
     for my $name (@nouns) {
@@ -1865,12 +1680,8 @@ sub update_database {
     my @actions = @_;
 
     ## Grab our generic usage message
-    my $usage = usage('update_database');
-
-    if (! @actions) {
-        print "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'update/update db';
+    usage_exit($doc_section) unless @actions;
 
     my $name = shift @actions;
 
@@ -1887,8 +1698,7 @@ sub update_database {
     for my $arg (@actions) {
         next if $arg =~ /set/i;
         next if $arg =~ /\w+=\w+/o;
-        print "$usage\n";
-        exit 1;
+        usage_exit($doc_section);
     }
 
     ## Change the arguments into a hash
@@ -2046,9 +1856,6 @@ sub list_databases {
     ## 1+ Databases to view. Can be "all" and can have wildcards
     ## Returns: 0 on success, -1 on error
     ## Example: bucardo list db sale%
-
-    ## Grab our generic usage message
-    my $usage = usage('list_databases');
 
     ## Might be no databases yet
     if (! keys %$DB) {
@@ -2221,15 +2028,12 @@ sub add_dbgroup {
     ## Example: bucardo add dbgroup nycservers nyc1:source nyc2:source lax1
 
     ## Grab our generic usage message
-    my $usage = usage('add_dbgroup');
+    my $doc_section = 'add/add dbgroup';
 
     my $name = shift @nouns || '';
 
     ## Must have a name
-    if (!length $name) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) unless length $name;
 
     ## Create the group if it does not exist
     if (! exists $DBGROUP->{$name}) {
@@ -2269,14 +2073,10 @@ sub remove_dbgroup {
     ## Returns: undef
     ## Example: bucardo remove dbgroup sales
 
-    ## Grab our generic usage message
-    my $usage = usage('remove_dbgroup');
+    my $doc_section = 'remove';
 
     ## Must have at least one name
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) unless @nouns;
 
     ## Make sure all the groups exist
     for my $name (@nouns) {
@@ -2334,13 +2134,8 @@ sub update_dbgroup {
 
     my @actions = @_;
 
-    ## Grab our generic usage message
-    my $usage = usage('update_dbgroup');
-
-    if (! @actions) {
-        print "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'update/update dbgroup';
+    usage_exit($doc_section) unless @actions;
 
     my $name = shift @actions;
 
@@ -2434,9 +2229,6 @@ sub list_dbgroups {
     ## 1+ Groups to view. Can be "all" and can have wildcards
     ## Returns: 0 on success, -1 on error
     ## Example: bucardo list dbgroups
-
-    ## Grab our generic usage message
-    my $usage = usage('list_dbgroups');
 
     ## Might be no groups yet
     if (! keys %$DBGROUP) {
@@ -2533,15 +2325,11 @@ sub add_customname {
 
     my $item_name = shift @nouns || '';
 
-    my $usage = usage('add_customname');
+    my $doc_section = 'add/add customname';
 
-    ## Must have a second name as well
     my $newname = shift @nouns || '';
 
-    if (!length $item_name or ! length $newname) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) unless length $item_name && length $newname;
 
     ## Does this number or name exist?
     if (! exists $GOAT->{$item_name}) {
@@ -2566,10 +2354,7 @@ sub add_customname {
     }
 
     ## If the new name contains an equal sign, treat as an error
-    if ($Tname =~ /=/) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) if $Tname =~ /=/;
 
     ## Names cannot be the same
     if ($sname eq $Sname and $tname eq $Tname) {
@@ -2598,8 +2383,7 @@ sub add_customname {
             push @db => $db;
         }
         else {
-            warn "$usage\n";
-            exit 1;
+            usage_exit($doc_section);
         }
     }
 
@@ -2661,20 +2445,12 @@ sub remove_customname {
     ## Example: bucardo remove customname 7
 
     ## Grab our generic usage message
-    my $usage = usage('remove_customname');
-
-    ## Must have at least one name
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     ## Make sure each argument is a number
     for my $name (@nouns) {
-        if ($name !~ /^\d+$/) {
-            warn "$usage\n";
-            exit 1;
-        }
+        usage_exit($doc_section) if $name !~ /^\d+$/;
     }
 
     ## We want the per-id hash here
@@ -2755,7 +2531,7 @@ sub list_customnames {
     ## Example: bucardo list customname
 
     ## Grab our generic usage message
-    my $usage = usage('list_customname');
+    my $doc_section = 'list';
 
     ## Might be no entries yet
     if (! keys %$CUSTOMNAME) {
@@ -2863,15 +2639,12 @@ sub add_customcols {
 
     my $item_name = shift @nouns || '';
 
-    my $usage = usage('add_customcols');
+    my $doc_section = 'add';
 
     ## Must have a clause as well
     my $clause = shift @nouns || '';
 
-    if (!length $item_name or ! length $clause) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) unless length $item_name && length $clause;
 
     ## Does this number or name exist?
     if (! exists $GOAT->{$item_name}) {
@@ -2887,8 +2660,8 @@ sub add_customcols {
 
     ## Make sure the clause looks sane
     if ($clause !~ /^\s*SELECT /i) {
-        warn "$usage\nThe clause must start with SELECT\n";
-        exit 1;
+        warn "\nThe clause must start with SELECT\n";
+        usage_exit($doc_section);
     }
 
     ## Parse the rest of the arguments
@@ -2912,8 +2685,7 @@ sub add_customcols {
             push @db => $db;
         }
         else {
-            warn "$usage\n";
-            exit 1;
+            usage_exit($doc_section);
         }
     }
 
@@ -2965,21 +2737,12 @@ sub remove_customcols {
     ## Returns: undef
     ## Example: bucardo remove customcols 7
 
-    ## Grab our generic usage message
-    my $usage = usage('remove_customcols');
-
-    ## Must have at least one name
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     ## Make sure each argument is a number
     for my $name (@nouns) {
-        if ($name !~ /^\d+$/) {
-            warn "$usage\n";
-            exit 1;
-        }
+        usage_exit($doc_section) if $name !~ /^\d+$/;
     }
 
     ## We want the per-id hash here
@@ -3078,8 +2841,7 @@ sub list_customcols {
     ## Returns: 0 on success, -1 on error
     ## Example: bucardo list customcols
 
-    ## Grab our generic usage message
-    my $usage = usage('list_customcols');
+    my $doc_section = 'list';
 
     ## Might be no entries yet
     if (! keys %$CUSTOMCOLS) {
@@ -3185,26 +2947,24 @@ sub add_table {
     ## Example: bucardo add table pgbench_accounts foo% myschema.abc
 
     ## Grab our generic usage message
-    my $usage = usage('add_table');
-
-    ## Must have at least one table
-    if (! @nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'add/add table';
+    usage_exit($doc_section) unless @nouns;
 
     ## Inputs and aliases, database column name, flags, default
     my $validcols = q{
         db                       db                   0                null
-        ping                     ping                 TF               null
+        autokick|ping            autokick             TF               null
         rebuild_index            rebuild_index        numeric          null
-        standard_conflict        standard_conflict    0                null
         analyze_after_copy       analyze_after_copy   TF               null
-        herd                     herd                 0                skip
+        makedelta                makedelta            =on|off          null
+        herd|relgroup            herd                 0                skip
     };
 
-    my ($dbcols,$cols,$phs,$vals,$extra)
-        = process_simple_args({cols => $validcols, list => \@nouns, usage => $usage});
+    my ( $dbcols, $cols, $phs, $vals, $extra ) = process_simple_args({
+        cols        => $validcols,
+        list        => \@nouns,
+        doc_section => $doc_section,
+    });
 
     ## Loop through all the args and attempt to add the tables
     ## This returns a hash with the following keys: relations, match, nomatch
@@ -3230,13 +2990,13 @@ sub add_table {
     }
 
     ## If they requested a herd and it does not exist, create it
-    if (exists $extra->{herd}) {
-        my $herdname = $extra->{herd};
+    if (exists $extra->{relgroup}) {
+        my $herdname = $extra->{relgroup};
         if (! exists $HERD->{$herdname}) {
             $SQL = 'INSERT INTO bucardo.herd(name) VALUES(?)';
             $sth = $dbh->prepare($SQL);
             $sth->execute($herdname);
-            $message .= qq{Created the herd named "$herdname"\n};
+            $message .= qq{Created the relgroup named "$herdname"\n};
         }
         ## Now load all of these tables into this herd
         $SQL = 'INSERT INTO bucardo.herdmap (herd,priority,goat) VALUES (?,?,'
@@ -3263,14 +3023,14 @@ sub add_table {
         }
 
         if (@oldnames) {
-            $message .= qq{The following tables were already in the herd "$herdname":\n};
+            $message .= qq{The following tables were already in the relgroup "$herdname":\n};
             for (@oldnames) {
                 $message .= "  $_\n";
             }
         }
 
         if (@newnames) {
-            $message .= qq{The following tables are now part of the herd "$herdname":\n};
+            $message .= qq{The following tables are now part of the relgroup "$herdname":\n};
             for (sort numbered_relations @newnames) {
                 $message .= "  $_\n";
             }
@@ -3289,55 +3049,63 @@ sub add_table {
 } ## end of add_table
 
 
-sub remove_table {
+sub _remove_relation {
+    my $reltype = shift;
 
-    ## Usage: remove table tablename [t2 t3 ...]
-    ## Arguments: none, parses nouns for tables
-    ## Returns: never, exits
-
-    my $usage = usage('remove_table');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     ## Prepare our SQL
-    $SQL = q{DELETE FROM bucardo.goat WHERE schemaname||'.'||tablename = ?};
+    $SQL = q{DELETE FROM bucardo.goat WHERE reltype = ? AND schemaname||'.'||tablename = ?};
     $sth = $dbh->prepare($SQL);
+    my @removed;
 
     for my $name (@nouns) {
         if ($name =~ /^\w[\w\d]*\.\w[\w\d]*$/) {
             if (! exists $GOAT->{$name}) {
-                print qq{No such table: $name\n};
+                print qq{No such $reltype: $name\n};
+                next;
             }
             eval {
-                $sth->execute($name);
+                $sth->execute($reltype, $name);
             };
             if ($@) {
-                die qq{Could not delete goat "$name"\n$@\n};
+                die qq{Could not delete $reltype "$name"\n$@\n};
             }
+            push @removed, $name;
         }
         else {
-            die qq{Please use the full schema.table name\n};
+            die qq{Please use the full schema.$reltype name\n};
         }
     }
 
-    print "Removed the following tables:\n";
-    for my $name (sort numbered_relations @nouns) {
-        print qq{  $name\n};
+    if (@removed) {
+        print "Removed the following ${reltype}s:\n";
+        for my $name (sort numbered_relations @removed) {
+            print qq{  $name\n};
+        }
     }
 
     confirm_commit();
 
     exit 0;
 
+} ## end of _remove_relation
+
+sub remove_table {
+    ## Usage: remove table tablename [t2 t3 ...]
+    ## Arguments: none, parses nouns for tables
+    ## Returns: never, exits
+    _remove_relation('table');
+
 } ## end of remove_table
 
+
 sub remove_sequence {
-
-    die 'Write me';
-
+    ## Usage: remove sequence sequencename [t2 t3 ...]
+    ## Arguments: none, parses nouns for sequences
+    ## Returns: never, exits
+    _remove_relation('sequence');
 } ## end of remove_sequence
 
 
@@ -3353,13 +3121,8 @@ sub update_table {
 
     my @actions = @_;
 
-    ## Grab our generic usage message
-    my $usage = usage('update_table');
-
-    if (! @actions) {
-        print "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'update/update table';
+    usage_exit($doc_section) unless @actions;
 
     my $name = shift @actions;
 
@@ -3367,20 +3130,18 @@ sub update_table {
     exit 0 if ! check_recurse($GOAT, $name, @actions);
 
     ## Make sure this table exists!
-    if (! exists $GOAT->{$name}) {
-        die qq{Could not find a table named "$name"\nUse 'list tables' to see all available.\n};
-    }
+    my $table = $GOAT->{$name} or die qq{Could not find a table named "$name"\n}
+        . "Use 'list tables' to see all available.\n";
 
     ## Store the id so we work with that alone whenever possible
-    my $id = $GOAT->{$name}[0]{id};
+    my $id = $table->{id};
 
     ## Everything is a name=value setting after this point
     ## We will ignore and allow noise word "set"
     for my $arg (@actions) {
         next if $arg =~ /set/i;
         next if $arg =~ /\w+=\w+/o;
-        print "$usage\n";
-        exit 1;
+        usage_exit($doc_section);
     }
 
     ## Change the arguments into a hash
@@ -3407,13 +3168,13 @@ sub update_table {
         my $newvalue = transform_value($value);
 
         ## Handle all the non-standard columns
-        if (lc $newname eq 'herd') {
+        if (lc $newname eq 'herd' || lc $newname eq 'relgroup') {
 
             ## Track the changes and publish at the end
             my @herdchanges;
 
             ## Grab the current hash of herds
-            my $oldherd = $GOAT->{$name}[0]{herd} || '';
+            my $oldherd = $table->{herd} || '';
 
             ## Keep track of what groups they end up in, so we can remove as needed
             my %doneherd;
@@ -3427,17 +3188,17 @@ sub update_table {
                 ## Does this herd exist?
                 if (! exists $HERD->{$herd}) {
                     create_herd($herd);
-                    push @herdchanges => qq{Created herd "$herd"};
+                    push @herdchanges => qq{Created relgroup "$herd"};
                 }
 
                 ## Are we a part of it already?
                 if ($oldherd and exists $oldherd->{$herd}) {
-                    $QUIET or print qq{No change: table "$name" already belongs to herd "$herd"\n};
+                    $QUIET or print qq{No change: table "$name" already belongs to relgroup "$herd"\n};
                 }
                 else {
                     ## We are not a part of this herd yet
                     add_goat_to_herd($herd, $id);
-                    push @herdchanges => qq{Added table "$name" to herd "$herd"};
+                    push @herdchanges => qq{Added table "$name" to relgroup "$herd"};
                 }
 
             } ## end each herd specified
@@ -3452,7 +3213,7 @@ sub update_table {
                     next;
 
                     remove_table_from_herd($name, $old);
-                    push @herdchanges => qq{Removed table "$name" from herd "$old"};
+                    push @herdchanges => qq{Removed table "$name" from relgroup "$old"};
                 }
             }
 
@@ -3472,11 +3233,11 @@ sub update_table {
         ## This must exist in our hash
         ## We assume it is the first entry for now
         ## Someday be more intelligent about walking and adjusting all matches
-        if (! exists $GOAT->{$name}[0]{$newname}) {
+        if (! exists $table->{$newname}) {
             print qq{Cannot change "$newname"\n};
             next;
         }
-        my $oldvalue = $GOAT->{$name}[0]{$newname};
+        my $oldvalue = $table->{$newname};
 
         ## May be undef!
         $oldvalue = 'NULL' if ! defined $oldvalue;
@@ -3504,13 +3265,13 @@ sub update_table {
         if ($@) {
             $dbh->rollback();
             $dbh->disconnect();
-            print "Sorry, failed to update the bucardo.goat table. Error was:\n$@\n";
+            print "Sorry, failed to update the relation. Error was:\n$@\n";
             exit 1;
         }
 
         for my $item (sort keys %change) {
             my ($old,$new) = @{ $change{$item} };
-            print "Changed bucardo.goat $item from $old to $new\n";
+            print "Changed relation $item from $old to $new\n";
         }
 
         confirm_commit();
@@ -3528,8 +3289,7 @@ sub list_tables {
     ## Returns: 0 on success, -1 on error
     ## Example: bucardo list tables
 
-    ## Grab our generic usage message
-    my $usage = usage('list_tables');
+    my $doc_section = 'list';
 
     ## Might be no tables yet
     if (! keys %$TABLE) {
@@ -3595,8 +3355,8 @@ sub list_tables {
             printf '  Syncs: ';
             print join ',' => sort keys %{ $row->{sync} };
         }
-        if (defined $row->{ping}) {
-            printf '  ping:%s', $row->{ping} ? 'true' : 'false';
+        if (defined $row->{autokick}) {
+            printf '  autokick:%s', $row->{autokick} ? 'true' : 'false';
         }
         if ($row->{rebuild_index}) {
             print '  rebuild_index:true';
@@ -3625,24 +3385,20 @@ sub add_herd {
     ## Returns: undef
     ## Example: bucardo add herd foobar tab1 tab2
 
-    ## Grab our generic usage message
-    my $usage = usage('add_herd');
+    my $doc_section = 'add/add relgroup';
 
     my $herdname = shift @nouns || '';
 
     ## Must have a name
-    if (!length $herdname) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) unless length $herdname;
 
     ## Create the herd if it does not exist
     if (exists $HERD->{$herdname}) {
-        print qq{Herd "$herdname" already exists\n};
+        print qq{Relgroup "$herdname" already exists\n};
     }
     else {
         create_herd($herdname);
-        $QUIET or print qq{Created herd "$herdname"\n};
+        $QUIET or print qq{Created relgroup "$herdname"\n};
     }
 
     ## Everything else is tables or sequences to add to this herd
@@ -3703,14 +3459,14 @@ sub add_herd {
     }
 
     if (@oldnames) {
-        $message .= qq{The following tables were already in the herd "$herdname":\n};
+        $message .= qq{The following tables were already in the relgroup "$herdname":\n};
         for (@oldnames) {
             $message .= "  $_\n";
         }
     }
 
     if (@newnames) {
-        $message .= qq{The following tables are now part of the herd "$herdname":\n};
+        $message .= qq{The following tables are now part of the relgroup "$herdname":\n};
         for (@newnames) {
             $message .= "  $_\n";
         }
@@ -3733,18 +3489,14 @@ sub remove_herd {
     ## Arguments: none, parses nouns
     ## Returns: never, exits
 
-    my $usage = usage('remove_herd');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     my $herd = $global{herd};
 
     for my $name (@nouns) {
         if (! exists $herd->{$name}) {
-            die qq{No such herd: $name\n};
+            die qq{No such relgroup: $name\n};
         }
     }
 
@@ -3756,14 +3508,14 @@ sub remove_herd {
         };
         if ($@) {
             if ($@ =~ /"sync_source_herd_fk"/) {
-                die qq{Cannot delete herd "$name": must remove all syncs that reference it first\n};
+                die qq{Cannot delete relgroup "$name": must remove all syncs that reference it first\n};
             }
-            die qq{Could not delete herd "$name"\n$@\n};
+            die qq{Could not delete relgroup "$name"\n$@\n};
         }
     }
 
     for my $name (@nouns) {
-        print qq{Removed herd "$name"\n};
+        print qq{Removed relgroup "$name"\n};
     }
 
     $dbh->commit();
@@ -3779,7 +3531,12 @@ sub update_herd {
     ## Arguments: none, parses nouns
     ## Returns: never, exits
 
+    die "update relgroup not implemented yet\n";
 } ## end of update_herd
+
+sub add_goat_to_herd {
+    die "Adding to a relgroup not implemented yet\n";
+}
 
 
 sub list_herds {
@@ -3788,7 +3545,7 @@ sub list_herds {
     ## Arguments: none, parses nouns for herd names
     ## Returns: 0 on success, -1 on error
 
-    my $usage = usage('list_herds');
+    my $doc_section = 'list';
 
     ## Any nouns are filters against the whole list
     my $clause = generate_clause({col => 'name', items => \@nouns});
@@ -3798,7 +3555,7 @@ sub list_herds {
     $count = $sth->execute();
     if ($count < 1) {
         $sth->finish();
-        printf "There are no%s entries in the 'herd' table.\n",
+        printf "There are no%s relgroups.\n",
             $WHERE ? ' matching' : '';
         return -1;
     }
@@ -3813,7 +3570,7 @@ sub list_herds {
     for my $row (@$info) {
         my $name = $row->{name};
         my $h = $global{herd}{$name};
-        printf 'Herd: %-*s ',
+        printf 'Relgroup: %-*s ',
             $maxlen, $name;
         printf ' DB: %s ', $h->{db} if $h->{db};
         ## Got goats?
@@ -3846,29 +3603,21 @@ sub add_sync {
 
     my $item_name = shift @nouns || '';
 
-    my $usage = usage('add_sync');
-
+    my $doc_section = 'add/add sync';
+    usage_exit($doc_section) unless length $item_name;
     my $batch = 1;
-
-    if (!length $item_name) {
-        warn "$usage\n";
-        exit 1;
-    }
 
     ## Inputs and aliases, database column name, flags, default
     my $validcols = qq{
         name                     name                 0                $item_name
-        herd                     herd                 0                null
+        herd|relgroup            herd                 0                null
         dbs                      dbs                  0                null
         stayalive                stayalive            TF               null
         kidsalive                kidsalive            TF               null
-        limitdbs                 limitdbs             numeric          null
-        ping                     ping                 TF               null
-        do_listen                do_listen            TF               null
+        autokick|ping            autokick             TF               null
         checktime                checktime            interval         null
         status                   status               =active|inactive null
-        source_makedelta         source_makedelta     =inherits|on|off null
-        target_makedelta         target_makedelta     =inherits|on|off null
+        conflict_strategy|standard_conflict conflict_strategy  0       null
         priority                 priority             numeric          null
         analyze_after_copy       analyze_after_copy   TF               null
         overdue                  overdue              interval         null
@@ -3878,28 +3627,31 @@ sub add_sync {
         lifetime                 lifetime             interval         null
         maxkicks                 maxkicks             numeric          null
         rebuild_index|rebuildindex   rebuild_index    numeric          null
-        customselect|usecustomselect usecustomselect  TF               null
         tables                   tables               0                skip
     };
 
     ## Fullcopy syncs get some of their defaults overriden
     ## The controllers and kids never start automatically,
-    ## and ping is never on
+    ## and autokick is never on
 
     my $morph = [
         {
             field => 'synctype',
             value => 'fullcopy',
-            new_defaults => 'ping|F stayalive|F kidsalive|F',
+            new_defaults => 'autokick|F stayalive|F kidsalive|F',
         },
     ];
 
-    my ($dbcols,$cols,$phs,$vals)
-        = process_simple_args({cols => $validcols, list => \@nouns, usage => $usage, morph => $morph});
+    my ( $dbcols, $cols, $phs, $vals ) = process_simple_args({
+        cols        => $validcols,
+        list        => \@nouns,
+        doc_section => $doc_section,
+        morph       => $morph,
+    });
 
     if (! exists $dbcols->{herd}) {
         ## But allow on-the-fly herd creation
-        die "Need to specify a herd for this sync\n";
+        die "Need to specify a relgroup for this sync\n";
     }
     if (! exists $dbcols->{dbs}) {
         die "Need to specify which databases\n";
@@ -3927,8 +3679,8 @@ sub add_sync {
 
             ## Maybe it's a table?
             if (! exists $global{goat}{$name}) {
-                warn "No such herd or table: $name\n";
-                warn "To list all herds, use: list herds\n";
+                warn "No such relgroup or table: $name\n";
+                warn "To list all relgroups, use: list relgroups\n";
                 warn "To list all tables, use: list tables\n";
                 exit 1;
             }
@@ -3937,7 +3689,7 @@ sub add_sync {
             for my $hname (sort keys %{$global{herd}}) {
                 my $number = keys %{$global{herd}{$hname}{hasgoat}{$schema}};
                 next unless 1 == $number;
-                print qq{Use existing herd "$hname"? Y/N };
+                print qq{Use existing relgroup "$hname"? Y/N };
                 my $ans = $batch ? 'Y' : <STDIN>;
                 if ($ans =~ /^y/i) {
                     $dbcols->{herd} = $hname;
@@ -3948,7 +3700,7 @@ sub add_sync {
             ## If we aren't using an existing herd, create a new one
             $name = $dbcols->{herd};
             if (! exists $global{herd}{$name}) {
-                print "Create a new herd with table $name\n";
+                print "Create a new relgroup with table $name\n";
 
                 ## We will use the name of the sync if free
                 ## Otherwise, keep adding numbers to it until we get a free name
@@ -4133,12 +3885,8 @@ sub remove_sync {
     ## Arguments: none (uses nouns)
     ## Returns: never, exits
 
-    my $usage = usage('remove_sync');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     ## Make sure all named syncs exist
     my $s = $global{sync};
@@ -4185,12 +3933,8 @@ sub update_sync {
 
     my @actions = @_;
 
-    my $usage = usage('update_sync');
-
-    if (! @actions) {
-        print "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'update/update sync';
+    usage_exit($doc_section) unless @actions;
 
     my $name = shift @actions;
 
@@ -4208,6 +3952,12 @@ sub update_sync {
     ## Current information about this sync, including column names
     my $syncinfo;
 
+    my %aliases = (
+        standard_conflict => 'conflict_strategy',
+        ping              => 'autokick',
+        relgroup          => 'herd',
+    );
+
     for my $action (@actions) {
         ## Look for a standard foo=bar or foo:bar format
         if ($action =~ /(.+?)\s*[=:]\s*(.+)/) {
@@ -4215,6 +3965,7 @@ sub update_sync {
 
             ## No funny characters please, just boring column names
             $setting =~ /^[a-z_]+$/ or die "Invalid setting: $setting\n";
+            $setting = $aliases{$setting} || $setting;
 
             ## If we have not already, grab the current information for this sync
             ## We also use this to get the list of valid column names to modify
@@ -4245,9 +3996,8 @@ sub update_sync {
             next;
         }
 
-        print "Unknown action: $action\n$usage\n";
-        exit 1;
-
+        warn "\nUnknown action: $action\n";
+        usage_exit($doc_section);
     }
 
     confirm_commit() if $changes;
@@ -4263,7 +4013,7 @@ sub list_syncs {
     ## Arguments: none (reads nouns for a list of syncs)
     ## Returns: 0 on success, -1 on error
 
-    my $usage = usage('list_syncs');
+    my $doc_section = 'list';
 
     my $syncs = $global{sync};
 
@@ -4352,7 +4102,7 @@ sub list_syncs {
         my $maxdbline = 50;
 
         ## Show basic information
-        printf "Sync: %-*s  Herd: %-*s %s[%s]\n",
+        printf "Sync: %-*s  Relgroup: %-*s %s[%s]\n",
             $maxname, $name,
             $maxherd, $s->{herd}{name},
             $maxdbs > $maxdbline ? '' : "$s->{d}  ",
@@ -4394,7 +4144,7 @@ sub get_goat_ids {
     ## Also checks the live database and adds tables to the goat table as needed.
     ## Arguments: key-value pairs:
     ##  - args: arrayref of names to match against. Can have wildcards.
-    ##  - dbcols: optional hashref of fields to populate goat table with (e.g. ping=1)
+    ##  - dbcols: optional hashref of fields to populate goat table with (e.g. autokick=1)
     ## Returns: a hash with:
     ##  - relations: hash of goat objects, key is the fully qualified name
     ##    - original: hash of search term(s) used to find this
@@ -4634,7 +4384,7 @@ sub add_items_to_goat_table {
         $sth = $dbh->prepare($SQL);
         ($count = $sth->execute(@args)) =~ s/0E0/0/;
 
-        debug(qq{Added "$schema.$table" to goat table with db "$db", count was $count});
+        debug(qq{Added "$schema.$table" with db "$db", count was $count});
 
         push @newid => $sth->fetchall_arrayref()->[0][0];
     }
@@ -4774,12 +4524,8 @@ sub kick {
     ## Arguments: none, parses nouns
     ## Returns: never, exits
 
-    my $usage = usage('kick');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'kick';
+    usage_exit($doc_section) unless @nouns;
 
     my ($exitstatus, $retries, $do_retry) = (0,0,0);
 
@@ -4807,8 +4553,6 @@ sub kick {
             $QUIET or print qq{Kick $sync: };
             $dbh->do(qq{LISTEN "$done"});
             $dbh->do(qq{LISTEN "$killed"});
-            my $s = $SYNC->{$sync};
-            $dbh->do(qq{LISTEN "bucardo_syncdone_$sync"});
             $dbh->commit();
 
             my $time = time;
@@ -4920,12 +4664,10 @@ sub show_why_sync_killed {
     my $sync = shift;
 
     $SQL = q{
-SELECT * FROM bucardo.q
+SELECT * FROM bucardo.syncrun
 WHERE sync = ?
-AND aborted IS NOT NULL
-AND LENGTH(whydie) > 2
-AND aborted >= now() - '30 seconds'::interval
-ORDER BY aborted DESC LIMIT 1
+AND lastbad
+ORDER BY started DESC LIMIT 1
 };
     $sth = $dbh->prepare($SQL);
     $count = $sth->execute($sync);
@@ -4935,12 +4677,12 @@ ORDER BY aborted DESC LIMIT 1
     }
 
     my $result = $sth->fetchall_arrayref({})->[0];
-    (my $whydie = $result->{whydie}) =~ s/\\n */\n    /g;
+    (my $whydie = $result->{details}) =~ s/\\n */\n    /g;
     $whydie =~ s/: ERROR:/:\n    ERROR:/;
     $whydie =~ s/ (at .+ line \d+\.)/\n      $1/g;
     $whydie =~ s/\t/<tab>/g;
-    my $message = sprintf "  PID: %s\n  Started: %s\n  Ended: %s\n    %s",
-        $result->{pid}, $result->{started}, $result->{aborted}, $whydie;
+    my $message = sprintf "  Started: %s\n  Ended: %s\n    %s",
+        $result->{pid}, $result->{started}, $result->{ended}, $whydie;
 
     return $message;
 
@@ -5211,12 +4953,12 @@ sub status_detail {
 
         ## Undefined should be written as 'none'
         for (qw/checktime/) {
-            $s->{$_} ||= 'none';
+            $s->{$_} ||= 'None';
         }
 
         ## Should be 'yes' or 'no'
-        for (qw/analyze_after_copy vacuum_after_copy stayalive kidsalive ping do_listen usecustomselect/) {
-            $s->{$_} = (defined $s->{$_} and $s->{$_}) ? 'yes' : 'no ';
+        for (qw/analyze_after_copy vacuum_after_copy stayalive kidsalive autokick/) {
+            $s->{$_} = (defined $s->{$_} and $s->{$_}) ? 'Yes' : 'No';
         }
 
         ## If currently running, there should be a PID file
@@ -5228,25 +4970,22 @@ sub status_detail {
         ## Build the display list
         push @items => ['Sync name'            => $sync];
         push @items => ['Current state'        => $s->{state}];
-        push @items => ['Source herd/database' => "$s->{herd}{name} / $sourcedb"];
+        push @items => ['Source relgroup/database' => "$s->{herd}{name} / $sourcedb"];
         push @items => ['Tables in sync'       => $numtables];
-        push @items => ['Status'               => $s->{status}];
+        push @items => ['Status'               => ucfirst $s->{status}];
         push @items => ['Check time'           => $s->{checktime}];
         push @items => ['Overdue time'         => $s->{overdue}];
         push @items => ['Expired time'         => $s->{expired}];
         push @items => ['Stayalive/Kidsalive'  => "$s->{stayalive} / $s->{kidsalive}"];
         push @items => ['Rebuild index'        => $s->{rebuild_index} ? 'Yes' : 'No'];
-        push @items => ['Ping'                 => $s->{ping}];
+        push @items => ['Autokick'             => $s->{autokick}];
         push @items => ['Onetimecopy'          => $s->{onetimecopy} ? 'Yes' : 'No'];
 
         ## Only show these if enabled
-        if ($s->{usecustomselect} eq 'yes') {
-            push @items => ['Custom select', $s->{usecustomselect}];
-        }
-        if ($s->{analyze_after_copy} eq 'yes') {
+        if ($s->{analyze_after_copy} eq 'Yes') {
             push @items => ['Post-copy analyze', 'Yes'];
         }
-        if ($s->{vacuum_after_copy} eq 'yes') {
+        if ($s->{vacuum_after_copy} eq 'Yes') {
             push @items => ['Post-copy vacuum', 'Yes'];
         }
 
@@ -5442,22 +5181,15 @@ sub inspect {
     ## Arguments: none, parses nouns
     ## Returns: never, exits
 
-    my $usage = usage('inspect');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'inspect';
+    usage_exit($doc_section) unless @nouns;
     my $thing = shift @nouns;
 
     inspect_table() if $thing =~ /tab/i  or $thing eq 't';
     inspect_sync()  if $thing =~ /sync/i or $thing eq 's';
-    inspect_herd()  if $thing =~ /herd/i or $thing eq 'h';
+    inspect_herd()  if $thing =~ /(?:relgr|herd)/i or $thing eq 'h';
 
-    warn "$usage\n";
-
-    exit 1;
-
+    usage_exit($doc_section);
 } ## end of inspect
 
 
@@ -5467,12 +5199,8 @@ sub inspect_table {
     ## Arguments: none, parses nouns
     ## Returns: never, exits
 
-    my $usage = usage('inspect_table');
-
-    if (! @nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'inspect';
+    usage_exit($doc_section) unless @nouns;
 
     $SQL = q{SELECT * FROM bucardo.goat WHERE tablename=?};
     my $sth_goat = $dbh->prepare($SQL);
@@ -5524,7 +5252,7 @@ sub inspect_table {
             for my $herd (sort keys %{$ggoat->{$id}{herd}}) {
                 $seenit{fktable} = 1;
                 next if exists $hherd->{$herd}{hasgoat}{$schema}{$table};
-                printf "Table %s.%s is in herd %s, but %s.%s (used as FK%s) is not\n",
+                printf "Table %s.%s is in relgroup %s, but %s.%s (used as FK%s) is not\n",
                     $s, $t, $herd, $schema, $table,
                         $type == 1 ? '' : ' target';
 
@@ -5548,12 +5276,8 @@ sub inspect_herd {
     ## Arguments: none, parses nouns
     ## Returns: never, exits
 
-    my $usage = usage('inspect_herd');
-
-    if (! @nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'inspect';
+    usage_exit($doc_section) unless @nouns;
 
     die "Not implemented yet\n";
 
@@ -5566,12 +5290,8 @@ sub inspect_sync {
     ## Arguments: none, parses nouns
     ## Returns: never, exits
 
-    my $usage = usage('inspect_sync');
-
-    if (! @nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'inspect';
+    usage_exit($doc_section) unless @nouns;
 
     die "Not implemented yet\n";
 
@@ -5699,7 +5419,7 @@ sub list_customcodes {
     ## Arguments: none, parses nouns for customcodes
     ## Returns: 0 on success, -1 on error
 
-    my $usage = usage('list_customcodes');
+    my $doc_section = 'list';
 
     ## Any nouns are filters against the whole list
     my $clause = generate_clause({col => 'name', items => \@nouns});
@@ -5724,10 +5444,11 @@ sub list_customcodes {
 
     for my $row (@$info) {
         my $name = $row->{name};
-        printf "Code: %-*s  When run: %-*s  Get dbh: %s  Get rows: %s Trigrules: %s\n",
+        printf "Code: %-*s  When run: %-*s  Get dbh: %s  Status: %s\n",
             $maxname, $name,
             $maxwhen, $row->{whenrun},
-            $row->{getdbh}, $row->{getrows}, $row->{trigrules};
+            $row->{getdbh},
+            $row->{status};
         if (defined $row->{about} and $VERBOSE) {
             (my $about = $row->{about}) =~ s/(.)^/$1    /gsm;
             print "  About: $about\n";
@@ -5739,12 +5460,103 @@ sub list_customcodes {
 
 } ## end of list_customcodes
 
+
 sub update_customcode {
 
-    die 'Write me';
+    ## Update one or more customcodes
+    ## Arguments: none (reads nouns for a list of customcodes)
+    ## Returns: never, exits
+
+    my @actions = @_;
+
+    my $doc_section = 'update/update customcode';
+    usage_exit($doc_section) unless @actions;
+
+    my $name = shift @actions;
+
+    ## Recursively call ourselves for wildcards and 'all'
+    exit 0 if ! check_recurse($SYNC, $name, @actions);
+
+    ## Make sure this customcode exists!
+    if (! exists $CUSTOMCODE->{$name}) {
+        die qq{Could not find a customcode named "$name"\nUse 'list customcodes' to see all available.\n};
+    }
+
+    my $cc = $CUSTOMCODE->{$name};
+
+    my $changes = 0;
+
+    for my $action (@actions) {
+        ## Look for a standard foo=bar or foo:bar format
+        if ($action =~ /(.+?)\s*[=:]\s*(.+)/) {
+            my ($setting,$value) = (lc $1,$2);
+
+            ## No funny characters please, just boring column names
+            $setting =~ /^[a-z_]+$/ or die "Invalid setting: $setting\n";
+
+            ## We only allow changing a strict subset of all the columns
+            if ($setting =~ /^(?:about|getdbh|name|priority|status|whenrun)$/) {
+                my $oldvalue = defined $cc->{$setting} ? $cc->{$setting} : '';
+                ## Allow some variation for booleans, but transform to 0/1
+                if ($setting =~ /^(?:getdbh)$/) {
+                    $value = $value =~ /^[1tTyY]/ ? 1 : 0;
+                }
+                ## Some things can only be numbers
+                elsif ($setting =~ /^(?:priority)$/) {
+                    if ($value !~ /^\d+$/) {
+                        die qq{Customcode setting "$setting" must be a number!\n};
+                    }
+                }
+                ## And some are very specific indeed
+                elsif ('whenrun' eq $setting) {
+                    my %whenrun = map { $_ => 1 } _whenrun_values();
+                    die qq{Invalid value for setting "whenrun"\n}
+                        unless $whenrun{$value};
+                }
+                ## Make the change, if it has changed
+                if ($value ne $oldvalue) {
+                    $SQL = "UPDATE customcode SET $setting=? WHERE name = ?";
+                    $sth = $dbh->prepare($SQL);
+                    $sth->execute($value, $name);
+                    $changes++;
+                    print qq{Changed customcode "$name" $setting from '$oldvalue' to '$value'\n};
+                }
+            }
+            else {
+                warn "Cannot change attribute '$setting'\n";
+                usage_exit($doc_section);
+            }
+
+            next;
+        }
+
+        warn "\nUnknown action: $action\n";
+        usage_exit($doc_section);
+    }
+
+    confirm_commit() if $changes;
+
+    return;
 
 } ## end of update_customcode
 
+sub _whenrun_values {
+    return qw(
+        before_txn
+        before_check_rows
+        before_trigger_drop
+        after_trigger_drop
+        after_table_sync
+        exception
+        conflict
+        before
+        _trigger_enable
+        after_trigger_enable
+        after_txn
+        before_sync
+        after_sync
+    );
+}
 
 
 
@@ -5754,7 +5566,7 @@ sub list_sequences {
     ## Arguments: none (reads nouns for a list of sequences)
     ## Returns: 0 on success, -1 on error
 
-    my $usage = usage('list_sequences');
+    my $doc_section = 'list';
 
     my $clause = generate_clause({col => 'tablename', items => \@nouns});
     my $WHERE = $clause ? "AND $clause" : '';
@@ -5763,7 +5575,7 @@ sub list_sequences {
     $count = $sth->execute();
     if ($count < 1) {
         $sth->finish();
-        printf "There are no%s entries in the 'goat' table.\n",
+        printf "There are no%s squences.\n",
             $WHERE ? ' matching' : '';
         return -1;
     }
@@ -5927,34 +5739,28 @@ sub add_customcode {
 
     my $item_name = shift @nouns || '';
 
-    my $usage = usage('add_customcode');
-
-    if (!length $item_name) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'add/add customcode';
+    usage_exit($doc_section) unless length $item_name;
 
     ## Inputs and aliases, database column name, flags, default
-    my $whenrunlist = 'before_txn before_check_rows before_trigger_drop after_trigger_drop'
-        . ' after_table_sync exception conflict before_trigger_enable after_trigger_enable'
-        . ' after_txn before_sync after_sync';
-    my $whenrun = join '|' => split /\s+/ => $whenrunlist;
+    my $whenrun = join '|' => _whenrun_values();
     my $validcols = qq{
         name                     name                 0                $item_name
         about                    about                0                null
         whenrun|when_run         whenrun              =$whenrun        null
         getdbh                   getdbh               TF               null
-        getrows                  getrows              TF               null
-        trigrules                trigrules            TF               null
         sync                     sync                 0                skip
-        goat                     goat                 0                skip
-        active                   active               TF               skip
+        goat|relation            goat                 0                skip
+        status                   status               =active|inactive skip
         priority                 priority             number           skip
         src_code                 src_code             0                skip
     };
 
-    my ($dbcols,$cols,$phs,$vals)
-        = process_simple_args({cols => $validcols, list => \@nouns, usage => $usage});
+    my ( $dbcols, $cols, $phs, $vals, $extras ) = process_simple_args({
+        cols        => $validcols,
+        list        => \@nouns,
+        doc_section => $doc_section,
+    });
 
     my $newname = $dbcols->{name};
 
@@ -5965,17 +5771,12 @@ sub add_customcode {
     }
 
     ## We must have a "whenrun"
-    if (! $dbcols->{whenrun}) {
-        warn "$usage\n";
-        exit 1;
-    }
+    usage_exit($doc_section) unless $dbcols->{whenrun};
 
     ## We must have a src_code as a file
-    if (! exists $dbcols->{src_code} or ! $dbcols->{src_code}) {
-        warn "$usage\n";
-        exit 1;
-    }
-    my $tfile = $dbcols->{src_code};
+    usage_exit($doc_section) unless $extras->{src_code};
+
+    my $tfile = $extras->{src_code};
     if (! -e $tfile) {
         warn qq{Could not find a file named "$tfile"\n};
         exit 2;
@@ -5991,7 +5792,7 @@ sub add_customcode {
     $DEBUG and warn Dumper $vals;
     $sth = $dbh->prepare($SQL);
     eval {
-        $count = $sth->execute(@$vals, $src);
+        $count = $sth->execute((map { $vals->{$_} } sort keys %$vals), $src);
     };
     if ($@) {
         die "Failed to add customcode: $@\n";
@@ -6002,33 +5803,35 @@ sub add_customcode {
     ## See if any updates to customcode_map need to be made
 
     ## Only one of sync or goat can be specified
-    if ($dbcols->{sync} and $dbcols->{goat}) {
-        die qq{Sorry, you must specify a sync OR a goat, not both\n};
+    if ($extras->{sync} and $extras->{relation}) {
+        die qq{Sorry, you must specify a sync OR a relation, not both\n};
     }
 
     ## Makes no sense to specify priority or active if no goat or sync
-    if (($dbcols->{priority} or $dbcols->{active}) and !$dbcols->{sync} and ! $dbcols->{goat}) {
-        die qq{You must specify a sync or a goat when using priority or active\n};
+    if (($extras->{priority} or $extras->{active}) and !$extras->{sync} and ! $extras->{relation}) {
+        die qq{You must specify a sync or a relation when using priority or active\n};
     }
 
     ## Is this a valid sync?
-    if ($dbcols->{sync} and ! exists $global{sync}{$dbcols->{sync}}) {
+    if ($extras->{sync} and ! exists $global{sync}{$extras->{sync}}) {
         die qq{Unknown sync: $dbcols->{sync}\n};
     }
 
     ## Is this a valid gaot?
-    if ($dbcols->{goat} and ! exists $global{goat}{$dbcols->{goat}}) {
-        die qq{Unknown goat: $dbcols->{goat}\n};
+    if ($extras->{relation} and ! exists $global{goat}{$extras->{relation}}) {
+        die qq{Unknown relation: $extras->{relation}\n};
     }
 
     ## Add to the customcode_map table
-    if ($dbcols->{sync} or $dbcols->{goat}) {
+    if ($extras->{sync} or $extras->{relation}) {
         $SQL = 'INSERT INTO customcode_map(code,';
         my @vals;
-        for my $col (qw/sync goat priority active/) {
-            if ($dbcols->{$col}) {
+        # XXX Relation is text, but we need a goat.id. Should the param be
+        # table instead of relation, and should it look up the ID?
+        for my $col (qw/sync priority active/) {
+            if ($extras->{$col}) {
                 $SQL .= "$col,";
-                push @vals => $dbcols->{$col};
+                push @vals => $extras->{$col};
             }
         }
         my $phs2 = '?,' x @vals;
@@ -6124,7 +5927,7 @@ sub add_all_goats {
     ## --exclude-schema or -N: exclude these schemas
     ## --table or -t: limit to the given tables
     ## --exclude-table or -t: exclude these tables
-    ## --herd: name of the herd to add new tables to
+    ## --relgroup: name of the herd to add new tables to
     ## pkonly: exclude tables with no pkey
     ## Returns: text string of results, with a newline
 
@@ -6139,6 +5942,8 @@ sub add_all_goats {
             $bcargs->{$noun} = 1;
         }
     }
+
+    $bcargs->{herd} = delete $bcargs->{relgroup} || $bcargs->{herd};
 
     ## If no databases, cowardly refuse to continue
     if (! keys %$DB) {
@@ -6189,6 +5994,7 @@ sub add_all_goats {
     ## We always exclude information_schema, system, and bucardo schemas
     $SQL .= q{AND n.nspname <> 'information_schema' AND nspname !~ '^pg' AND nspname !~ '^bucardo'};
 
+
     my @clause;
 
     ## If they gave a schema option, restrict the query by namespace
@@ -6226,20 +6032,20 @@ sub add_all_goats {
     ## Do we have a herd request? Process it if so
     my $herd = '';
     my $addtoherd;
-    if (exists $bcargs->{herd}) {
+    if ($bcargs->{herd}) {
         $herd = $bcargs->{herd};
         $SQL = 'SELECT 1 FROM bucardo.herd WHERE name = ?';
         my $herdcheck = $dbh->prepare($SQL);
         $count = $herdcheck->execute($herd);
         $herdcheck->finish();
         if ($count < 1) {
-            print "Creating herd: $herd\n";
+            print "Creating relgroup: $herd\n";
             $SQL = 'INSERT INTO bucardo.herd(name) VALUES (?)';
             $herdcheck = $dbh->prepare($SQL);
             $herdcheck->execute($herd);
         }
         else {
-            $VERBOSE >= 1 and warn "Herd already exists: $herd\n";
+            $VERBOSE >= 1 and warn "Relgroup already exists: $herd\n";
         }
         $SQL = 'INSERT INTO bucardo.herdmap(herd,goat) VALUES (?,?)';
         $addtoherd = $dbh->prepare($SQL);
@@ -6257,7 +6063,7 @@ sub add_all_goats {
         my $tinfo;
         ## Do we already have this one?
         if (exists $hastable{$S}{$T}) {
-            $VERBOSE >= 2 and warn "Skipping $type already in goat: $S.$T\n";
+            $VERBOSE >= 2 and warn "Skipping $type already in relation: $S.$T\n";
             $count{seenit}++;
             $old{$S}{$T} = 1;
             if ($herd) {
@@ -6274,7 +6080,7 @@ sub add_all_goats {
             }
             next;
         }
-        $VERBOSE >= 2 and warn "Attempting to add $S.$T to the goat table\n";
+        $VERBOSE >= 2 and warn "Attempting to add relation $S.$T\n";
         eval {
             $count = $addtable->execute($db->{name},$S,$T,$type);
         };
@@ -6290,7 +6096,7 @@ sub add_all_goats {
         }
         if ($count != 1) {
             $addtable->finish();
-            warn "Failed to add $type $S.$T to the goat table!\n";
+            warn "Failed to add $type relation $S.$T!\n";
             $fail{$S}{$T} = 1;
             next;
         }
@@ -6309,7 +6115,7 @@ sub add_all_goats {
                 $tinfo = $sth->fetchall_arrayref({})->[0];
             }
             if ($bcargs->{pkonly} and 'table' eq $type and ! length $tinfo->{pkey}) {
-                warn "Not adding table $S.$T to herd: no pkey\n";
+                warn "Not adding table $S.$T to relgroup: no pkey\n";
             }
             else {
                 $SQL = 'SELECT 1 FROM herdmap WHERE herd=? AND goat = ?';
@@ -6317,7 +6123,7 @@ sub add_all_goats {
                 $count = $sth->execute($herd, $id);
                 if ($count < 1) {
                     $addtoherd->execute($herd, $id);
-                    print "Added $type $S.$T to herd $herd\n";
+                    print "Added $type $S.$T to relgroup $herd\n";
                 }
             }
         }
@@ -6364,12 +6170,8 @@ sub remove_customcode {
     ## Arguments: none (uses nouns)
     ## Returns: never, exits
 
-    my $usage = usage('remove_customcode');
-
-    if (!@nouns) {
-        warn "$usage\n";
-        exit 1;
-    }
+    my $doc_section = 'remove';
+    usage_exit($doc_section) unless @nouns;
 
     ## Make sure all named codes exist
     my $code = $global{cc};
@@ -6923,7 +6725,7 @@ sub upgrade {
     }
     if ($schema_version ne $VERSION) {
         die qq{Cannot continue: bucardo is version $VERSION, but $schema_file is version $schema_version\n};
-    }
+   }
 
     $dbh->do(q{SET escape_string_warning = 'OFF'});
     $dbh->do(q{SET standard_conforming_strings = 'ON'});
@@ -6954,6 +6756,10 @@ sub upgrade {
         'upsert_attempts',
     );
 
+    my @renamed_configs = (
+        ['default_standard_conflict' => 'default_conflict_strategy'],
+    );
+
     my @old_constraints = (
         ['bucardo', 'goat', 'goat_pkeytype_check'],
         ['bucardo', 'sync', 'sync_replica_allornone'],
@@ -6962,8 +6768,10 @@ sub upgrade {
     );
 
     my @old_columns = (
-        ['bucardo', 'sync', 'disable_rules'],
-        ['bucardo', 'sync', 'disable_triggers'],
+        ['bucardo', 'dbmap', 'makedelta'],
+        ['bucardo', 'sync',  'disable_rules'],
+        ['bucardo', 'sync',  'disable_triggers'],
+        ['bucardo', 'sync',  'makedelta'],
     );
 
     my @old_functions = (
@@ -6982,16 +6790,29 @@ sub upgrade {
     my @new_columns = (
     );
 
+    my @dropped_columns = (
+        ['bucardo', 'sync', 'limitdbs'],
+        ['bucardo', 'goat', 'customselect'],
+        ['bucardo', 'sync', 'usecustomselect'],
+        ['bucardo', 'sync', 'do_listen'],
+        ['bucardo', 'customcode', 'getrows'],
+    );
+
     my @altered_columns = (
-        ['bucardo', 'goat', 'rebuild_index', 'BOOL2SMALLINT1'],
-        ['bucardo', 'goat', 'schemaname',    'NO DEFAULT'],
-        ['bucardo', 'sync', 'rebuild_index', 'BOOL2SMALLINT1'],
+        ['bucardo', 'goat', 'rebuild_index',     'BOOL2SMALLINT1'],
+        ['bucardo', 'goat', 'schemaname',        'NO DEFAULT'],
+        ['bucardo', 'sync', 'rebuild_index',     'BOOL2SMALLINT1'],
+        ['bucardo', 'sync', 'standard_conflict', 'RENAME conflict_strategy'],
+        ['bucardo', 'sync', 'ping',              'RENAME autokick'],
+        ['bucardo', 'goat', 'ping',              'RENAME autokick'],
+        ['bucardo', 'goat', 'standard_conflict', 'RENAME conflict_strategy'],
     );
 
     my @row_values = (
 
         ['bucardo_config','about',q{name = 'log_showtime'}, 1,
          'Show timestamp in the log output?  0=off  1=seconds since epoch  2=scalar gmtime  3=scalar localtime'],
+        ['bucardo_config', 'about', q{name = 'default_conflict_strategy'}, 1, 'Default conflict strategy for all syncs'],
     );
 
     my @drop_all_rules = (
@@ -7196,6 +7017,15 @@ sub upgrade {
         $changes++;
     }
 
+    ## Drop columns as needed.
+    for my $row (@dropped_columns) {
+        my ($schema,$table,$column) = @$row;
+        next unless column_exists($schema, $table, $column);
+        upgrade_and_log("ALTER TABLE $schema.$table DROP COLUMN $column");
+        clog "Dropped column: $schema.$table.$column";
+        $changes++;
+    }
+
     ## Change any altered columns
     for my $row (@altered_columns) {
         my ($schema,$table,$column,$change) = @$row;
@@ -7209,6 +7039,7 @@ sub upgrade {
         }
         elsif ($change =~ /^RENAME\s+(\w+)/) {
             my $newname = $1;
+            next if column_exists($schema, $table, $newname);
             upgrade_and_log("ALTER TABLE $schema.$table RENAME COLUMN $column TO $newname");
             clog("Renamed $schema.$table.$column to $newname");
             $changes++;
@@ -7235,30 +7066,6 @@ sub upgrade {
         else {
             die qq{Do not know how to handle altered column spec of "$change"};
         }
-    }
-
-    ## Special cases
-    if (! column_exists('bucardo', 'goat', 'source_makedelta')) {
-        #upgrade_and_log(q{ALTER TABLE bucardo.goat ADD COLUMN source_makedelta ONOFF NOT NULL DEFAULT 'inherits'});
-        #upgrade_and_log(q{ALTER TABLE bucardo.goat ADD COLUMN target_makedelta ONOFF NOT NULL DEFAULT 'inherits'});
-        if (column_exists('bucardo', 'goat', 'makedelta')) {
-        #    upgrade_and_log(q{UPDATE goat SET source_makedelta='on', target_makedelta='on' WHERE makedelta IS TRUE});
-        #    upgrade_and_log(q{UPDATE goat SET source_makedelta='off', target_makedelta='off' WHERE makedelta IS FALSE});
-        #    upgrade_and_log('ALTER TABLE bucardo.goat DROP COLUMN makedelta');
-        }
-        #clog('Added columns goat.source_makedelta and goat.target_makedelta');
-        #$changes++;
-    }
-    if (! column_exists('bucardo', 'sync', 'source_makedelta')) {
-        #upgrade_and_log(q{ALTER TABLE bucardo.sync ADD COLUMN source_makedelta ONOFF NOT NULL DEFAULT 'inherits'});
-        #upgrade_and_log(q{ALTER TABLE bucardo.sync ADD COLUMN target_makedelta ONOFF NOT NULL DEFAULT 'inherits'});
-        if (column_exists('bucardo', 'sync', 'makedelta')) {
-         #   upgrade_and_log(q{UPDATE sync SET source_makedelta='on', target_makedelta='on' WHERE makedelta IS TRUE});
-         #   upgrade_and_log(q{UPDATE sync SET source_makedelta='off', target_makedelta='off' WHERE makedelta IS FALSE});
-         #   upgrade_and_log('ALTER TABLE bucardo.sync DROP COLUMN makedelta');
-        }
-        #clog('Added columns sync.source_makedelta and sync.target_makedelta');
-        #$changes++;
     }
 
     ## Drop any old columns
@@ -7296,6 +7103,18 @@ sub upgrade {
         $changes++;
     }
 
+    ## Rename configs.
+    for my $names (@renamed_configs) {
+        next if config_exists($names->[1]);
+        clog "Renamed bucardo_config $names->[0] to $names->[1]";
+        upgrade_and_log(qq{
+            UPDATE bucardo.bucardo_config
+               SET name = '$names->[1]'
+             WHERE name = '$names->[0]'
+        });
+        $changes++;
+    }
+
     ## Check for any new config items
     $SQL = 'SELECT setting FROM bucardo.bucardo_config WHERE lower(name) = ?';
     my $cfgsth = $dbh->prepare($SQL);
@@ -7305,6 +7124,7 @@ sub upgrade {
     my $inside = 0;
     seek $fh, 0, 0;
     while (<$fh>) {
+        chomp;
         if (!$inside) {
             if (/^WITH DELIMITER/) {
                 $inside = 1;
@@ -7342,7 +7162,6 @@ sub upgrade {
         clog "New value set for bucardo.$table.$column WHERE $where";
         $changes++;
     }
-
 
     $SQL = 'SELECT pg_catalog.md5(?)';
     my $md5sth = $dbh->prepare($SQL);
@@ -7540,311 +7359,29 @@ sub upgrade_and_log {
 } ## end of upgrade_and_log
 
 
-sub usage {
+sub usage_exit {
 
     ## Grab the help string for a specific item
     ## Arguments: one
     ## 1. The thing we want help on
-    ## Returns: help string or an empty string for no matches
+    ## Returns: nothing
 
     my $name = shift or die;
+    my $exitval = defined $_[0] ? shift : 1;
 
-    ## no critic (RequireInterpolationOfMetachars)
-    if ('add' eq $name) {
-        return qq{Usage: add <type> <name> [options]
-Adds an item to the internal Bucardo database.
-The type is one of: db, dbgroup, herd, sync, table, sequence,
-  customname, customcols, or customcode
-For more information, run: $progname help add <type>};
-    }
-    if ('add_customcode' eq $name) {
-        return q{Usage: add customcode <name> <whenrun=value> <src_code=filename> [optional information]};
-    }
-    if ('add_customname' eq $name) {
-        return q{Usage: add customname tablename newtablename [sync=x db=x]};
-    }
-    if ('add_customcols' eq $name) {
-        return q{Usage: add customcols tablename select_clause [sync=x db=x]};
-    }
-    if ('add_database' eq $name) {
-        return q{Usage: add db <name> <dbname=value> [optional information]
-Adds a database
-
-Required information
-dbname=name         (database name to connect to)
-
-Optional information:
- dbtype=type of database (defaults to postgres. Others: drizzle,mongo,mariadb,mysql,oracle,redis,sqlite)
- dbuser=username    (defaults to 'bucardo')
- dbpass=name        (avoid if possible; use .pgpass or equivalent instead)
- dbport=#           (defaults to type default, e.g. 5432 for postgres)
- dbhost=hostname    (defaults to none - which is Unix socket for some types)
- dbconn=string      (extra connection parameters, e.g. "sslmode=require")
- status=status      (active or inactive, defaults to 'active')
- dbgroup=name       (database group; created if it does not exist)
- addalltables       (automatically adds all tables in the database)
- addallsequences    (automatically adds all sequences in the database)
- ssp=#              (if server-side prepares are used, defaults to 1 (on) - postgres only);
- dbservice=name     (the service name to use for Postgres databases)
- makedelta=onoff    (whether this database needs makedelta magic)
-};
-    }
-    if ('add_dbgroup' eq $name) {
-        return q{Usage: add dbgroup <name> [database1 database2 ...]
-Adds a database group, and optionally which databases are members of it.
-You can specify the role a database has with a colon and role name.
-If none is given, the default is a role of 'target'
-Example: add dbgroup foobar d1:source d2:source d3 d4
-This can also be used to assign databases to an existing group.};
-    }
-    if ('add_herd' eq $name) {
-        return q{Usage: add herd <name> [table1 table2 ...]
-Adds a herd, and optionally which tables are members of it.
-This can also be used to assign tables to an existing herd.};
-    }
-    if ('add_sync' eq $name) {
-        return q{Usage: add sync <name> herd=x dbs=dbgroup [options]
-Adds a sync. Required args:
-  herd=name          (the herd containing the tables and sequences to be replicated)
-  dbs=name           (the database group, or a comma-separated list of databases)
-
-Optional information:
-  status=x           (One of 'active' or 'inactive', defaults to 'active')
-  rebuild_index      (whether to rebuild indexes after every sync, defaults to 0 (off))
-  lifetime=number    (how long a kid can live before being reaped, defaults to null (no limit))
-  maxkicks=number    (how many kicks a kid can process before being reaped, defaults to 0 (no limit))
-  onetimecopy=number (controls whether we switch to a fullcopy mode for one run,
-                      0=off, 1=always full copy, 2=only copy tables which are empty on the target)
-  tables=list        (list of tables to add to this new sync,
-                      will create a herd with the same name as the sync)};
-    }
-    if ('add_sequence' eq $name) {
-        return q{Usage: add sequence <name> [name2 name3 ...]
-Adds one or more sequences to the internal Bucardo database.};
-    }
-    if ('add_table' eq $name) {
-        return q{Usage: add table <name> [name2 name3 ...]
-Adds one or more tables to the internal Bucardo database.
-Use "table" to find all matching tables, or be specific with "schema.table"
-Can use wildcards, e.g. "foobar%"
-Use "add table all" to add in all tables};
-    }
-    if ('config' eq $name) {
-        return q{Usage: config show [all | name]
-Usage: config set foo=bar [foo2=bar2]
-Displays or sets items from the bucardo_config table.
-Using 'show' will display all items or a subset based on the given name.
-Using 'set' will change one or more items.};
-    }
-    if ('inspect' eq $name) {
-        return q{Usage: inspect <type> <name>
-Inspects an object to see if it has dependency issues.
-The only supported type is currently 'table'.};
-    }
-    if ('inspect_herd' eq $name) {
-        return q{Usage: inspect herd <name>
-Inspects a herd to see if it has dependency issues.};
-    }
-    if ('inspect_sync' eq $name) {
-        return q{Usage: inspect sync <name>
-Inspects a sync to see if it has dependency issues.};
-    }
-    if ('inspect_table' eq $name) {
-        return q{Usage: inspect table <name>
-Inspects a table to see if it has dependency issues.};
-    }
-    if ('kick' eq $name) {
-        return q{Usage: kick <name> [# of seconds] [name2 name3...] [--notimer]
-Kicks one or more named syncs.
-If a number is given, that is how long to wait for the sync to signal that it is finished.
-If the number 0 is given, we wait as long as it takes.
-By default a graphical timer is given: this can be turned off with the --notimer option.};
-    }
-    if ('list' eq $name) {
-        return qq{Usage: list <type> [options]
-Shows information about items in the internal Bucardo database.
-The type is one of: db, dbgroup, table, sequence, herd, sync,
-  customcode, customcols, customname, or all to see everything at once.
-For more information, run: $progname help list <type>};
-    }
-    if ('list_customcode' eq $name) {
-        return q{Usage: list customcode name [options]
-Lists information about each customcode.
-If ''verbose' is added, the 'About' for each code is shown.
-If '--verbose --verbose' is added, the internal database columns for the 'customcode' table are shown.};
-    }
-    if ('list_databases' eq $name) {
-        return q{Usage: list db [name] [--verbose] [--verbose]
-Lists information about each database Bucardo knows about.
-
-Without a name, all databases are listed.
-The name can have wildcards with '%'
-If '--verbose' is added, information is shown about which groups and syncs are involved.
-If a second '--verbose' is added, the internal database columns for the 'db' table are shown.};
-    }
-    if ('list_dbgroups' eq $name) {
-        return q{Usage: list dbgroup [name] [--verbose --verbose]
-Lists database groups, and which databases (if any) are members.
-
-Without a name, all database groups are listed.
-The name can have wildcards with a '%'
-If '--verbose --verbose' is added, the internal database columns for the 'dbgroup' table are shown.};
-    }
-    if ('list_herds' eq $name) {
-        return q{Usage: list herd [name] [--verbose --verbose]
-Lists herds, and which tables (if any) are members.
-
-Without a name, all herds are listed.
-The name can have wildcards with a '%'
-If '--verbose --verbose' is added, the internal database columns for the 'herd' table are shown.};
-    }
-    if ('list_syncs' eq $name) {
-        return q{Usage: list sync [name] [--verbose --verbose]
-Lists syncs
-
-Without a name, all syncs are listed.
-The name can have wildcards with a '%'
-If '--verbose --verbose' is added, the internal database columns for the 'sync' table are shown.};
-    }
-    if ('list_sequences' eq $name) {
-        return q{Usage: list sequence [name] [--verbose --verbose]
-Lists sequences
-
-Without a name, all sequences are listed.
-The name can have wildcards with a '%'
-If '--verbose --verbose' is added, the internal database columns for the 'goat' table are shown.};
-    }
-    if ('list_tables' eq $name) {
-        return q{Usage: list table [name] [--verbose --verbose]
-Lists tables
-
-Without a name, all tables are listed.
-The name can have wildcards with a '%'
-If '--verbose --verbose' is added, the internal database columns for the 'goat' table are shown.};
-    }
-    if ('message' eq $name) {
-        return q{Usage: message "text"
-Asks a running Bucardo daemon to insert the given text into the Bucardo log files.};
-    }
-    if ('ping' eq $name) {
-        return q{Usage: ping [# of seconds]
-Sends a ping notice to the main Bucardo process (MCP) to see if it will respond.
-By default, it will wait 15 seconds for a response.
-If a number is given, it will wait that number of seconds instead.
-Returns a Nagios like message starting with "OK" or "CRITICAL" for success or failure.\n};
-    }
-    if ('reload' eq $name) {
-        return q{Usage: reload sync [sync2 sync3 ...]
-Reloads one or more syncs.
-This sends a message to Bucardo to stop the named syncs, reload their
-information from the database, and start them up again.
-Useful if you have changed a setting for an active syncs and need
-to put the change in place right away.};
-    }
-    if ('reload_config' eq $name) {
-        return q{Usage: reload_config
-Instructs the Bucardo daemon to reload its configuration file and restart.};
-    }
-    if ('remove' eq $name or 'delete' eq $name) {
-        return qq{Usage: remove <type> <name> [options]
-Removes an item from the internal Bucardo database.
-The type is one of: db, dbgroup, table, sequence, herd, sync,
-  customcode, customcols, or customname
-For more information, run: $progname help remove <type>};
-    }
-    if ('remove_customcode' eq $name) {
-        return qq{Usage: $verb customcode <name> [name2 name3 ...]
-Removes one or more customcodes.};
-    }
-    if ('remove_customname' eq $name) {
-        return qq{Usage: $verb customname number [number2 number3 ...]
-Removes one or more customnames. Determine the numbers with list customnames};
-    }
-    if ('remove_customcols' eq $name) {
-        return qq{Usage: $verb customcols number [number2 number3 ...]
-Removes one or more customcols. Determine the numbers with list customcols};
-    }
-    if ('remove_database' eq $name) {
-        return qq{Usage: $verb db <name> [name2 name3 ...]
-Removes one or more databases.
-Use the --force option to remove all related tables};
-    }
-    if ('remove_dbgroup' eq $name) {
-        return qq{Usage: $verb dbgroup <name> [name2 name3 ...]
-Removes one or more database groups.};
-    }
-    if ('remove_herd' eq $name) {
-        return qq{Usage: $verb herd <name> [name2 name3 ...]
-Removes one or more herds.};
-    }
-    if ('remove_sync' eq $name) {
-        return qq{Usage: $verb sync <name> [name2 name3 ...]
-Removes one or more syncs.};
-    }
-    if ('remove_sequence' eq $name) {
-        return qq{Usage: $verb sequence <name> [name2 name3 ...]
-Removes one or more sequences.};
-    }
-    if ('remove_table' eq $name) {
-        return qq{Usage: $verb table <name> [name2 name3 ...]
-Removes one or more tables.};
-    }
-    if ('restart' eq $name) {
-        return q{Usage: restart ["reason"]
-Restarts Bucardo by stopping, then starting it up again.
-An optional reason can be given.};
-    }
-    if ('start' eq $name) {
-        return q{Usage: start ["reason"]
-Starts Bucardo.
-An optional reason can be given.};
-    }
-    if ('status' eq $name) {
-        return q{Usage: status [sync1 sync2]
-Displays information about the status of syncs.
-With no arguments, shows a summary of all syncs.
-If one or more named syncs are given, detailed information
-about each sync is given.}
-    }
-    if ('stop' eq $name) {
-        return q{Usage: stop ["reason"]
-Stops Bucardo and all of its child processes.
-An optional reason can be given.
-Active children will not stop until they have finished their current task.};
-    }
-    if ('update' eq $name) {
-        return q{Usage: update <type> <name> col1=val [col2=val2 col3=val3 ...]
-Updates an item from the internal Bucardo database.
-The type is one of: db, dbgroup, table, sequence, herd, sync, or customname};
-    }
-    if ('update_database' eq $name) {
-        return q{Usage: update database <name> col1=val [col2=val2 col3=val3 ...]
-Updates a database
-    };
-    }
-    if ('update_table' eq $name) {
-        return q{Usage: update table <name> col1=val [col2=val2 col3=val3 ...] herd=herd1,herd2
-Updates a table
-    };
-    }
-    if ('upgrade' eq $name) {
-        return q{Usage: upgrade
-Upgrades an existing Bucardo database to the current version.};
-    }
-    if ('validate' eq $name) {
-        return q{Usage: validate [all] [sync1 sync2]
-Validates one or more named syncs.
-Use 'all' to validate all known syncs at once};
-    }
-    if ('purge' eq $name) {
-        return q{Usage: purge [all] [database] [database.table]
-Purges one or more tables in one or more databases
-Use 'all' to validate all known tables};
+    if ($name =~ m{/!}) {
+        # Bug in Pod::Usage prevents these from working properly. Force it
+        # to use Pod::PlainText.
+        # https://rt.perl.org/rt3//Public/Bug/Display.html?id=115534
+        require Pod::Usage;
+        require Pod::PlainText;
+        unshift @Pod::Usage::ISA => 'Pod::PlainText';
     }
 
-    ## use critic
-
-    return '';
+    _pod2usage(
+        '-sections' => "COMMAND DETAILS/$name",
+        '-exitval'  => $exitval,
+    );
 
 } ## end of usage
 
@@ -7949,7 +7486,7 @@ sub config {
                 die "Invalid log_level, must be terse, normal, verbose, or debug\n";
             }
         }
-        if ($setting eq 'default_standard_conflict') {
+        if ($setting eq 'default_standard_conflict' || $setting eq 'default_conflict_strategy') {
             if ($val !~ /^(?:source|target|skip|random|latest|none)$/oi) {
                 ## FIXME
                 #die "Invalid default_standard_conflict, must be none, source, target, skip, random, or latest\n";
@@ -7957,6 +7494,7 @@ sub config {
             if ($val =~ /none/i) {
                 $val = '';
             }
+            $setting = 'default_conflict_strategy';
         }
 
         $sth->execute($val,$setting);
@@ -7978,9 +7516,8 @@ sub message {
     ## Arguments: none (reads in nouns)
     ## Returns: never, exits
 
-    if (! length($nouns)) {
-        die qq{Usage: bucardo message "Some message to send to the logs"\n};
-    }
+    my $doc_section = 'message';
+    usage_exit($doc_section) unless length $nouns;
 
     $SQL = 'INSERT INTO bucardo.bucardo_log_message(msg) VALUES (?)';
     $sth = $dbh->prepare($SQL);
@@ -8282,15 +7819,19 @@ sub install {
         exit 1;
     }
 
-    ## This can actually happen for many reasons: lack of this message
-    ## simply means something went wrong somewhere
-    ## TODO: Parse other errors more gracefully
-    if ($res !~ m{Pl/PerlU was successfully installed}) {
+    if ($res =~ /"plperlu".*CREATE LANGUAGE/s) {
         warn "\nINSTALLATION FAILED! ($res)\n\n";
-        warn "This is often caused by the Pl/PerlU language not being available\n";
+        warn "The Pl/PerlU language needs to be available\n";
         warn "This is usually available as a separate package\n";
         warn "For example, you might try: yum install postgresql-plperl\n";
         warn "If compiling from source, add the --with-perl option to your ./configure command\n\n";
+        exit 1;
+    }
+
+    ## This can actually happen for many reasons: lack of this message
+    ## simply means something went wrong somewhere
+    if ($res !~ m{Pl/PerlU was successfully installed}) {
+        warn "\nINSTALLATION FAILED! ($res)\n\n";
         exit 1;
     }
 
@@ -8377,7 +7918,7 @@ sub standardize_name {
 
     return 'database'   if $name =~ /^db/i or $name =~ /^database/i;
 
-    return 'herd'       if $name =~ /^herd/i;
+    return 'herd'       if $name =~ /^(?:relgr|herd)/i;
 
     return 'sync'       if $name =~ /^s[yi]n[ck]/i;
 
@@ -8415,9 +7956,9 @@ sub process_simple_args {
     ##    values string, and 'extra' hashref
 
     my $arg = shift;
-    my $validcols = $arg->{cols} or die 'Need a list of valid cols!';
-    my $list = $arg->{list}      or die 'Need a list of arguments!';
-    my $usage = $arg->{usage}    or die 'Need a usage!';
+    my $validcols   = $arg->{cols}        or die 'Need a list of valid cols!';
+    my $list        = $arg->{list}        or die 'Need a list of arguments!';
+    my $doc_section = $arg->{doc_section} or die 'Need a doc_section!';
 
     my %item;
     my %dbcol;
@@ -8460,7 +8001,8 @@ sub process_simple_args {
         next if $arg eq 'extraargs';
 
         if (! exists $item{$arg}) {
-            die "Unknown option '$arg'\n$usage\n";
+            warn "Unknown option '$arg'\n";
+            usage_exit($doc_section);
         }
 
         (my $val = $xyargs->{$arg}) =~ s/^\s*(\S+)\s*$/$1/;
@@ -8851,7 +8393,7 @@ JOIN goat g ON (g.id = c.goat)
             $SEQUENCE->{$id} = $GOAT->{$id};
         }
         else {
-            die "Unknown goat type $type!";
+            die "Unknown relation type $type!";
         }
     }
 
@@ -9165,7 +8707,7 @@ sub create_herd {
         $sth->execute($name);
     };
     if ($@) {
-        print qq{Failed to create database group "$name"\n$@\n};
+        print qq{Failed to create relation group "$name"\n$@\n};
         exit 1;
     }
 
@@ -9185,220 +8727,1880 @@ bucardo - utility script for controlling the Bucardo program
 
 =head1 VERSION
 
-This document describes version 4.99.5 of bucardo
+This document describes version 4.99.6 of bucardo
 
-=head1 SYNOPSIS
+=head1 USAGE
 
-  ./bucardo install
-
-  ./bucardo list dbs
-
-  ./bucardo add sync testsync source=herd1 type=pushdelta targetdb=B
-
-  ./bucardo add sync testsync source=herd1 type=pushdelta targetdb=B tables=tab1,tab2,tab3
-
-  ./bucardo add database newdb dbname=internal_name port=5432 host=myserver
-
-  ./bucardo add all tables db=foo [herd=x] [pkonly]
-
-  ./bucardo add all sequences db=foo [herd=x]
-
-  ./bucardo add herd newherd table1 table2 table3 ...
-
-  ./bucardo add dbgroup name db1 db2 db3 ...
-
-  ./bucardo start "Starting up - Greg"
-
-  ./bucardo stop "Bringing down for debugging - Raul E."
-
-  ./bucardo ping
-
-  ./bucardo status
-
-  ./bucardo status sync1 sync2
-
-  ./bucardo kick sync1 sync2
-
-  ./bucardo kick sync1 0
-
-  ./bucardo reload_config
-
-  ./bucardo upgrade
-
-  ./bucardo reload sync
-
-  ./bucardo validate sync
-
-  ./bucardo message "Your message here"
-
-  ./bucardo config show
-
-  ./bucardo config set foo=bar baz=123
-
+  bucardo [<options>] <command> [<action>] [<command-options>] [<command-params>]
 
 =head1 DESCRIPTION
 
-The bucardo script is the main interaction to a running Bucardo instance. It can 
-be used to start and stop Bucardo, add new items, kick syncs, and even install and 
-upgrade Bucardo itself. For more complete documentation, please view the wiki at:
-
-http://bucardo.org/
+The bucardo script is the main interaction to a running Bucardo instance. It
+can be used to start and stop Bucardo, add new items, kick syncs, and even
+install and upgrade Bucardo itself. For more complete documentation, please
+view L<the wiki|http://bucardo.org/>.
 
 =head1 COMMANDS
 
-=over 4
+Run C<< bucardo help <command> >> for additional details
 
-=item B<install>
+=over
 
-Usage: ./bucardo install
+=item C<install>
 
-Attempts to install the Bucardo schema from the file 'bucardo.schema' into an existing 
-Postgres cluster. The user 'bucardo' and database 'bucardo' will be created first as needed.
-This is an interactive installer, but you can supply the following values from the command 
-line:
+Installs the Bucardo configuration database.
 
-=over 2
+=item C<upgrade>
 
-=item --dbuser (defaults to postgres)
+Upgrades the Bucardo configuration database to the latest schema.
 
-=item --dbname (defaults to postgres)
+=item C<< start [<start options>] [<reason>] >>
 
-=item --dbport (defaults to 5432)
+Starts Bucardo.
 
-=item --piddir (defaults to /var/run/bucardo/)
+=item C<< stop [<reason>] >>
+
+Stops Bucardo.
+
+=item C<< restart [<start options>] [<reason>] >>
+
+Stops and starts Bucardo.
+
+=item C<< list <type> [<regex>] >>
+
+Lists objects managed by Bucardo.
+
+=item C<< add <type> <name> <parameters> >>
+
+Adds a new object.
+
+=item C<< update <type> <name> <parameters> >>
+
+Updates an object.
+
+=item C<< remove <type> <name> [<name>...] >>
+
+Removes one or more objects.
+
+=item C<< kick <syncname> [<sync options>] [<syncname>...] [<timeout>] >>
+
+Kicks off one or more syncs.
+
+=item C<reload config>
+
+Sends a message to all CTL and KID processes asking them to reload the Bucardo
+configuration.
+
+=item C<< show all|<setting> [<setting>...] >>
+
+Shows the current Bucardo settings.
+
+=item C<<set <setting=value> [<setting=value>...] >>
+
+Sets one or more configuration setting..
+
+=item C<< ping [<timeout>] >>
+
+Sends a ping notice to the MCP process to see if it will respond.
+
+=item C<< status [<status options>] <syncname> [<syncname>...] >>
+
+Shows the brief status of syncs in a tabular format.
+
+=item C<< activate <syncname> [<syncname>...] [<timeout>] >>
+
+Activates one or more named syncs.
+
+=item C<< deactivate <syncname> [<syncname>...] [<timeout>] >>
+
+Deactivates one or more named syncs.
+
+=item C<< message <body> >>
+
+Sends a message to the running Bucardo logs.
+
+=item C<< reload [<syncname> [<syncname>...]] >>
+
+Sends a message to one or more sync processes, instructing them to reload.
+
+=item C<< inspect <type> <name> [<name>...] >>
+
+Inspects one or more objects of a particular type.
+
+=item C<< validate all|<syncname> [<syncname>...] >>
+
+Validates one or more syncs.
+
+=item C<< purge all|<table> [<table>...] >>
+
+Purges the delta and track tables for one or more tables, for one or more
+databases.
+
+=item C<< help [<command> [<action>]] >>
+
+Shows help.
 
 =back
 
-=item B<upgrade>
+=head1 OPTIONS
 
-Usage: ./bucardo upgrade
+  -d --db-name       NAME  Database name.
+  -U --db-user       USER  Database user name.
+  -P --db-pass       PASS  Database password.
+  -h --db-host       HOST  Database server host name.
+  -p --db-port       PORT  Database server port number.
+     --bucardorc     FILE  Use specified .bucarorc file.
+     --no-bucardorc        Do not use .bucardorc file.
+     --quiet               Incremental quiet.
+     --verbose             Incremental verbose mode.
+  -? --help                Output basic help and exit.
+     --version             Print the version number and exit.
 
-Upgrades an existing Bucardo installation to the current version of the bucardo script.
-Requires that the bucardo script and the bucardo.schema file be the same version. All
+=head1 COMMAND DETAILS
+
+Most of the commands take parameters. These may be passed after the command
+name and, where appropriate, an object name. Parameters take the form of
+key/value pairs separated by an equal sign (C<=>). For example:
+
+  bucardo add db sea_widgets dbname=widgets host=db.example.com
+
+Here C<dbname> and <host> are parameters.
+
+Many of the commands also use command-line options, which are specified in the
+normal way. For example, the C<bucardo add db> command could also be written
+as:
+
+  bucardo add db sea_widgets --dbname widgets --dbhost db.example.com
+
+However, parameters and options are not directly interchangeable in all cases.
+See the documentation for individual commands for their supported options.
+
+=head2 install
+
+  bucardo install
+
+Installs the Bucardo schema from the file F<bucardo.schema> into an existing Postgres cluster.
+The user "bucardo" and database "bucardo" will be created first as needed. This is an
+interactive installer, but you can supply the following values from the command line:
+
+=over
+
+=item C<--dbuser>
+
+defaults to postgres
+
+=item C<--dbname>
+
+defaults to postgres
+
+=item C<--dbport>
+
+defaults to 5432
+
+=item C<--pid-dir>
+
+defaults to /var/run/bucardo/
+
+=back
+
+=head2 upgrade
+
+  bucardo upgrade
+
+Upgrades an existing Bucardo installation to the current version of the bucardo database
+script. Requires that bucardo and the F<bucardo.schema> file be the same version. All
 changes should be backwards compatible, but you may need to re-validate existing scripts
 to make sure changes get propagated to all databases.
 
-=item B<start>
+=head2 start
 
-Usage: ./bucardo start "Reason --name"
+  bucardo start "Reason"
 
-Restarts Bucardo cleanly by first issuing the equivalent of a stop to ask any existing Bucardo
+Starts Bucardo. Fails if the MCP process is running (determined if its PID file is present).
+Otherwise, starts cleanly by first issuing the equivalent of a stop to ask any existing Bucardo
 processes to exit, and then starting a new Bucardo MCP process. A short reason and name should
-be provided - these are logged in the reason_file file and sent in the email sent when Bucardo
-has been started up.
+be provided - these are written to the C<reason_file> file (F<./bucardo.restart.reason.txt> by
+default) and sent in the email sent when Bucardo has been started up. It is also appended to
+the reason log, which has the same name as the the C<reason_file> but ends in F<.log>.
 
-Before attempting to kill any old processes, a ping command with a timeout of 5 seconds is issued.
-If this returns successfully (indicating an active MCP process already running), the script will
-exit with a return value of 2.
+The options for the C<start> command are:
 
-=item B<stop>
+=over
 
-Usage: ./bucardo stop "Reason --name"
+=item C<--sendmail>
+
+Tells Bucardo whether or not to send mail on interesting events: startup,
+shutdown, and errors. Default is on.
+
+=item C<--extra-name string>
+
+A short string that will be appended to the version string as output by the
+Bucardo process names. Mostly useful for debugging.
+
+=item C<--log-destination destination>
+
+Determines the destination for logging output. The supported values are:
+
+=over
+
+=item C<stderr>
+
+=item C<stdout>
+
+=item C<syslog>
+
+=item C<none>
+
+=item A file system directory.
+
+=back
+
+May be specified more than once, which is useful for, e.g., logging both to a
+directory and to syslog. If C<--log-destination> is not specified at all, the
+default is to log to files in F</var/log/bucardo>.
+
+=item C<--log-separate>
+
+Forces creation of separate log files for each Bucardo process of the form
+"log.bucardo.X.Y", where X is the type of process (MCP, CTL, or KID), and Y is
+the process ID.
+
+=item C<--log-extension string>
+
+Appends the given string to the end of the default log file name,
+F<log.bucardo>. A dot is added before the name as well, so a log extension of
+"rootdb" would produce a log file named F<log.bucardo.rootdb>.
+
+=item C<--log-clean>
+
+Forces removal of all old log files before running.
+
+=item C<--debug>
+
+=item C<--no-debug>
+
+Enable or disable debugging output. Disabled by default.
+
+=item C<--exit-on-nosync>
+
+=item C<--no-exit-on-nosync>
+
+On startup, if Bucardo finds no active syncs, it normally will continue to
+run, requiring a restart once syncs are added. This is useful for startup
+scripts and whatnot.
+
+If, however, you want it to exit when there are no active syncs, pass the
+C<--exit-on-nosync> option. You can also be explicit that it should I<not>
+exit when there are no syncs by passing C<--no-exit-on-nosync>. This is the
+default value.
+
+=back
+
+=head2 stop
+
+  bucardo stop "Reason"
 
 Forces Bucardo to quit by creating a stop file which all MCP, CTL, and KID processes should
 detect and cause them to exit. Note that active syncs will not exit right away, as they
 will not look for the stop file until they have finished their current run. Typically,
 you should scan the list of processes after running this program to make sure that all Bucardo
 processes have stopped. One should also provide a reason for issuing the stop - usually
-this is a short explanation and your name. This is logged in the reason_file file and
-is also used by Bucardo when it exits and sends out mail about its death.
+this is a short explanation and your name. This is written to the C<reason_file> file
+(F<./bucardo.restart.reason.txt> by default) and is also used by Bucardo when it exits and
+sends out mail about its death. It is also appended to the reason log, which has the same name
+as the the C<reason_file> but ends in F<.log>.
 
-=item B<list>
+=head2 restart
 
-Usage: ./bucardo list <type> <regex>
+  bucardo restart "Reason"
 
-Lists summary information about dbs, dbgroups, tables, sequences,
-syncs, herds, customnames, customcols or customcode. Adding anything
-after the type will look up all matching entries.
+Stops bucardo, waits for the stop to complete, and then starts it again.
+Supports the same options as <C<start>/start>. Useful for start scripts. For
+getting just CTL and KID processes to recognize newly added, updated, or
+removed objects, use the C<reload> command, instead.
 
-=item B<add>
+=head2 list
 
-Usage:  add <item_type> <item_name>
+  bucardo list <type> <regex>
 
-Usage:  add db <dbname> dbname=internal_name port=xxx host=xxx user=xxx pass=xxx service=xxx conn=xxx ssp=1/0
+Lists summary information about Bucardo objects. The supported types are:
 
-Usage:  add dbgroup name db1 db2 db3 ...
+=over
 
-Usage:  add table [schema].table db=internal_db_name ping=bool standard_conflict=xxx herd=xxx
+=item * C<database>
 
-Usage:  add all tables [herd=xxx] [pkonly]
+=item * C<dbgroup>
 
-Usage:  add sequence [schema].table herd=xxx
+=item * C<relgroup>
 
-Usage:  add all sequences herd=xxx
+=item * C<sync>
 
-Usage:  add sync syncname options
+=item * C<table>
 
-Usage:  add herd name
+=item * C<sequence>
 
-Usage:  add customname tablename newtablename [sync=x db=x]
+=item * C<customcode>
 
-Usage:  add customcols tablename select_clause [sync=x db=x]
+=item * C<customname>
 
-Usage:  add customcode <name> <whenrun=value> <src_code=filename> [optional information]
+=item * C<customcols>
 
-Tells Bucardo about new objects it should know about. These commands can
-replace direct manipulation of the tables in the bucardo schema for the
-supported object types (you'll still need to add things like the mappings between objects on your own).
+=item * C<all>
 
-=item B<remove>
+=back
 
-Usage:  remove <item_type> <item_name>
+The C<all> option will list information about all object types.
 
-Removes one or more items from the Bucardo database. Valid item types are database, 
-dbgroup, herd, sync, table, and sequence.
+The optional C<regex> option can be used to filter the list to only those
+matching a regular expression.
 
-=item B<kick>
+Aliases:
 
-Usage: ./bucardo kick <syncname(s)> [timeout]
+=over
+
+=item C<l>
+
+=item C<lsit>
+
+=item C<liast>
+
+=item C<lisy>
+
+=item C<lit>
+
+=back
+
+=head2 add
+
+  bucardo add <type> <name> <parameters>
+
+Adds a new object to Bucardo. The C<type> specifies the type of object to add,
+while the C<name> should be the name of the object. The supported types
+include:
+
+=over
+
+=item C<db>
+
+=item C<dbgroup>
+
+=item C<table>
+
+=item C<sequence>
+
+=item C<all tables>
+
+=item C<all sequences>
+
+=item C<relgroup>
+
+=item C<sync>
+
+=item C<customname>
+
+=item C<customcols>
+
+=item C<customcols>
+
+=back
+
+=head3 add db
+
+  bucardo add db <name> dbname=actual_name port=xxx host=xxx user=xxx pass=xxx
+
+Adds a new database. The C<name> is the name by which the database will be
+known to Bucardo, and must be unique. This may vary from the actual database
+name, as multiple hosts might have databases with the same name.
+
+The supported named parameters are:
+
+=over
+
+=item C<dbname>
+
+=item C<db>
+
+The actual name of the database. Required.
+
+=item C<type>
+
+=item C<dbtype>
+
+The type of the database. Defaults to C<postgres>. Currently supported values are:
+
+=over
+
+=item * C<postgres>
+
+=item * C<drizzle>
+
+=item * C<mongo>
+
+=item * C<mysql>
+
+=item * C<maria>
+
+=item * C<oracle>
+
+=item * C<redis>
+
+=item * C<sqlite>
+
+=back
+
+=item C<username>
+
+=item C<dbuser>
+
+=item C<user>
+
+The username Bucardo should use to connect to the database. Optional.
+
+=item C<password>
+
+=item C<dbpass>
+
+=item C<pass>
+
+The password Bucardo should use when connecting to the database. Optional.
+
+=item C<dbhost>
+
+=item C<pghost>
+
+=item C<host>
+
+The host name to which to connect. Defaults to the value of the C<$PGHOSTADDR>
+or C<$PGHOST> environment variables, if present. Optional.
+
+=item C<dbport>
+
+=item C<pgport>
+
+=item C<port>
+
+The port to which to connect. Defaults to the value of the C<$PGPORT>
+environment variable, if present. Optional.
+
+=item C<dbconn>
+
+=item C<pgconn>
+
+=item C<conn>
+
+Additional connection parameters, e.g., C<sslmode=require>. Optional.
+
+=item C<status>
+
+Initial status of the database in Bucardo. Must be either "active" or
+"inactive". Defaults to "active".
+
+=item C<dbgroup>
+
+=item C<group>
+
+Bucardo database group to which to add the database. Optional.
+
+=item C<addalltables>
+
+Automatically adds all tables once the database has been added. Optional.
+
+=item C<addallsequences>
+
+Automatically adds all sequences once the database has been added. Optional.
+
+=item C<server_side_prepares>
+
+=item C<ssp>
+
+Enable or disable server-side prepares. Pass 1 to enable them or 0 to disable
+them. Defaults to 1.
+
+=item C<dbservice>
+
+=item C<service>
+
+The service name to use for a Postgres database. Optional.
+
+=item C<makedelta>
+
+Turns makedelta magic on or off. Value must be one of "on" or "off". Defaults
+to "on".
+
+=back
+
+=head3 add dbgroup
+
+  bucardo add dbgroup name db1:source db2:source db3:target ...
+
+Adds one or more databases to the named database group. If the database group
+doesn't exist, it will be created. The database parameters should specify
+their roles, either "source" or "target".
+
+=head3 add table
+
+  bucardo add table [schema].table db=actual_db_name
+
+Adds a table object. The table information will be read from the specified
+database. Supported parameters:
+
+=over
+
+=item C<db>
+
+The name of the database from which to read the table information. Should be a
+name known to Bucardo, thanks to a previous call to C<add database>. Required.
+
+=item C<autokick>
+
+Boolean indicating whether or not the table should automatically send kick
+messages when it's modified. Overrides the C<autokick> parameter of any syncs
+of which the table is a part.
+
+=item C<rebuild_index>
+
+Boolean indicating whether or not to rebuild indexes after every sync. Off by
+default. Optional.
+
+=item C<analyze_after_copy>
+
+Boolean indicating whether or not to analyze the table after every sync. Off
+by default. Optional.
+
+=item C<vaccuum_after_copy>
+
+Boolean indicating whether or not to vacuum the table after every sync. Off by
+default. Optional.
+
+=item C<relgroup>
+
+Adds the table to the named relation group. If the relation group does not
+exist, it will be created. Optional.
+
+=item C<makedelta>
+
+Turns makedelta magic on or off. Value must be one of "on" or "off". Defaults
+to "on".
+
+=back
+
+=head3 add sequence
+
+  bucardo add sequence [schema].sequence relgroup=xxx
+
+=over
+
+=item C<db>
+
+The name of the database from which to read the sequence information. Should
+be a name known to Bucardo, thanks to a previous call to C<add database>.
+Required.
+
+=item C<relgroup>
+
+Adds the sequence to the named relation group. If the relation group does not
+exist, it will be created. Optional.
+
+=back
+
+=head3 add all tables
+
+  bucardo add all tables [relgroup=xxx] [pkonly]
+
+Adds all the tables in all known databases or in a specified database.
+Excludes tables in the C<pg_catalog>, C<information_schema>, and C<bucardo>
+schemas. (Yes, this means that you cannot replicate the Bucardo configuration
+database using Bucardo. Sorry about that.) Supported options and parameters:
+
+=over
+
+=item C<db>
+
+=item C<--db>
+
+Name of the database from which to find all the tables to add. If not
+provided, tables will be added from all known databases.
+
+=item C<schema>
+
+=item C<--schema>
+
+=item C<-n>
+
+Limit to the tables in the specified comma-delimited list of schemas. The
+options may be specified more than once.
+
+=item C<exclude-schema>
+
+=item C<--exclude-schema>
+
+=item C<-N>
+
+Exclude tables in the specified comma-delimited list of schemas. The options
+may be specified more than once.
+
+=item C<table>
+
+=item C<--table>
+
+=item C<-t>
+
+Limit to the specified tables. The options may be specified more than once.
+
+=item C<exclude-table>
+
+=item C<--exclude-table>
+
+=item C<-T>
+
+Exclude the specified tables. The options may be specified more than once.
+
+=item C<relgroup>
+
+=item C<--relgroup>
+
+Name of the relation group to which to add new tables.
+
+=item C<pkonly>
+
+Exclude tables without primary keys.
+
+=back
+
+=head3 add all sequences
+
+  bucardo add all sequences relgroup=xxx
+
+Adds all the sequences in all known databases or in a specified database.
+Excludes sequences in the C<pg_catalog>, C<information_schema>, and C<bucardo>
+schemas. (Yes, this means that you cannot replicate the Bucardo configuration
+database using Bucardo. Sorry about that.) Supported options and parameters:
+
+=over
+
+=item C<db>
+
+=item C<--db>
+
+Name of the database from which to find all the sequences to add. If not
+provided, sequences will be added from all known databases.
+
+=item C<schema>
+
+=item C<--schema>
+
+=item C<-n>
+
+Limit to the sequences in the specified comma-delimited list of schemas. The
+options may be specified more than once.
+
+=item C<exclude-schema>
+
+=item C<--exclude-schema>
+
+=item C<-N>
+
+Exclude sequences in the specified comma-delimited list of schemas. The
+options may be specified more than once.
+
+=item C<relgroup>
+
+=item C<--relgroup>
+
+Name of the relation group to which to add new tables or sequences.
+
+=back
+
+=head3 add relgroup
+
+  bucardo add relgroup name
+  bucardo add relgroup name table, sequence, ...
+
+Adds a relation group. After the name, pass in an optional list of tables
+and/or sequences and they will be added to the group.
+
+=head3 add sync
+
+  bucardo add sync syncname relgroup=xxx dbs=xxx
+
+Adds a sync, which is a named replication event containing information about
+what to replicate from where to where. The supported parameters are:
+
+=over
+
+=item C<dbs>
+
+The name of a database group or comma-delimited list of databases. All of the
+specified databases will be synchronized. Required.
+
+=item C<relgroup>
+
+The name of a relation group to synchronize. All of the tables and/or
+sequences in the relgroup will be synchronized. Required unless C<tables> is
+specified.
+
+=item C<tables>
+
+List of tables to add to the sync. This implicitly creates a relation group
+with the same name as the sync. Required unless C<relgroup> is specified.
+
+=item C<status>
+
+Indicates whether or not the sync is active. Must be either "active" or
+"inactive". Defaults to "active".
+
+=item C<rebuild_index>
+
+Boolean indicating whether or not to rebuild indexes after every sync.
+Defaults to off.
+
+=item C<lifetime>
+
+Number of seconds a KID can live before being reaped. No limit by default.
+
+=item C<maxkicks>
+
+Number of times a KID may be kicked before being reaped. No limit by default.
+
+=item C<conflict_strategy>
+
+The conflict resolution strategy to use in the sync. Supported values:
+
+=over
+
+=item C<bucardo_source>
+
+The rows on the "source" database always "win". In other words, in a conflict,
+Bucardo copies rows from source to target.
+
+=item C<bucardo_target>
+
+The rows on the "target" database always win.
+
+=item C<bucardo_skip>
+
+Any conflicting rows are simply not replicated. Not recommended for most
+cases.
+
+=item C<bucardo_random>
+
+Each database has an equal chance of winning each time. This is the default.
+
+=item C<bucardo_latest>
+
+The row that was most recently changed wins.
+
+=item C<bucardo_abort>
+
+The sync is aborted on a conflict.
+
+=back
+
+=item C<onetimecopy>
+
+Determines whether or not a sync should switch to a full copy mode for a
+single run. Supported values are:
+
+=over
+
+=item 0: off
+
+=item 1: always full copy
+
+=item 2: only copy tables that are empty on the target
+
+=back
+
+=item C<stayalive>
+
+Boolean indicating whether or not the sync processes (CTL) should be
+persistent. Defaults to false.
+
+=item C<kidsalive>
+
+Boolean indicating whether or not the sync child processes (KID) should be
+persistent. Defaults to false.
+
+=item C<autokick>
+
+Boolean indicating whether or not tables in the sync should automatically send
+kick messages when they're modified. May be overridden by the C<autokick>
+parameter of individual tables.
+
+=item C<checktime>
+
+An interval specifying the maximum time a sync should go before being
+kicked. Useful for busy systems where you don't want the overhead of notify
+triggers.
+
+=item C<priority>
+
+An integer indicating the priority of the sync. Lower numbers are higher
+priority. Currently used only for display purposes.
+
+=item C<analyze_after_copy>
+
+Boolean indicating whether or not to analyze tables after every sync. Off by
+default. Optional.
+
+=item C<overdue>
+
+An interval specifying the amount of time after which the sync has not run
+that it should be considered overdue. C<check_bucardo_sync> issues a warning
+when a sync has not been run in this amount of time.
+
+=item C<expired>
+
+An interval specifying the amount of time after which the sync has not run
+that it should be considered expired. C<check_bucardo_sync> issues a critical
+message when a sync has not been run in this amount of time.
+
+=item C<track_rates>
+
+Boolean indicating whether or not to track synchronization rates.
+
+=item C<rebuild_index>
+
+Boolean indicating whether or not to rebuild indexes after every sync. Off by
+default. Optional.
+
+=back
+
+=head3 add customname
+
+  bucardo add customname oldname newname [db=name] [sync=name]
+
+Creates a new Bucardo custom name mapping. This allows the tables involved in
+replication to have different names on different databases. The C<oldname>
+must contain the schema as well as the table name (if the source database
+supports schemas). The optional parameters limit it to one or more databases,
+and/or to one or more syncs. Supported parameters:
+
+=over
+
+=item C<sync>
+
+A sync to which to add the customname. May be specified multiple times.
+
+=item C<database>
+
+=item C<db>
+
+A database for which to add the customname. May be specified multiple times.
+
+=back
+
+=head3 add customcols
+
+  bucardo add customcols tablename select_clause [sync=x db=x]
+
+Specify the list of columns to select from when syncing. Rather than the
+default C<SELECT *> behavior, you can specify any columns you want, including
+the use of function call return values and things not in the source column
+list. The optional parameters limit it to one or more databases, and/or to one
+or more syncs. Some examples:
+
+  bucardo add customcols public.foobar "select a, b, c"
+  bucardo add customcols public.foobar "select a, upper(b) AS b, c" db=foo
+  bucardo add customcols public.foobar "select a, b, c" db=foo sync=abc
+
+Supported parameters:
+
+=over
+
+=item C<sync>
+
+A sync to which to add the customcols. May be specified multiple times.
+
+=item C<database>
+
+=item C<db>
+
+A database for which to add the customcols. May be specified multiple times.
+
+=back
+
+=head3 add customcode
+
+  bucardo add customcode <name> <whenrun=value> <src_code=filename> [optional information]
+
+Adds a customcode, which is a Perl subroutine that can be run at certain
+points in the sync process. It might handle exceptions, handle conflicts, or
+just run at certain times with no expectation of functionality (e.g., before
+Bucardo drops triggers). Metadata about that point will be passed to the
+subroutine as a hash reference.
+
+Supported parameters:
+
+=over
+
+=item C<name>
+
+The name of the custom code object.
+
+=item C<about>
+
+A short description of the custom code.
+
+=item C<whenrun>
+
+=item C<when_run>
+
+A string indicating when the custom code should be run. Supported values
+include:
+
+=over
+
+=item C<before_txn>
+
+=item C<before_check_rows>
+
+=item C<before_trigger_drop>
+
+=item C<after_trigger_drop>
+
+=item C<after_table_sync>
+
+=item C<exception>
+
+=item C<conflict>
+
+=item C<before_trigger_enable>
+
+=item C<after_trigger_enable>
+
+=item C<after_txn>
+
+=item C<before_sync>
+
+=item C<after_sync>
+
+=back
+
+=item C<getdbh>
+
+Boolean indicating whether or not Perl L<DBI> database handles should be
+provided to the custom code subroutine. If true, database handles will be
+provided under the C<dbh> key of the hash reference passed to the subroutine.
+The value under this key will be a hash reference mapping database names to
+their respective handles.
+
+=item C<sync>
+
+Name of the sync with which to associate the custom code.
+
+=item C<relation>
+
+Name of the table or sequence with which to associate the custom code.
+
+=item C<status>
+
+The current status of this customcode. Anything other than "active" means the
+code is not run.
+
+=item C<priority>
+
+Number indicating the priority in which order to execute custom codes. Lower numbers
+are higher priority. Useful for subroutines that set C<lastcode> in order to
+cancel the execution of subsequent custom codes for the same C<when_run>.
+
+=item C<src_code>
+
+File from which to read the custom code Perl source.
+
+=back
+
+The body of the Perl subroutine should be implemented in the C<src_code> file,
+and not inside a C<sub> declaration. When called, it will be passed a single
+hash reference with the following keys:
+
+=over
+
+=item C<syncname>
+
+The name of the currently-executing sync.
+
+=item C<version>
+
+The version of Bucardo executing the sync.
+
+=item C<sourcename>
+
+The name of the source database.
+
+=item C<targetname>
+
+The name of the target database.
+
+=item C<sendmail>
+
+A code reference that can be used to send email messages.
+
+=item C<sourcedbh>
+
+A L<DBI> database handle to the sync source database. Provided only to custom
+code executed by the controller.
+
+=item C<rellist>
+
+An array reference of hash references, each representing a relation in the
+sync. Provided only to custom code executed by the controller. The keys in
+the hash are the same as the parameters supported by L</add table> and
+L</add sequence>, as appropriate.
+
+=item C<schemaname>
+
+The schema for the table that triggered the exception. Provided only to
+"exception" custom codes.
+
+=item C<tablename>
+
+The name of the table that triggered the exception. Provided only to
+"exception" custom codes.
+
+=item C<error_string>
+
+The string containing the actual error message. Provided only to "exception"
+custom codes.
+
+=item C<deltabin>
+
+A hash reference with the name of each source database as a key and a list of
+all primary keys joined together with "\0". Provided only to "exception"
+custom codes.
+
+=item C<attempts>
+
+The number of times the sync has been attempted. Provided only to "exception"
+custom codes.
+
+=item C<conflicts>
+
+A hash reference of conflicting rows. The keys are the primary key values, and
+the values are hash references with the names of the databases containing the
+conflicting rows and true values. Provided only to "conflict" custom codes.
+
+=back
+
+The custom code subroutine may set any of these keys in the hash reference to
+change the behavior of the sync:
+
+=over
+
+=item C<message>
+
+Message to send to the logs.
+
+=item C<warning>
+
+A warning to emit after the subroutine has returned.
+
+=item C<error>
+
+An error to be thrown after the subroutine has returned.
+
+=item C<nextcode>
+
+Set to send execution to the next custom code of the same type. Mainly useful
+to exception custom codes, and supported only by custom codes executed by the
+controller.
+
+=item C<lastcode>
+
+Set to true to have any subsequent custom codes of the same type to be
+skipped.
+
+=item C<endsync>
+
+Cancels the sync altogether.
+
+=back
+
+An example:
+
+  use strict;
+  use warnings;
+  use Data::Dumper;
+
+  my $info = shift;
+
+  # Let's open a file.
+  my $file = '/tmp/bucardo_dump.txt';
+  open my $fh, '>:encoding(UTF-8)', $file or do {
+      $info->{warning} = "Cannot open $file: $!\n";
+      return;
+  };
+
+  # Inspect $info for fun.
+  print $fh Dumper $info;
+  close $fh or $info->{warning} = "Error closing $file: $!\n";
+
+  # Log a message and return.
+  $info->{message} = 'IN UR DATABASEZ NORMALIZIN UR RELAYSHUNS';
+  return;
+
+=head2 update
+
+  bucardo update <type> <name> <parameters>
+
+Updates a Bucardo object. The C<type> specifies the type of object to update,
+while the C<name> should be the name of the object. The supported parameters
+for each type are the same as those for L</add>. The supported types are:
+
+=over
+
+=item C<db>
+
+=item C<dbgroup>
+
+=item C<sync>
+
+=item C<table>
+
+=item C<sequence>
+
+=back
+
+=head3 update customcode
+
+  bucardo update customcode <name> setting=value
+
+Updates an existing customcode. Items that can be changed are:
+
+=over
+
+=item C<about>
+
+A short description of the custom code.
+
+=item C<getdbh>
+
+Boolean indicating whether or not Perl L<DBI> database handles should be
+provided to the custom code subroutine. If true, database handles will be
+provided under the C<dbh> key of the hash reference passed to the subroutine.
+The value under this key will be a hash reference mapping database names to
+their respective handles.
+
+=item C<name>
+
+The name of the custom code object.
+
+=item C<priority>
+
+Number indicating the priority in which order to execute custom codes. Lower numbers
+are higher priority. Useful for subroutines that set C<lastcode> in order to
+cancel the execution of subsequent custom codes for the same C<when_run>.
+
+=back
+
+=item C<status>
+
+The current status of this customcode. Anything other than "active" means the
+code is not run.
+
+=item C<whenrun>
+
+A string indicating when the custom code should be run. Supported values include:
+
+=over
+
+=item C<before_txn>
+
+=item C<before_check_rows>
+
+=item C<before_trigger_drop>
+
+=item C<after_trigger_drop>
+
+=item C<after_table_sync>
+
+=item C<exception>
+
+=item C<conflict>
+
+=item C<before_trigger_enable>
+
+=item C<after_trigger_enable>
+
+=item C<after_txn>
+
+=item C<before_sync>
+
+=item C<after_sync>
+
+=back
+
+=head3 update db
+
+  bucardo udpate db <name> port=xxx host=xxx user=xxx pass=xxx
+
+Updates a database. The C<name> is the name by which the database is known to
+Bucardo. This may vary from the actual database name, as multiple hosts might
+have databases with the same name.
+
+The supported named parameters are:
+
+=over
+
+=item C<dbname>
+
+=item C<db>
+
+The actual name of the database.
+
+=item C<type>
+
+=item C<dbtype>
+
+The type of the database. Currently supported values are:
+
+=over
+
+=item * C<postgres>
+
+=item * C<drizzle>
+
+=item * C<mongo>
+
+=item * C<mysql>
+
+=item * C<maria>
+
+=item * C<oracle>
+
+=item * C<redis>
+
+=item * C<sqlite>
+
+=back
+
+=item C<username>
+
+=item C<dbuser>
+
+=item C<user>
+
+The username Bucardo should use to connect to the database.
+
+=item C<password>
+
+=item C<dbpass>
+
+=item C<pass>
+
+The password Bucardo should use when connecting to the database.
+
+=item C<dbhost>
+
+=item C<pghost>
+
+=item C<host>
+
+The host name to which to connect.
+
+=item C<dbport>
+
+=item C<pgport>
+
+=item C<port>
+
+The port to which to connect.
+
+=item C<dbconn>
+
+=item C<pgconn>
+
+=item C<conn>
+
+Additional connection parameters, e.g., C<sslmode=require>. Optional.
+
+=item C<status>
+
+Status of the database in Bucardo. Must be either "active" or "inactive".
+
+=item C<dbgroup>
+
+=item C<server_side_prepares>
+
+=item C<ssp>
+
+Enable or disable server-side prepares. Pass 1 to enable them or 0 to disable
+them.
+
+=item C<dbservice>
+
+=item C<service>
+
+The service name to use for a Postgres database.
+
+=item C<makedelta>
+
+Turns makedelta magic on or off. Value must be one of "on" or "off".
+
+=item C<group>
+
+A comma-separated list of database groups to which to add the database. The
+database will be removed from any other groups of which it was previously a
+member.
+
+=back
+
+=head3 update dbgroup
+
+  bucardo update dbgroup name=newname
+  bucardo update dbgroup db1:source db2:source db3:target ...
+
+Updates a database group. The name can be changed, or the databases in the
+group updated. The database parameters should specify their roles, either
+"source" or "target". If database parameters are specified, they will replace
+the existing list of databases in the group. If you just want to add
+databases, use L<C<add dbgroup>|/add dbgroup> instead.
+
+=head3 update sync
+
+  bucardo update sync syncname relgroup=xxx dbs=xxx
+
+Updates a sync, which is a named replication event containing information about
+what to replicate from where to where. The supported parameters are:
+
+=over
+
+=item C<name>
+
+The name of the sync.
+
+=item C<dbs>
+
+The name of a database group or comma-delimited list of databases.
+
+=item C<relgroup>
+
+The name of a relation group to synchronize.
+
+=item C<status>
+
+Indicates whether or not the sync is active. Must be either "active" or
+"inactive".
+
+=item C<rebuild_index>
+
+Boolean indicating whether or not to rebuild indexes after every sync.
+
+=item C<lifetime>
+
+Number of seconds a KID can live before being reaped.
+
+=item C<maxkicks>
+
+Number of times a KID may be kicked before being reaped.
+
+=item C<conflict_strategy>
+
+The conflict resolution strategy to use in the sync. Supported values:
+
+=over
+
+=item C<bucardo_source>
+
+The rows on the "source" database always "win". In other words, in a conflict,
+Bucardo copies rows from source to target.
+
+=item C<bucardo_target>
+
+The rows on the "target" database always win.
+
+=item C<bucardo_skip>
+
+Any conflicting rows are simply not replicated. Not recommended for most
+cases.
+
+=item C<bucardo_random>
+
+Each database has an equal chance of winning each time.
+
+=item C<bucardo_latest>
+
+The row that was most recently changed wins.
+
+=item C<bucardo_abort>
+
+The sync is aborted on a conflict.
+
+=back
+
+=item C<onetimecopy>
+
+Determines whether or not a sync should switch to a full copy mode for a
+single run. Supported values are:
+
+=over
+
+=item 0: off
+
+=item 1: always full copy
+
+=item 2: only copy tables that are empty on the target
+
+=back
+
+=item C<stayalive>
+
+Boolean indicating whether or not the sync processes (CTL) should be
+persistent.
+
+=item C<kidsalive>
+
+Boolean indicating whether or not the sync child processes (KID) should be
+persistent.
+
+=item C<autokick>
+
+Boolean indicating whether or not tables in the sync should automatically send
+kick messages when they're modified. May be overridden by the C<autokick>
+parameter of individual tables.
+
+=item C<checktime>
+
+An interval specifying the maximum time a sync should go before being
+kicked. Useful for busy systems where you don't want the overhead of notify
+triggers.
+
+=item C<priority>
+
+An integer indicating the priority of the sync. Lower numbers are higher
+priority. Currently used only for display purposes.
+
+=item C<analyze_after_copy>
+
+Boolean indicating whether or not to analyze tables after every sync. Off by
+default.
+
+=item C<overdue>
+
+An interval specifying the amount of time after which the sync has not run
+that it should be considered overdue. C<check_bucardo_sync> issues a warning
+when a sync has not been run in this amount of time.
+
+=item C<expired>
+
+An interval specifying the amount of time after which the sync has not run
+that it should be considered expired. C<check_bucardo_sync> issues a critical
+message when a sync has not been run in this amount of time.
+
+=item C<track_rates>
+
+Boolean indicating whether or not to track synchronization rates.
+
+=item C<rebuild_index>
+
+Boolean indicating whether or not to rebuild indexes after every sync.
+
+=back
+
+=head3 update table
+
+  bucardo update table [schema].table db=actual_db_name
+
+Updates a table object. The table information will be read from the specified
+database. Supported parameters:
+
+=over
+
+=item C<db>
+
+The name of the database from which to read the table information. Should be a
+name known to Bucardo.
+
+=item C<schemaname>
+
+The name of the schema in which the table is found.
+
+=item C<tablename>
+
+The actual name of the table.
+
+=item C<autokick>
+
+Boolean indicating whether or not the table should automatically send kick
+messages when it's modified. Overrides the C<autokick> parameter of any syncs
+of which the table is a part.
+
+=item C<rebuild_index>
+
+Boolean indicating whether or not to rebuild indexes after every sync.
+
+=item C<analyze_after_copy>
+
+Boolean indicating whether or not to analyze the table after every sync.
+
+=item C<vaccuum_after_copy>
+
+Boolean indicating whether or not to vacuum the table after every sync.
+
+=item C<relgroup>
+
+Adds the table to the named relation group. May be specified more than once.
+The table will be removed from any other relation groups.
+
+=item C<makedelta>
+
+Turns makedelta magic on or off. Value must be one of "on" or "off".
+
+=back
+
+=head3 update sequence
+
+  bucardo update sequence [schema].sequence relgroup=xxx
+
+=over
+
+=item C<db>
+
+The name of the database where the sequence lives.
+
+=item C<schemaname>
+
+The name of the schema in which the sequence is found.
+
+=item C<relgroup>
+
+Adds the sequence to the named relation group. May be specified more than
+once. The sequence will be removed from any other relation groups.
+
+=back
+
+=head2 remove
+
+  bucardo remove <item_type> <item_name>
+
+Removes one or more objects from Bucardo. Valid item types are;
+
+=over
+
+=item * C<db> or C<database>
+
+Use the C<--force> option to clear out related tables and groups instead of
+erroring out.
+
+=item * C<dbgroup>
+
+=item * C<relgroup>
+
+=item * C<sync>
+
+=item * C<table>
+
+=item * C<sequence>
+
+=item * C<customcols>
+
+=item * C<customname>
+
+=item * C<customcode>
+
+=back
+
+Aliases:
+
+=over
+
+=item C<delete>
+
+=item C<del>
+
+=back
+
+=head2 kick
+
+  bucardo kick <syncname(s)> [timeout]
 
 Tells one or more named syncs to fire as soon as possible. Note that this simply sends a request that 
 the sync fire: it may not start right away if the same sync is already running, or if the source or 
 target database has exceeded the number of allowed Bucardo connections. If the final argument is a 
 number, it is treated as a timeout. If this number is zero, the bucardo command will not return 
 until the sync has finished. For any other number, the sync will wait at most that number of seconds. 
-If any sync has not finished before the timeout, a false value is returned. In all other cases, a 
-true value is returned.
+If any sync has not finished before the timeout, an exit value of 1 will be returned. Errors will
+cause exit values of 2 or 3. In all other cases, an exit value of 0 will be returned.
 
 If a timeout is given, the total completion time in seconds is also displayed. If the sync is going to 
 multiple targets, the time that each target takes from the start of the kick is also shown as each 
-target finishes.
+target finishes. Options:
 
-=item B<reload_config>
+=over
 
-Forces Bucardo to reload the bucardo_config file, and then restart all processes to ensure that the new 
-information is loaded.
+=item C<--retry>
 
-=item B<show>
+The number of times to retry a sync if it fails. Defaults to 0.
 
-Usage: ./bucardo show <all|setting1> [setting2..]
+=item C<--retry-sleep>
 
-Shows the current settings in the bucardo_config table. Use the keyword 'all' to see all the settings, or 
-specify one or more search terms.
+How long to sleep, in seconds, between each retry attempt.
 
-=item B<set>
+=item C<--notimer>
 
-Usage: ./bucardo set setting1=value [setting2=value]
+By default, kicks with a timeout argument give a running real-time summary of
+time elapsed by using the backspace character. This may not be wanted if
+running a kick, for example, via a cronjob, so turning --notimer on will
+simply print the entire message without backspaces.
 
-Sets one or more items inside the bucardo_config table. Setting names are case-insensitive.
+=back
 
-=item B<ping>
+=head2 reload config
+
+  bucardo reload config
+  bucardo reload config 30
+
+Sends a message to all CTL and KID processes asking them to reload the Bucardo
+configuration. This configuration is a series of key/value pairs that
+configure Bucardo's behavior, and not any of the objects managed by the
+C<add>, C<remove>, or C<update> commands.
+
+By default, Bucardo will send the message and then exit. Pass an optional
+number and Bucardo will instead wait up to that length of time for all child
+processes to report completion.
+
+=head2 set
+
+  bucardo set setting1=value [setting2=value]
+
+Sets one or more configuration setting table. Setting names are
+case-insensitive. The available settings are:
+
+=begin comment
+
+How to generate this list:
+
+  psql -U bucardo -d bucardo -AXtc "SELECT regexp_replace(format(
+      E'=item C<%s>\n\n%s. Default: %s.\n',
+      name, about, CASE WHEN setting = '' THEN 'None' ELSE 'C<' || setting || '>' END
+  ), '([.?])[.]', E'\\\\1') FROM bucardo_config ORDER BY name;"
+
+=end comment
+
+=over
+
+=item C<autosync_ddl>
+
+Which DDL changing conditions do we try to remedy automatically? Default: C<newcol>.
+
+=item C<bucardo_current_version>
+
+Current version of Bucardo. Default: C<4.99.6>.
+
+=item C<bucardo_vac>
+
+Do we want the automatic VAC daemon to run? Default: C<1>.
+
+=item C<bucardo_version>
+
+Bucardo version this schema was created with. Default: C<4.99.6>.
+
+=item C<ctl_checkonkids_time>
+
+How often does the controller check on the kids health? Default: C<10>.
+
+=item C<ctl_createkid_time>
+
+How long do we sleep to allow kids-on-demand to get on their feet? Default: C<0.5>.
+
+=item C<ctl_sleep>
+
+How long does the controller loop sleep? Default: C<0.2>.
+
+=item C<default_conflict_strategy>
+
+Default conflict strategy for all syncs. Default: C<bucardo_latest>.
+
+=item C<default_email_from>
+
+Who the alert emails are sent as. Default: C<nobody@example.com>.
+
+=item C<default_email_host>
+
+Which host to send email through. Default: C<localhost>.
+
+=item C<default_email_to>
+
+Who to send alert emails to. Default: C<nobody@example.com>.
+
+=item C<email_debug_file>
+
+File to save a copy of all outgoing emails to. Default: None.
+
+=item C<endsync_sleep>
+
+How long do we sleep when custom code requests an endsync? Default: C<1.0>.
+
+=item C<flatfile_dir>
+
+Directory to store the flatfile output inside of. Default: C<.>.
+
+=item C<host_safety_check>
+
+Regex to make sure we don't accidentally run where we should not. Default: None.
+
+=item C<kid_deadlock_sleep>
+
+How long to sleep in seconds if we hit a deadlock error. Default: C<0.5>.
+Set to -1 to prevent the kid from retrying.
+
+=item C<kid_nodeltarows_sleep>
+
+How long do kids sleep if no delta rows are found? Default: C<0.5>.
+
+=item C<kid_pingtime>
+
+How often do we ping check the KID? Default: C<60>.
+
+=item C<kid_restart_sleep>
+
+How long to sleep in seconds when restarting a kid? Default: C<1>.
+
+=item C<kid_serial_sleep>
+
+How long to sleep in seconds if we hit a serialization error. Default: C<0.5>.
+Set to -1 to prevent the kid from retrying.
+
+=item C<kid_sleep>
+
+How long does a kid loop sleep? Default: C<0.5>.
+
+=item C<log_conflict_file>
+
+Name of the conflict detail log file. Default: C<bucardo_conflict.log>.
+
+=item C<log_level>
+
+How verbose to make the logging. Higher is more verbose. Default: C<normal>.
+
+=item C<log_microsecond>
+
+Show microsecond output in the timestamps? Default: C<0>.
+
+=item C<log_showlevel>
+
+Show log level in the log output? Default: C<0>.
+
+=item C<log_showline>
+
+Show line number in the log output? Default: C<0>.
+
+=item C<log_showpid>
+
+Show PID in the log output? Default: C<1>.
+
+=item C<log_showtime>
+
+Show timestamp in the log output?  0=off  1=seconds since epoch  2=scalar gmtime  3=scalar localtime. Default: C<3>.
+
+=item C<mcp_dbproblem_sleep>
+
+How many seconds to sleep before trying to respawn. Default: C<15>.
+
+=item C<mcp_loop_sleep>
+
+How long does the main MCP daemon sleep between loops? Default: C<0.2>.
+
+=item C<mcp_pingtime>
+
+How often do we ping check the MCP? Default: C<60>.
+
+=item C<mcp_vactime>
+
+How often in seconds do we check that a VAC is still running? Default: C<60>.
+
+=item C<piddir>
+
+Directory holding Bucardo PID files. Default: C</var/run/bucardo>.
+
+=item C<reason_file>
+
+File to hold reasons for stopping and starting. Default: C<bucardo.restart.reason.txt>.
+
+=item C<semaphore_table>
+
+Table to let apps know a sync is ongoing. Default: C<bucardo_status>.
+
+=item C<statement_chunk_size>
+
+How many primary keys to shove into a single statement. Default: C<10000>.
+
+=item C<stats_script_url>
+
+Location of the stats script. Default: C<http://www.bucardo.org/>.
+
+=item C<stopfile>
+
+Name of the semaphore file used to stop Bucardo processes. Default: C<fullstopbucardo>.
+
+=item C<syslog_facility>
+
+Which syslog facility level to use. Default: C<log_local1>.
+
+=item C<tcp_keepalives_count>
+
+How many probes to send. 0 indicates sticking with system defaults. Default: C<0>.
+
+=item C<tcp_keepalives_idle>
+
+How long to wait between each keepalive probe. Default: C<0>.
+
+=item C<tcp_keepalives_interval>
+
+How long to wait for a response to a keepalive probe. Default: C<0>.
+
+=item C<vac_run>
+
+How often does the VAC process run? Default: C<30>.
+
+=item C<vac_sleep>
+
+How long does VAC process sleep between runs? Default: C<120>.
+
+=item C<warning_file>
+
+File containing all log lines starting with "Warning". Default: C<bucardo.warning.log>.
+
+=back
+
+=head2 show
+
+  bucardo show all|<setting> [<setting>...]
+
+Shows the current Bucardo settings. Use the keyword "all" to see all the
+settings, or specify one or more search terms. See L</set> for complete
+details on the configuration settings.
+
+=head2 config
+
+  bucardo config show all|<setting> [<setting>...]
+  bucardo config set <setting=value> [<setting=value>...]
+
+Deprecated interface for showing and setting configuration settings. Use the
+L</show> and L</set> commands, instead.
+
+=head2 ping
+
+  bucardo ping
+  bucardo ping 60
+  bucardo ping 0
 
 Sends a ping notice to the MCP process to see if it will respond. By default, it will wait 15 seconds. A 
 numeric argument will change this timeout. Using a 0 as the timeout indicates waiting forever. If a response 
 was returned, the program will exit with a value of 0. If it times out, the value will be 1.
+Returns a Nagios like message starting with "OK" or "CRITICAL" for success or failure.
 
-=item B<status>
+=head2 status
 
-Usage: ./bucardo status [syncname(s)] [--sort=#] [--showdays] [--compress]
+  bucardo status [syncname(s)] [--sort=#] [--show-days] [--compress]
 
-Shows the brief status of all known syncs in a tabular format. If given one or more syncnames, 
+Shows the brief status of all known syncs in a tabular format. If given one or more sync names, 
 shows detailed information for each one. To see detailed information for all syncs, simply 
-use 'status all'.
+use "status all"
 
 When showing brief information, the columns are:
 
-=over 8
+=over
 
 =item 1. B<Name>
 
@@ -9431,145 +10633,175 @@ How long it has been since the last sync failure
 
 =back
 
+The options for C<status> are:
 
-=item B<activate> syncname [syncname2 syncname3 ...] [timeout]
+=over
+
+=item C<--show-days>
+
+Specifies whether or not do list the time interval with days, or simply show
+the hours. For example, "3d 12h 6m 3s" vs. "48h 6m 3s"
+
+=item C<--compress>
+
+Specifies whether or not to compress the time interval by removing spaces.
+Mostly used to limit the width of the 'status' display.
+
+=item C<--sort=#>
+
+Requests sorting of the 'status' output by one of the nine columns. Use a
+negative number to reverse the sort order.
+
+=back
+
+=head2 activate
+
+  bucardo activate syncname [syncname2 syncname3 ...] [timeout]
 
 Activates one or more named syncs. If given a timeout argument, it will wait until it has received 
 confirmation from Bucardo that each sync has been successfully activated.
 
-=item B<deactivate> syncname [syncname2 syncname3 ...] [timeout]
+=head2 deactivate
+
+  bucardo deactivate syncname [syncname2 syncname3 ...] [timeout]
 
 Deactivates one or more named syncs. If given a timeout argument, it will wait until it has received 
 confirmation from Bucardo that the sync has been successfully deactivated.
 
-=item B<message>
+=head2 message
 
-Adds a message to the running Bucardo logs. This message will appear prefixed with "MESSAGE: ". If 
-Bucardo is not running, the message will go to the logs the next time Bucardo is running and someone 
+  bucardo message 'I WAS HERE'
+
+Sends a message to the running Bucardo logs. This message will appear prefixed with "MESSAGE: ". If 
+Bucardo is not running, the message will go to the logs the next time Bucardo runs and someone 
 adds another message.
+
+=head2 reload
+
+  bucardo reload [syncname2 syncname3 ...]
+
+Sends a message to one or more sync processes, instructing them to reload.
+Waits for each to reload before going on to the next. Reloading consists of
+deactivating a sync, reloading its information from the database, and
+activating it again.
+
+=head2 inspect
+
+  bucardo inspect <type> <name> [<name2>...]
+
+Inspects one or more objects of a particular type. The results are sent to
+C<STDOUT>. The supported types include:
+
+=over
+
+=item C<table>
+
+=item C<sync>
+
+=item C<relgroup>
 
 =back
 
-=head1 OPTIONS
+=head2 validate
+
+  bucardo validate all|<sync> [<sync>...]
+
+Validates one or more syncs. Use the keyword "all" to validate all syncs, or
+specify one or more syncs to validate.
+
+=head2 purge
+
+  bucardo purge all|<table> [<table>...]
+
+Purges the delta and track tables for one or more tables, for one or more
+databases. Use the keyword "all" to validate all tables, or specify one or
+more tables to validate.
+
+=head2 help
+
+  bucardo help
+  bucardo help <command>
+  bucardo help <command> <action>
+
+Get help. General help can be returned, as well as help for a single command
+or a command and its action. Some examples:
+
+  bucard help list
+  bucard help add table
+
+=head1 OPTIONS DETAILS
 
 It is usually easier to set most of these options at the top of the script, or make an alias for them, 
 as they will not change very often if at all.
 
-=over 4
+=over
 
-=item B<--dbport=number>
+=item C<-d>
 
-=item B<--dbhost=string>
+=item C<--db-name>
 
-=item B<--dbname=string>
+  bucardo --db-name widgets
+  bucardo -d bricolage
 
-=item B<--dbuser=string>
+Name of the Bucardo database to which to connect.
 
-=item B<--dbpass=string>
+=item C<-U>
 
-The port, host, and name of the Bucardo database, the user to connect as, and the password to use.
+=item C<--db-user>
 
-=item B<--verbose>
+  bucardo --db-user postgres
+  bucardo -U Mom
+
+User name to use when connecting to the Bucardo database.
+
+=item C<-P>
+
+=item C<--db-pass>
+
+  bucardo --db-pass s3cr1t
+  bucardo -P lolz
+
+Password to use when connecting to the Bucardo database.
+
+=item C<-h>
+
+=item C<--db-host>
+
+  bucardo --db-host db.example.com
+  bucardo -h db2.example.net
+
+Host name to use when connecting to the Bucardo database.
+
+=item C<-p>
+
+=item C<--db-port>
+
+  bucardo --db-port 7654
+
+Port number to connect to when connecting to the Bucardo database.
+
+=item C<--bucardorc>
+
+  bucardo --bucardorc myrcfile
+
+Use the specified file for configuration instead of the default
+F<./.bucardorc>.
+
+=item C<--no-bucardorc>
+
+Do not use the F<./.bucardorc> configuration file.
+
+=item C<--verbose>
 
 Makes bucardo run verbosely. Default is off.
 
-=item B<--quiet>
+=item C<--quiet>
 
 Tells bucardo to be as quiet as possible. Default is off.
 
-=item B<--help>
+=item C<--help>
 
 Shows a brief summary of usage for bucardo.
-
-=back
-
-=head2 Kick arguments
-
-The following arguments are only used with the 'kick' command:
-
-=over 4
-
-=item B<--retry=#>
-
-The number of times to retry a sync if it fails. Defaults to 0.
-
-=item B<--retrysleep>
-
-How long to sleep, in seconds, between each retry attempt.
-
-=item B<--notimer>
-
-By default, kicks with a timeout argument give a running real-time summary of time elapsed by 
-using the backspace character. This may not be wanted if running a kick, for example, 
-via a cronjob, so turning --notimer on will simply print the entire message without backspaces.
-
-=back
-
-=head2 Status arguments
-
-The following arguments are only used with the 'status' command:
-
-=over 4
-
-=item B<--showdays>
-
-Specifies whether or not do list the time interval with days, or simply show the hours. For example, 
-"3d 12h 6m 3s" vs. "48h 6m 3s"
-
-=item B<--compress>
-
-Specifies whether or not to compress the time interval by removing spaces. Mostly used to limit 
-the width of the 'status' display.
-
-=item B<--sort=#>
-
-Requests sorting of the 'status' output by one of the nine columns. Use a negative number to reverse 
-the sort order.
-
-=back
-
-=head2 Startup arguments
-
-The following arguments are only applicable when using the "start" command:
-
-=over 4
-
-=item B<--sendmail>
-
-Tells Bucardo whether or not to send mail on interesting events: startup, shutdown, and errors. Default is on.
-Only applicable when using ./bucardo start.
-
-=item B<--extraname=string>
-
-A short string that will be appended to the version string as output by the Bucardo process names. Mostly 
-useful for debugging.
-
-=item B<--debugfilesep>
-
-Forces creation of separate log files for each Bucardo process of the form "log.bucardo.X.Y", 
-where X is the type of process (MCP, CTL, or KID), and Y is the process ID.
-
-=item B<--debugsyslog>
-
-Sends all log messages to the syslog daemon. On by default. The facility used is controlled by 
-the row "syslog_facility" in the bucardo_config table, and defaults to "LOG_LOCAL1".
-
-=item B<--debugfile>
-
-If set, writes detailed debugging information to one or more files.
-
-=item B<--debugdir=directory name>
-
-Directory where the debug files should go.
-
-=item B<--debugname=string>
-
-Appends the given string to the end of the default debug file name, "log.bucardo". A dot is added 
-before the name as well, so a debugname of "rootdb" would produce a log file named "log.bucardo.rootdb".
-
-=item B<--cleandebugs>
-
-Forces removal of all old debug files before running.
 
 =back
 
@@ -9589,7 +10821,10 @@ The bucardo script uses I<$ENV{HOME}> to look for a F<.bucardorc> file.
 
 =head1 BUGS
 
-Bug reports and feature requests are always welcome, please visit http://bucardo.org or email bucardo-general@bucardo.org.
+Bug reports and feature requests are always welcome, please visit
+L<bucardo.org|http://bucardo.org>, file L<GitHub
+Issues|http://github.com/bucardo/bucardo/issues>, or post to our
+L<email list|https://mail.endcrypt.com/mailman/listinfo/bucardo-general>.
 
 =head1 SEE ALSO
 
@@ -9602,4 +10837,3 @@ Copyright 2006-2012 Greg Sabino Mullane <greg@endpoint.com>
 This program is free to use, subject to the limitations in the LICENSE file.
 
 =cut
-

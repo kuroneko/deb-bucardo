@@ -1,7 +1,7 @@
 diff -Nur bucardo/bucardo.schema bucardo.new/bucardo.schema
---- bucardo/bucardo.schema	2011-03-17 11:27:22.000000000 +1100
-+++ bucardo.new/bucardo.schema	2011-03-27 16:19:27.345146453 +1100
-@@ -135,9 +135,9 @@
+--- bucardo/bucardo.schema	2013-01-08 13:17:52.000000000 +0100
++++ bucardo.new/bucardo.schema	2013-01-08 13:29:17.968256714 +0100
+@@ -136,9 +136,9 @@
  log_showlevel|0|Show log level in the log output?
  log_showline|0|Show line number in the log output?
  log_showtime|3|Show timestamp in the log output?  0=off  1=seconds since epoch  2=scalar gmtime  3=scalar localtime
@@ -13,7 +13,7 @@ diff -Nur bucardo/bucardo.schema bucardo.new/bucardo.schema
  \.
  
  -- Versioning
-@@ -153,15 +153,15 @@
+@@ -154,15 +154,15 @@
  FROM STDIN
  WITH DELIMITER '|';
  bucardo_vac|1|Do we want the automatic VAC daemon to run?
@@ -22,12 +22,12 @@ diff -Nur bucardo/bucardo.schema bucardo.new/bucardo.schema
 +default_email_from|root|Who the alert emails are sent as
 +default_email_to|root|Who to send alert emails to
  default_email_host|localhost|Which host to send email through
- default_standard_conflict|bucardo_latest|Default conflict method for all syncs
+ default_conflict_strategy|bucardo_latest|Default conflict strategy for all syncs
  email_debug_file||File to save a copy of all outgoing emails to
  flatfile_dir|.|Directory to store the flatfile output inside of
  host_safety_check||Regex to make sure we don't accidentally run where we should not
  piddir|/var/run/bucardo|Directory holding Bucardo PID files
--reason_file|bucardo.restart.reason.log|File to hold reasons for stopping and starting
+-reason_file|bucardo.restart.reason.txt|File to hold reasons for stopping and starting
 +reason_file|/var/log/bucardo/restart.reason|File to hold reasons for stopping and starting
  semaphore_table|bucardo_status|Table to let apps know a sync is ongoing
  statement_chunk_size|10000|How many primary keys to shove into a single statement

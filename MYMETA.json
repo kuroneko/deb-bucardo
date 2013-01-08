@@ -27,8 +27,10 @@
             "ExtUtils::MakeMaker" : "6.32",
             "File::Spec" : 0,
             "IO::Handle" : "1.24",
+            "List::Util" : 0,
             "MIME::Base64" : 0,
             "Net::SMTP" : 0,
+            "Pod::Usage" : 0,
             "Sys::Hostname" : "1.11",
             "Sys::Syslog" : "0.13",
             "Test::Harness" : "2.03",
@@ -40,11 +42,11 @@
    "provides" : {
       "Bucardo" : {
          "file" : "Bucardo.pm",
-         "version" : "v4.99.5"
+         "version" : "v4.99.6"
       },
       "bucardo" : {
          "file" : "bucardo",
-         "version" : "v4.99.5"
+         "version" : "v4.99.6"
       }
    },
    "release_status" : "stable",
@@ -61,5 +63,5 @@
       },
       "x_MailingList" : "http://bucardo.org/list.html"
    },
-   "version" : "4.99.5"
+   "version" : "4.99.6"
 }
