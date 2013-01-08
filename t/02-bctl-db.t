@@ -34,11 +34,11 @@ my ($dbuserB,$dbportB,$dbhostB) = $bct->add_db_args('B');
 
 $t = 'Add database with no argument gives expected help message';
 $res = $bct->ctl('bucardo add db');
-like ($res, qr/Usage: add db/, $t);
+like ($res, qr/bucardo add db/, $t);
 
 $t = q{Add database accepts both 'add database' and 'add db'};
 $res = $bct->ctl('bucardo add database');
-like ($res, qr/Usage: add db/, $t);
+like ($res, qr/bucardo add db/, $t);
 
 $t = q{Add database fails if not given a dbname};
 $res = $bct->ctl('bucardo add database foobar');
@@ -72,9 +72,9 @@ $t = q{Add database fails if using the same internal name};
 $res = $bct->ctl("bucardo add db A dbname=postgres user=$dbuserA port=$dbportA host=$dbhostA");
 like ($res, qr/Cannot add database: the name "A" already exists/, $t);
 
-$t = q{Add database fails if same paramters given};
+$t = q{Add database works if same parameters given but different DB};
 $res = $bct->ctl("bucardo add db A2 dbname=bucardo_test user=$dbuserA port=$dbportA host=$dbhostA");
-like ($res, qr/same parameters/, $t);
+like ($res, qr/Added database "A2"/, $t);
 
 $t = 'Add database works for cluster B works with ssp=false';
 $res = $bct->ctl("bucardo add db B dbname=bucardo_test user=$dbuserB port=$dbportB host=$dbhostB ssp=0");
@@ -83,9 +83,10 @@ like ($res, qr/Added database "B"/, $t);
 $t = 'List databases gives expected results';
 $res = $bct->ctl('bucardo list databases');
 my $statA = qq{Database: A\\s+Status: active\\s+Conn: psql -p $dbportA -U $dbuserA -d bucardo_test -h $dbhostA};
+my $statA2 = qq{Database: A2\\s+Status: active\\s+Conn: psql -p $dbportA -U $dbuserA -d bucardo_test -h $dbhostA};
 my $statB = qq{Database: B\\s+Status: active\\s+Conn: psql -p $dbportB -U $dbuserB -d bucardo_test -h $dbhostB \\(SSP is off\\)};
 my $statz = qq{Database: foo\\s+Status: active\\s+Conn: psql .*-d bar};
-my $regex = qr{$statA\n$statB\n$statz$}s;
+my $regex = qr{$statA\n$statA2\n$statB\n$statz$}s;
 like ($res, $regex, $t);
 
 ## Clear them out for some more testing
@@ -125,8 +126,8 @@ like ($res, qr/Removed database "B"/, $t);
 
 $t = q{Able to remove more than one database at a time};
 $bct->ctl("bucardo add db B dbname=bucardo_test user=$dbuserB port=$dbportB host=$dbhostB");
-$res = $bct->ctl('bucardo remove db A B foo');
-like ($res, qr/Removed database "A"\nRemoved database "B"/ms, $t);
+$res = $bct->ctl('bucardo remove db A A2 B foo');
+like ($res, qr/Removed database "A"\nRemoved database "A2"\nRemoved database "B"/ms, $t);
 
 ## Tests for 'list databases'
 
@@ -178,11 +179,11 @@ is ($res, '', $t);
 
 $t = q{Update database gives proper error with no db};
 $res = $bct->ctl('bucardo update db');
-like ($res, qr/Usage:/, $t);
+like ($res, qr/bucardo update/, $t);
 
 $t = q{Update database gives proper error with no items};
 $res = $bct->ctl('bucardo update db foobar');
-like ($res, qr/Usage:/, $t);
+like ($res, qr/bucardo update/, $t);
 
 $t = q{Update database gives proper error with invalid database};
 $res = $bct->ctl('bucardo update db foobar a=b');
@@ -190,10 +191,10 @@ like ($res, qr/Could not find a database named "foobar"/, $t);
 
 $t = q{Update database gives proper error with invalid format};
 $res = $bct->ctl('bucardo update db A blah blah');
-like ($res, qr/Usage: update database/, $t);
+like ($res, qr/update db:/, $t);
 
 $res = $bct->ctl('bucardo update db A blah123#=123');
-like ($res, qr/Usage: update database/, $t);
+like ($res, qr/update db:/, $t);
 
 $t = q{Update database gives proper error with invalid items};
 $res = $bct->ctl('bucardo update db A foobar=123');

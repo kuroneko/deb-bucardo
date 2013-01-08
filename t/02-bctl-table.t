@@ -34,7 +34,7 @@ my ($dbuserB,$dbportB,$dbhostB) = $bct->add_db_args('B');
 
 $t = 'Add table with no argument gives expected help message';
 $res = $bct->ctl('bucardo add table');
-like ($res, qr/Usage: add table/, $t);
+like ($res, qr/add table/, $t);
 
 $t = q{Add table fails when no databases have been created yet};
 $res = $bct->ctl('bucardo add table foobarz');
@@ -153,8 +153,8 @@ $t = q{Add table works with multiple entries};
 $res = $bct->ctl('bucardo add table pub%.bucard%9 public.bucardo_test1 nada bucardo3 buca%2');
 is ($res, qq{$nomatch_msg:\n  bucardo3\n  nada\n$addtable_msg:\n  public.bucardo_test1\n  public.bucardo_test2\n  public.bucardo_test9\n}, $t);
 
-$t = q{Add table works when specifying the ping option};
-$res = $bct->ctl('bucardo add table bucardo_test5 ping=true');
+$t = q{Add table works when specifying the autokick option};
+$res = $bct->ctl('bucardo add table bucardo_test5 autokick=true');
 is ($res, qq{$addtable_msg:\n  public.bucardo_test5\n}, $t);
 
 $t = q{'bucardo list tables' returns expected result};
@@ -162,13 +162,13 @@ $res = $bct->ctl('bucardo list tables');
 $expected =
 qr{\d+\.\s* Table: public.bucardo_test1  DB: A  PK: id \(int2\)\s*
 \d+\.\s* Table: public.bucardo_test2  DB: A  PK: id\|data1 \(int4\|text\)\s*
-\d+\.\s* Table: public.bucardo_test5  DB: A  PK: id space \(date\)       ping:true\s*
+\d+\.\s* Table: public.bucardo_test5  DB: A  PK: id space \(date\)       autokick:true\s*
 \d+\.\s* Table: public.bucardo_test9  DB: A  PK: id \(int_unsigned\)\s*
 };
 like ($res, $expected, $t);
 
-$t = q{Add table works when specifying the rebuild_index and ping options};
-$res = $bct->ctl('bucardo add table bucardo_test4 ping=false rebuild_index=1');
+$t = q{Add table works when specifying the rebuild_index and autokick options};
+$res = $bct->ctl('bucardo add table bucardo_test4 autokick=false rebuild_index=1');
 is ($res, qq{$addtable_msg:\n  public.bucardo_test4\n  tschema.bucardo_test4\n}, $t);
 
 $t = q{'bucardo list tables' returns expected result};
@@ -176,45 +176,45 @@ $res = $bct->ctl('bucardo list tables');
 $expected =
 qr{\d+\.\s* Table: public.bucardo_test1   DB: A  PK: id \(int2\)\s*
 \d+\.\s* Table: public.bucardo_test2   DB: A  PK: id|data1 \(int4\|text\)\s*
-\d+\.\s* Table: public.bucardo_test4   DB: A  PK: id \(text\)\s* ping:false\s*rebuild_index:true\s*
-\d+\.\s* Table: public.bucardo_test5   DB: A  PK: id space \(date\)\s* ping:true\s*
+\d+\.\s* Table: public.bucardo_test4   DB: A  PK: id \(text\)\s* autokick:false\s*rebuild_index:true\s*
+\d+\.\s* Table: public.bucardo_test5   DB: A  PK: id space \(date\)\s* autokick:true\s*
 \d+\.\s* Table: public.bucardo_test9   DB: A  PK: id \(int_unsigned\)\s*
-\d+\.\s* Table: tschema.bucardo_test4  DB: A  PK: none\s*ping:false  rebuild_index:true\s*
+\d+\.\s* Table: tschema.bucardo_test4  DB: A  PK: none\s*autokick:false  rebuild_index:true\s*
 };
 like ($res, $expected, $t);
 
 empty_goat_table();
 
-$t = q{Add table works when adding to a new herd};
-$res = $bct->ctl('bucardo add table bucardo_test1 herd=foobar');
+$t = q{Add table works when adding to a new relgroup};
+$res = $bct->ctl('bucardo add table bucardo_test1 relgroup=foobar');
 $expected =
 qq{$addtable_msg:
   public.bucardo_test1
-Created the herd named "foobar"
+Created the relgroup named "foobar"
 $newherd_msg "foobar":
   public.bucardo_test1
 };
 is ($res, $expected, $t);
 
-$t = q{Add table works when adding to an existing herd};
-$res = $bct->ctl('bucardo add table bucardo_test5 herd=foobar');
+$t = q{Add table works when adding to an existing relgroup};
+$res = $bct->ctl('bucardo add table bucardo_test5 relgroup=foobar');
 is ($res, qq{$addtable_msg:\n  public.bucardo_test5\n$oldherd_msg "foobar":\n  public.bucardo_test5\n}, $t);
 
-$t = q{Add table works when adding multiple tables to a new herd};
-$res = $bct->ctl('bucardo add table "public.Buc*3" %.bucardo_test2 herd=foobar2');
+$t = q{Add table works when adding multiple tables to a new relgroup};
+$res = $bct->ctl('bucardo add table "public.Buc*3" %.bucardo_test2 relgroup=foobar2');
 $expected =
 qq{$addtable_msg:
   public.Bucardo_test3
   public.bucardo_test2
-Created the herd named "foobar2"
+Created the relgroup named "foobar2"
 $newherd_msg "foobar2":
   public.Bucardo_test3
   public.bucardo_test2
 };
 is ($res, $expected, $t);
 
-$t = q{Add table works when adding multiple tables to an existing herd};
-$res = $bct->ctl('bucardo add table bucardo_test6 %.%do_test4 herd=foobar2');
+$t = q{Add table works when adding multiple tables to an existing relgroup};
+$res = $bct->ctl('bucardo add table bucardo_test6 %.%do_test4 relgroup=foobar2');
 $expected =
 qq{$addtable_msg:
   public.bucardo_test4
