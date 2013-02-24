@@ -5,7 +5,7 @@
 ##
 ## This script should only be called via the 'bucardo' program
 ##
-## Copyright 2006-2012 Greg Sabino Mullane <greg@endpoint.com>
+## Copyright 2006-2013 Greg Sabino Mullane <greg@endpoint.com>
 ##
 ## Please visit http://bucardo.org for more information
 
@@ -15,7 +15,7 @@ use strict;
 use warnings;
 use utf8;
 
-our $VERSION = '4.99.6';
+our $VERSION = '4.99.7';
 
 use DBI 1.51;                               ## How Perl talks to databases
 use DBD::Pg 2.0   qw( :async             ); ## How Perl talks to Postgres databases
@@ -163,8 +163,36 @@ our %msg = (
     'time-years'         => q{années},
 },
 'de' => {
+    'time-day'           => q{Tag},
+    'time-days'          => q{Tag},
+    'time-hour'          => q{Stunde},
+    'time-hours'         => q{Stunden},
+    'time-minute'        => q{Minute},
+    'time-minutes'       => q{Minuten},
+    'time-month'         => q{Monat},
+    'time-months'        => q{Monate},
+    'time-second'        => q{Sekunde},
+    'time-seconds'       => q{Sekunden},
+    'time-week'          => q{Woche},
+    'time-weeks'         => q{Woche},
+    'time-year'          => q{Jahr},
+    'time-years'         => q{Jahr},
 },
 'es' => {
+    'time-day'           => q{día},
+    'time-days'          => q{días},
+    'time-hour'          => q{hora},
+    'time-hours'         => q{horas},
+    'time-minute'        => q{minuto},
+    'time-minutes'       => q{minutos},
+    'time-month'         => q{mes},
+    'time-months'        => q{meses},
+    'time-second'        => q{segundo},
+    'time-seconds'       => q{segundos},
+    'time-week'          => q{semana},
+    'time-weeks'         => q{semanas},
+    'time-year'          => q{año},
+    'time-years'         => q{años},
 },
 );
 ## use critic
@@ -627,6 +655,9 @@ sub start_mcp {
         $self->reload_mcp();
     };
 
+    ## We need KIDs to tell us their PID so we can deregister them
+    $self->{kidpidlist} = {};
+
     ## Let any listeners know we have gotten this far
     $self->db_notify($masterdbh, 'started', 1);
 
@@ -815,11 +846,24 @@ sub mcp_main {
 
             next if $x->{dbtype} ne 'postgres';
 
+            ## Start listening for KIDs if we have not done so already
+            if (! exists $self->{kidpidlist}{$dbname}) {
+                $self->{kidpidlist}{$dbname} = 1;
+                $self->db_listen($x->{dbh}, 'kid_pid_start', $dbname, 1);
+                $self->db_listen($x->{dbh}, 'kid_pid_stop', $dbname, 1);
+                $x->{dbh}->commit();
+            }
+
             my $nlist = $self->db_get_notices($x->{dbh});
             $x->{dbh}->rollback();
             for my $name (keys %{ $nlist } ) {
                 if (! exists $notice->{$name}) {
                     $notice->{$name} = $nlist->{$name};
+                }
+                else {
+                    for my $pid (keys %{ $nlist->{$name}{pid} }) {
+                        $notice->{$name}{pid}{$pid}++;
+                    }
                 }
             }
         }
@@ -849,6 +893,11 @@ sub mcp_main {
                 }
                 elsif (! $self->{sync}{$syncname}{mcp_active}) {
                     $msg = qq{Cannot kick inactive sync "$syncname"};
+                }
+                ## We also won't kick if this was created by a kid
+                ## This can happen as our triggerkicks may be set to 'always'
+                elsif (exists $self->{kidpidlist}{$npid}) {
+                    $self->glog(qq{Not kicking sync "$syncname" as it came from KID $npid}, LOG_DEBUG);
                 }
                 else {
                     ## Kick it!
@@ -914,7 +963,7 @@ sub mcp_main {
             elsif ('log_message' eq $name) {
                 $self->glog('Checking for log messages', LOG_DEBUG);
                 $SQL = 'SELECT msg,cdate FROM bucardo_log_message ORDER BY cdate';
-                $sth = $maindbh->prepare_cached($SQL);
+                my $sth = $maindbh->prepare_cached($SQL);
                 $count = $sth->execute();
                 if ($count ne '0E0') {
                     for my $row (@{$sth->fetchall_arrayref()}) {
@@ -922,6 +971,9 @@ sub mcp_main {
                     }
                     $maindbh->do('TRUNCATE TABLE bucardo_log_message');
                     $maindbh->commit();
+                }
+                else {
+                    $sth->finish();
                 }
             }
 
@@ -945,7 +997,7 @@ sub mcp_main {
                         . q{COALESCE(EXTRACT(epoch FROM checktime),0) AS checksecs, }
                             . q{COALESCE(EXTRACT(epoch FROM lifetime),0) AS lifetimesecs }
                                 . q{FROM bucardo.sync WHERE name = ?};
-                    $sth = $maindbh->prepare($SQL);
+                    my $sth = $maindbh->prepare($SQL);
                     $count = $sth->execute($syncname);
                     if ($count eq '0E0') {
                         $sth->finish();
@@ -1027,6 +1079,20 @@ sub mcp_main {
 
                 ## Echo out to anyone listening
                 $self->db_notify($maindbh, $name, 1);
+            }
+
+            ## A kid reporting in. We just store the PID
+            elsif ('kid_pid_start') {
+                for my $lpid (keys %{ $notice->{$name}{pid} }) {
+                    $self->{kidpidlist}{$lpid} = 1;
+                }
+            }
+
+            ## A kid leaving. We remove the stored PID.
+            elsif ('kid_pid_stop') {
+                for my $lpid (keys %{ $notice->{$name}{pid} }) {
+                    delete $self->{kidpidlist}{$lpid};
+                }
             }
 
             ## Should not happen, but let's at least log it
@@ -1324,7 +1390,7 @@ sub start_controller {
 
     }; ## end SIG{__DIE_} handler sub
 
-    ## Connect to the master database (overwriting the pre-fork MCP connection)
+    ## Connect to the master database
     ($self->{master_backend}, $self->{masterdbh}) = $self->connect_database();
     my $maindbh = $self->{masterdbh};
     $self->glog("Bucardo database backend PID: $self->{master_backend}", LOG_VERBOSE);
@@ -1461,7 +1527,7 @@ sub start_controller {
         ## Do not need non-Postgres handles for the controller
         next if $x->{dbtype} ne 'postgres';
 
-        ## Overwrites the MCP database handles
+        ## Establish a new database handle
         ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
         $self->glog(qq{Database "$dbname" backend PID: $x->{backend}}, LOG_NORMAL);
         $self->{pidmap}{$x->{backend}} = "DB $dbname";
@@ -1799,11 +1865,11 @@ sub start_controller {
         ## XXX This is called too soon - recently created kids are not there yet!
 
         ## Check that our kids are alive and healthy
-        ## XXX Skip if we know the kids are busy? (cannot ping/pong!)
+          ## XXX Skip if we know the kids are busy? (cannot ping/pong!)
         ## XXX Maybe skip this entirely and just check on a kick?
         if ($sync->{stayalive}      ## CTL must be persistent
             and $kidsalive          ## KID must be persistent
-            and $self->{kidpid} ## KID must have been created at least once
+            and $self->{kidpid}     ## KID must have been created at least once
             and time() - $kidchecktime >= $config{ctl_checkonkids_time}) {
 
             my $pidfile = "$config{piddir}/bucardo.kid.sync.$syncname.pid";
@@ -1975,6 +2041,9 @@ sub start_kid {
         ## Can it be queried?
         $x->{does_append_only} = 0;
 
+        ## List of tables in this database that do makedelta
+        $x->{is_makedelta} = {};
+
         ## Start clumping into groups and adjust the attributes
 
         ## Postgres
@@ -2088,7 +2157,6 @@ sub start_kid {
     }
 
     ## Connect to the main database
-    ## Overwrites the previous handle from the controller
     ($self->{master_backend}, $self->{masterdbh}) = $self->connect_database();
 
     ## Set a shortcut for this handle, and log the details
@@ -2173,6 +2241,10 @@ sub start_kid {
             };
 
             $dbh->rollback();
+
+            ## Deregister ourself with the MCP
+            $self->db_notify($dbh, 'kid_pid_stop', 1);
+
             $self->glog("Disconnecting from database $dbname", LOG_DEBUG);
             $_->finish for values %{ $dbh->{CachedKids} };
             $dbh->disconnect();
@@ -2336,9 +2408,13 @@ sub start_kid {
 
             $x = $sync->{db}{$dbname};
 
-            ## This overwrites the items we inherited from the controller
             ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
             $self->glog(qq{Database "$dbname" backend PID: $x->{backend}}, LOG_VERBOSE);
+
+            ## Register ourself with the MCP (if we are Postgres)
+            if ($x->{dbtype} eq 'postgres') {
+                $self->db_notify($x->{dbh}, 'kid_pid_start', 1);
+            }
         }
 
         ## Set the maximum length of the $dbname.$S.$T string.
@@ -2418,6 +2494,8 @@ sub start_kid {
 
                     next if $g->{reltype} ne 'table';
 
+                    ($S,$T) = ($g->{safeschema},$g->{safetable});
+
                     ## Replace with the target name for source delta querying
                     ($SQL = $SQL{delta}{$g}) =~ s/TARGETNAME/'$x->{TARGETNAME}'/o;
 
@@ -2435,6 +2513,14 @@ sub start_kid {
                     ## Same thing for stage
                     ($SQL = $SQL{stage}{$g}) =~ s/TARGETNAME/'$x->{TARGETNAME}'/go;
                     $sth{stage}{$dbname}{$g} = $x->{dbh}->prepare($SQL, {pg_async => PG_ASYNC});
+
+                    ## Set the per database/per table makedelta setting now
+                    if (defined $g->{makedelta}) {
+                        if ($g->{makedelta} eq 'on' or $g->{makedelta} =~ /\b$dbname\b/) {
+                            $x->{is_makedelta}{$S}{$T} = 1;
+                            $self->glog("Set table $dbname.$S.$T to makedelta", LOG_NORMAL);
+                        }
+                    }
 
                 } ## end each table
 
@@ -3057,6 +3143,11 @@ sub start_kid {
                     $deltacount{table}{$S}{$T} += $count;
                     $deltacount{dbtable}{$dbname}{$S}{$T} = $count; ## NOT a +=
 
+                    ## Special versions for FK checks below
+                    if ($count) {
+                        $deltacount{tableoid}{$g->{oid}}{$dbname} = $count;
+                    }
+
                     ## For our pretty output below
                     $maxcount = $count if $count > $maxcount;
 
@@ -3093,7 +3184,11 @@ sub start_kid {
             ## Report on the total number of deltas found
             $self->glog("Total delta count: $deltacount{all}", LOG_VERBOSE);
 
+            ## Reset our list of possible FK issues
+            $sync->{fkcheck} = {};
+
             ## If more than one total source db, break it down at that level
+            ## We also check for foreign key dependencies here
             if (keys %{ $deltacount{db} } > 1) {
 
                 ## Figure out the width for the per-db breakdown below
@@ -3115,7 +3210,61 @@ sub start_kid {
                                  length $maxdbcount,
                                 $deltacount{db}{$dbname}), LOG_VERBOSE);
                 }
-            }
+
+                ## Since we have changes appearing on more than one database,
+                ## we need to see if any of the database-spanning tables involved
+                ## are linked via foreign keys. If they are, we may have to
+                ## change our replication strategy so that the foreign keys are
+                ## still intact at the end of our operation.
+                ## If we find tables that need to be checked, we add them to $self->{fkcheck}
+
+                ## Walk through each table with changes
+                for my $toid (sort keys %{ $deltacount{tableoid} }) {
+
+                    my $t1 = $deltacount{tableoid}{$toid};
+                    my $tname1 = $sync->{tableoid}{$toid}{name};
+
+                    ## Find all tables that this table references
+                    my $info = $sync->{tableoid}{$toid};
+                    ## Note that we really only need to check one of references or referencedby
+                  REFFER: for my $reftable (sort keys %{ $info->{references} } ) {
+
+                        ## Skip if it has no changes
+                        next if ! exists $deltacount{tableoid}{$reftable};
+
+                        ## At this point, we know that both linked tables have at
+                        ## least one source change. We also know that at least two
+                        ## source databases are involved in this sync.
+
+                        my $t2 = $deltacount{tableoid}{$reftable};
+                        my $tname2 = $sync->{tableoid}{$reftable}{name};
+
+                        ## The danger is if the changes come from different databases
+                        ## If this happens, the foreign key relationship may be violated
+                        ## when we push the changes both ways.
+
+                        ## Check if any of the dbs are mismatched. If so, instant FK marking
+                        for my $db1 (sort keys %$t1) {
+                            if (! exists $t2->{$db1}) {
+                                $self->glog("Table $tname1 and $tname2 may have FK issues", LOG_DEBUG);
+                                $sync->{fkcheck}{$tname1}{$tname2} = 1;
+                                next REFFER;
+                            }
+                        }
+
+                        ## So both tables have changes on the same source databases.
+                        ## Now the only danger is if either has more than one source
+                        if (keys %$t1 > 1 or keys %$t2 > 1) {
+                            $self->glog("Table $tname1 and $tname2 may have FK issues", LOG_DEBUG);
+                            $sync->{fkcheck}{$tname1}{$tname2} = 1;
+                            $sync->{fkcheck}{$tname2}{$tname1} = 2;
+                        }
+
+                    } ## end each reffed table
+
+                } ## end each changed table
+
+            } ## end if more than one source database has changes
 
             ## If there were no changes on any sources, rollback all databases,
             ## update the syncrun and dbrun tables, notify listeners,
@@ -3352,7 +3501,7 @@ sub start_kid {
                         ## In theory, this is a little crappy.
                         ## In practice, it works out quite well. :)
 
-                        $self->glog("Starting 'bucardo_latest' conflict strategy", LOG_VERBOSE);
+                        $self->glog(q{Starting 'bucardo_latest' conflict strategy}, LOG_VERBOSE);
 
                         if (! exists $self->{conflictwinner}) {
 
@@ -3417,7 +3566,7 @@ sub start_kid {
                         ## no updates at all for this run. Note: this does not
                         ## mean no conflicts, it means no insert/update/delete
 
-                        $self->glog("Starting default conflict strategy", LOG_VERBOSE);
+                        $self->glog(q{Starting default conflict strategy}, LOG_VERBOSE);
 
                         if (! exists $self->{conflictwinner}) {
 
@@ -3751,7 +3900,7 @@ sub start_kid {
                                 }
                             }
 
-                            ## Wait for all REINDEXes to finish, then release the savepoint
+                            ## Wait for all REINDEXes to finish
                             for my $dbname (sort keys %{ $sync->{db} }) {
                                 $x = $sync->{db}{$dbname};
 
@@ -3761,9 +3910,13 @@ sub start_kid {
                                     $x->{dbh}->pg_result();
                                     $x->{index_disabled} = 0;
                                 }
-                                if ($g->{has_exception_code}) {
-                                    $x->{dbh}->do("RELEASE SAVEPOINT bucardo_$$");
-                                }
+                            }
+
+                            ## If this table has a possible FK problem,
+                            ## we need to check things out
+                            ## Cannot do anything until both pairs have reported in!
+
+                            if (exists $sync->{fkcheck}{"$S.$T"}) {
                             }
 
                             ## We set this as we cannot rely on $@ alone
@@ -3863,7 +4016,6 @@ sub start_kid {
 
                         ## Make sure the Postgres database connections are still clean
                         for my $dbname (@dbs_postgres) {
-
                             $x = $sync->{db}{$dbname};
 
                             my $ping = $sync->{db}{$dbname}{dbh}->ping();
@@ -3886,7 +4038,6 @@ sub start_kid {
 
             ## Update bucardo_track table so that the bucardo_delta rows we just processed
             ##  are marked as "done" and ignored by subsequent runs
-            ## We also rely on this section to do makedelta related bucardo_track inserts
 
             ## Reset our pretty-printer count
             $maxcount = 0;
@@ -3919,10 +4070,37 @@ sub start_kid {
                 }
 
                 ## For each database that had delta changes, insert rows to bucardo_track
+                ## We also need to consider makedelta:
+                ## For all tables that are marked as makedelta, we need to ensure
+                ## that we call the SQL below for each dbs_source in which
+                ## the deltacount for *any* other source dbname is non-zero
                 for my $dbname (@dbs_source) {
+                    $x = $sync->{db}{$dbname};
+
+                    $x->{needs_track} = 0;
 
                     if ($deltacount{dbtable}{$dbname}{$S}{$T}) {
-                        ## XXX account for makedelta!
+                        $x->{needs_track} = 1;
+                    }
+                    elsif (exists $x->{is_makedelta}{$S}{$T}) { ## XXX set this earlier!
+                        ## We know that this particular table in this database is makedelta
+                        ## See if any of the other sources had deltas
+                        ## If they did, then rows were inserted here, so we need a track update
+                        my $found = 0;
+                        for my $dbname2 (@dbs_source) {
+                            if ($deltacount{dbtable}{$dbname}{$S}{$T}) {
+                                $found = 1;
+                                last;
+                            }
+                        }
+                    }
+                }
+
+                ## Kick off the track or stage update asynchronously
+                for my $dbname (@dbs_source) {
+                    $x = $sync->{db}{$dbname};
+
+                    if ($x->{needs_track}) {
                         ## This is async:
                         if ($x->{trackstage}) {
                             $sth{stage}{$dbname}{$g}->execute();
@@ -3938,7 +4116,7 @@ sub start_kid {
 
                     $x = $sync->{db}{$dbname};
 
-                    if ($deltacount{dbtable}{$dbname}{$S}{$T}) {
+                    if ($x->{needs_track}) {
                         ($count = $x->{dbh}->pg_result()) =~ s/0E0/0/o;
                         $self->{insertcount}{dbname}{$S}{$T} = $count;
                         $maxcount = $count if $count > $maxcount;
@@ -4001,7 +4179,7 @@ sub start_kid {
                     $SQL = "SELECT * FROM $S.$T";
                     $sth = $sourcedbh->prepare($SQL);
                     $sth->execute();
-                    $g->{sequenceinfo}{$sourcename} =$sth->fetchall_arrayref({})->[0];
+                    $g->{sequenceinfo}{$sourcename} = $sth->fetchall_arrayref({})->[0];
                     $g->{winning_db} = $sourcename;
 
                     ## We want to modify all fullcopy targets only
@@ -4762,6 +4940,12 @@ sub connect_database {
          $pass,
          {AutoCommit=>0, RaiseError=>1, PrintError=>0}
     );
+
+    ## Register this database in our global list
+    ## Note that we only worry about DBI-backed databases here,
+    ## as there is no particular cleanup needed (e.g. InactiveDestroy)
+    ## for other types.
+    $self->{dbhlist}{$dbh} = $dbh;
 
     if ($dbtype ne 'postgres') {
         return 0, $dbh;
@@ -5596,7 +5780,7 @@ sub validate_sync {
 
     ## Given a schema and table name, return safely quoted names
     $SQL{checktable} = q{
-            SELECT quote_ident(n.nspname), quote_ident(c.relname), quote_literal(n.nspname), quote_literal(c.relname)
+            SELECT c.oid, quote_ident(n.nspname), quote_ident(c.relname), quote_literal(n.nspname), quote_literal(c.relname)
             FROM   pg_class c, pg_namespace n
             WHERE  c.relnamespace = n.oid
             AND    c.oid = ?::regclass
@@ -5692,16 +5876,6 @@ sub validate_sync {
 
     } ## end checking each custom code
 
-    ## Consolidate some things that are set at both sync and goat levels
-
-    ## The makedelta settings indicates which sides (source/target) get manual delta rows
-    ## This is required if other syncs going to other targets need to see the changed data
-    ## Note that fullcopy is always 0, and pushdelta can only change target_makedelta
-    ## The db is on or off, and the sync then inherits, forces it on, or forces it off
-    ## Each goat then does the same: inherits, forces on, forces off
-
-    ## XXX Revisit the whole makedelta idea
-
     ## Go through each goat in this sync, adjusting items and possibly bubbling up info to sync
     for my $g (@{$s->{goatlist}}) {
         ## None of this applies to non-tables
@@ -5735,7 +5909,6 @@ sub validate_sync {
         $customname{$row->{goat}}{$row->{db}} = $row->{newname};
     }
 
-
     ## Go through each table and make sure it exists and matches everywhere
     for my $g (@{$s->{goatlist}}) {
 
@@ -5747,17 +5920,21 @@ sub validate_sync {
         $sth = $sth{checktable};
         $count = $sth->execute(qq{"$g->{schemaname}"."$g->{tablename}"});
         if ($count != 1) {
+            $sth->finish();
             my $msg = qq{Could not find $g->{reltype} "$g->{schemaname}"."$g->{tablename}"\n};
             $self->glog($msg, LOG_WARN);
             warn $msg;
             return 0;
         }
 
-        ## Store quoted names for this goat
-        ($g->{safeschema},$g->{safetable},$g->{safeschemaliteral},$g->{safetableliteral})
+        ## Store oid and quoted names for this relation
+        ($g->{oid},$g->{safeschema},$g->{safetable},$g->{safeschemaliteral},$g->{safetableliteral})
             = @{$sth->fetchall_arrayref()->[0]};
 
         my ($S,$T) = ($g->{safeschema},$g->{safetable});
+
+        ## Plunk the oid into a hash for easy lookup below when saving FK information
+        $s->{tableoid}{$g->{oid}}{name} = "$S.$T";
 
         ## Determine the conflict method for each goat
         ## Use the syncs if it has one, otherwise the default
@@ -5874,6 +6051,9 @@ sub validate_sync {
         ## Verify sequences or tables+columns on remote databases
         for my $dbname (sort keys %{ $self->{sdb} }) {
 
+            ## Only ones for this sync, please
+            next if ! exists $s->{db}{$dbname};
+
             $x = $self->{sdb}{$dbname};
 
             next if $x->{role} eq 'source';
@@ -5965,6 +6145,7 @@ sub validate_sync {
             }
 
             $dbh->do('RESET search_path');
+            $dbh->rollback();
 
             my $t = "$g->{schemaname}.$g->{tablename}";
 
@@ -6096,6 +6277,55 @@ sub validate_sync {
         } ## end each target database
 
     } ## end each goat
+
+    ## Generate mapping of foreign keys
+    ## This helps us with conflict resolution later on
+    my $oidlist = join ',' => map { $_->{oid} } @{ $s->{goatlist} };
+    if ($oidlist) {
+
+        $SQL = qq{SELECT conname,
+                    conrelid, conrelid::regclass,
+                    confrelid, confrelid::regclass,
+                    array_agg(a.attname), array_agg(z.attname)
+             FROM pg_constraint c
+             JOIN pg_attribute a ON (a.attrelid = conrelid AND a.attnum = ANY(conkey))
+             JOIN pg_attribute z ON (z.attrelid = confrelid AND z.attnum = ANY (confkey))
+             WHERE contype = 'f'
+             AND (conrelid IN ($oidlist) OR confrelid IN ($oidlist))
+             GROUP BY 1,2,3,4,5
+        };
+
+        ## We turn off search_path to get fully-qualified relation names
+        $srcdbh->do('SET LOCAL search_path = pg_catalog');
+
+        for my $row (@{ $srcdbh->selectall_arrayref($SQL) }) {
+
+            my ($conname, $oid1,$t1, $oid2,$t2, $c1,$c2) = @$row;
+
+            ## The referenced table is not being tracked in this sync
+            if (! exists $s->{tableoid}{$oid2}) {
+                ## Nothing to do except report this problem and move on
+                $self->glog("Table $t1 references $t2, which is not part of this sync!", LOG_NORMAL);
+                next;
+            }
+
+            ## A table referencing us is not being tracked in this sync
+            if (! exists $s->{tableoid}{$oid1}) {
+                ## Nothing to do except report this problem and move on
+                $self->glog("Table $t2 is referenced by $t1, which is not part of this sync!", LOG_NORMAL);
+                next;
+            }
+
+            ## Both exist, so tie them together
+            $s->{tableoid}{$oid1}{references}{$oid2} = [$conname,$c1,$c2];
+            $s->{tableoid}{$oid2}{referencedby}{$oid1} = [$conname,$c1,$c2];
+
+        }
+
+        $srcdbh->do('RESET search_path');
+        $srcdbh->commit();
+
+    }
 
     ## If autokick, listen for a triggerkick on all source databases
     if ($s->{autokick}) {
@@ -6242,10 +6472,7 @@ sub fork_controller {
 
     my ($self, $s, $syncname) = @_;
 
-    my $newpid = fork;
-    if (!defined $newpid) {
-        die qq{Warning: Fork for controller failed!\n};
-    }
+    my $newpid = $self->fork_and_inactivate('CTL');
 
     if ($newpid) { ## We are the parent
         $self->glog(qq{Created controller $newpid for sync "$syncname". Kick is $s->{kick_on_startup}}, LOG_NORMAL);
@@ -6264,17 +6491,6 @@ sub fork_controller {
     ## Sleep a hair so the MCP can finish the items above first
     sleep 0.05;
 
-    ## Make sure the controller exiting does not disrupt the MCP's database connections
-    ## The controller will overwrite all these handles of course
-    $self->{masterdbh}->{InactiveDestroy} = 1;
-    $self->{masterdbh} = 0;
-
-    for my $dbname (keys %{ $self->{sdb} }) {
-        $x = $self->{sdb}{$dbname};
-        next if $x->{dbtype} =~ /flat|mongo|redis/o;
-        $x->{dbh}->{InactiveDestroy} = 1;
-    }
-
     ## No need to keep information about other syncs around
     $self->{sync} = $s;
 
@@ -6283,6 +6499,76 @@ sub fork_controller {
     exit 0;
 
 } ## end of fork_controller
+
+
+sub fork_and_inactivate {
+
+    ## Call fork, and immediately inactivate open database handles
+    ## Arguments: one
+    ## 1. Type of thing we are forking (VAC, CTL, KID)
+    ## Returns: nothing
+
+    my $self = shift;
+    my $type = shift || '???';
+
+    my $newpid = fork;
+    if (!defined $newpid) {
+        die qq{Warning: Fork for $type failed!\n};
+    }
+
+    if ($newpid) { ## Parent
+        ## Very slight sleep to increase the chance of something happening to the kid
+        ## before InactiveDestroy is set
+        sleep 0.1;
+    }
+    else { ## Kid
+        ## Walk through the list of all known DBI databases
+        ## Inactivate each one, then undef it
+        ## It is probably still referenced elsewhere, so handle that - how?
+        for my $iname (keys %{ $self->{dbhlist} }) {
+            my $ldbh = $self->{dbhlist}{$iname};
+            $self->glog("Inactivating dbh $iname post-fork", LOG_DEBUG);
+            $ldbh->{InactiveDestroy} = 1;
+            delete $self->{dbhlist}{$iname};
+        }
+        ## Now go through common shared database handle locations, and delete them
+        delete $self->{masterdbh};
+
+        ## Clear the 'sdb' structure of any existing database handles
+        if (exists $self->{sdb}) {
+            for my $dbname (keys %{ $self->{sdb} }) {
+                for my $item (qw/ dbh backend kicked /) {
+                    delete $self->{sdb}{$dbname}{$item};
+                }
+            }
+        }
+
+        ## Clear any sync-specific database handles
+        if (exists $self->{sync}) {
+            if (exists $self->{sync}{name}) { ## This is a controller/kid with a single sync
+                for my $dbname (sort keys %{ $self->{sync}{db} }) {
+                    $self->glog("Removing reference to database $dbname", LOG_DEBUG);
+                        for my $item (qw/ dbh backend kicked /) {
+                            delete $self->{sync}{db}{$dbname}{$item};
+                        }
+                    }
+            }
+            else {
+                for my $syncname (keys %{ $self->{sync} }) {
+                    for my $dbname (sort keys %{ $self->{sync}{$syncname}{db} }) {
+                        $self->glog("Removing reference to database $dbname in sync $syncname", LOG_DEBUG);
+                        for my $item (qw/ dbh backend kicked /) {
+                            delete $self->{sync}{$syncname}{db}{$dbname}{$item};
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return $newpid;
+
+} ## end of fork_and_inactivate
 
 
 sub fork_vac {
@@ -6294,34 +6580,13 @@ sub fork_vac {
     my $self = shift;
 
     ## Fork it off
-    my $newpid = fork;
-    if (!defined $newpid) {
-        die qq{Warning: Fork for VAC failed!\n};
-    }
+    my $newpid = $self->fork_and_inactivate('VAC');
 
     ## Parent MCP just makes a note in the logs and returns
     if ($newpid) { ## We are the parent
         $self->glog(qq{Created VAC $newpid}, LOG_NORMAL);
         $self->{vacpid} = $newpid;
-        ## We sleep a bit here to increase the chance that the database connections
-        ## below are disassociated before the MCP can come back and possibly
-        ## kill the VAC, causing bad double-free libpq/libc errors
-        sleep 0.5;
         return;
-    }
-
-    ## We are now a VAC daemon - get to work!
-
-    ## We don't want to mess with any existing MCP database connections
-    $self->{masterdbh}->{InactiveDestroy} = 1;
-    $self->{masterdbh} = 0;
-
-    ## We also need to disassociate ourselves from any open database connections
-    for my $dbname (keys %{ $self->{sdb} }) {
-        $x = $self->{sdb}{$dbname};
-        next if $x->{dbtype} =~ /flat|mongo|redis/o;
-        $x->{dbh}->{InactiveDestroy} = 1;
-        $x->{dbh} = 0;
     }
 
     ## Prefix all log lines with this TLA (was MCP)
@@ -6361,7 +6626,7 @@ sub fork_vac {
         $self->glog(qq{${warn}VAC was killed at line $line: $diemsg}, LOG_WARN);
 
         ## Not a whole lot of cleanup to do on this one: just shut database connections and leave
-        $self->{masterdbh}->disconnect();
+        $self->{masterdbh}->disconnect() if exists $self->{masterdbhvac};
 
         ## Remove our pid file
         unlink $self->{vacpidfile} or $self->glog("Warning! Failed to unlink $self->{vacpidfile}", LOG_WARN);
@@ -6370,8 +6635,9 @@ sub fork_vac {
 
     }; ## end SIG{__DIE_} handler sub
 
-    ## Connect to the master database (overwriting the pre-fork MCP connection)
+    ## Connect to the master database
     ($self->{master_backend}, $self->{masterdbh}) = $self->connect_database();
+    $self->{masterdbhvac} = 1;
     my $maindbh = $self->{masterdbh};
     $self->glog("Bucardo database backend PID: $self->{master_backend}", LOG_VERBOSE);
 
@@ -6381,12 +6647,12 @@ sub fork_vac {
 
     ## Listen for an exit request from the MCP
     my $exitrequest = 'stop_vac';
-    $self->db_listen($maindbh, $exitrequest, 1); ## No payloads please
+    $self->db_listen($maindbh, $exitrequest, '', 1); ## No payloads please
 
     ## Commit so we start listening right away
     $maindbh->commit();
 
-    ## Reconnect to all databases we care about: overwrites existing dbhs
+    ## Reconnect to all databases we care about
     for my $dbname (keys %{ $self->{sdb} }) {
 
         $x = $self->{sdb}{$dbname};
@@ -6396,7 +6662,7 @@ sub fork_vac {
         ## not a fullcopy sync, dbtype is postgres, role is source
         next if ! $x->{needsvac};
 
-        ## Overwrites the MCP database handles
+        ## Establish a new database handle
         ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
         $self->glog(qq{Connected to database "$dbname" with backend PID of $x->{backend}}, LOG_NORMAL);
         $self->{pidmap}{$x->{backend}} = "DB $dbname";
@@ -6546,6 +6812,8 @@ sub reset_mcp_listeners {
 
     ## Unlisten everything
     $self->db_unlisten_all($maindbh);
+    ## Need to commit here to work around Postgres bug!
+    $maindbh->commit();
 
     ## Listen for MCP specific items
     for my $l
@@ -7176,7 +7444,7 @@ sub end_syncrun {
         AND    sync = ?
         };
     $sth = $ldbh->prepare($SQL);
-    $count = $sth->execute($syncname);
+    $sth->execute($syncname);
 
     ## End the current row, and elevate it to a 'last' position
     $SQL = qq{
@@ -7185,7 +7453,7 @@ sub end_syncrun {
         WHERE  ctid = ?
         };
     $sth = $ldbh->prepare($SQL);
-    $count = $sth->execute($status, $ctid);
+    $sth->execute($status, $ctid);
 
     return;
 
@@ -7287,10 +7555,7 @@ sub create_newkid {
     $self->db_notify($self->{masterdbh}, "kid_stopsync_$self->{syncname}");
 
     ## Fork off a new process which will become the KID
-    my $newkid = fork;
-    if (! defined $newkid) {
-        die q{Fork failed for new kid in create_newkid};
-    }
+    my $newkid = $self->fork_and_inactivate('KID');
 
     if ($newkid) { ## We are the parent
         my $msg = sprintf q{Created new kid %s for sync "%s"},
@@ -7303,25 +7568,6 @@ sub create_newkid {
         sleep $config{ctl_createkid_time};
 
         return $newkid;
-    }
-
-    ## We are the child process
-
-    ## Make sure the kid exiting does not disrupt the controller's database connections
-    ## The kid will overwrite all these handles of course
-    $self->{masterdbh}->commit();
-    $self->{masterdbh}->{InactiveDestroy} = 1;
-    $self->{masterdbh} = 0;
-    for my $dbname (keys %{ $kidsync->{db} }) {
-        $x = $kidsync->{db}{$dbname};
-        next if ! exists $x->{dbh};
-
-        $x->{dbh}->{InactiveDestroy} = 1;
-        $x->{status} = 'gone';
-        ## Otherwise, clear out items the kid does not need
-        for my $var (qw/ dbh backend kicked /) {
-            delete $x->{$var};
-        }
     }
 
     ## Create the kid process
@@ -7482,7 +7728,8 @@ sub table_has_rows {
     if ($x->{does_limit}) {
         $SQL = "SELECT 1 FROM $tname LIMIT 1";
         $sth = $x->{dbh}->prepare($SQL);
-        $count = $sth->execute();
+        $sth->execute();
+        $count = $sth->rows();
         $sth->finish();
         return $count >= 1 ? 1 : 0;
     }
@@ -7494,7 +7741,8 @@ sub table_has_rows {
     elsif ('oracle' eq $x->{dbtype}) {
         $SQL = "SELECT 1 FROM $tname WHERE rownum > 1";
         $sth = $x->{dbh}->prepare($SQL);
-        $count = $sth->execute();
+        $sth->execute();
+        $count = $sth->rows();
         $sth->finish();
         return $count >= 1 ? 1 : 0;
     }
@@ -8383,16 +8631,11 @@ sub push_rows {
         my $inner = length $key
             ? (join ',' => map { s{\'}{''}go; s{\\}{\\\\}go; qq{'$_'}; } split '\0', $key, -1)
             : q{''};
-        $pkvals[$round] .= $numpks > 1 ? "($inner)," : "$inner,";
+        push @{ $pkvals[$round] ||= [] } => $numpks > 1 ? "($inner)" : $inner;
         if (++$roundtotal >= $chunksize) {
             $roundtotal = 0;
             $round++;
         }
-    }
-
-    ## Remove that final comma from each
-    for (@pkvals) {
-        chop;
     }
 
     ## Example: 1234, 221
@@ -8404,7 +8647,7 @@ sub push_rows {
     }
 
     ## This can happen if we truncated but had no delta activity
-    return 0 if (! defined $pkvals[0] or ! length $pkvals[0]) and ! $fullcopy;
+    return 0 if (! $pkvals[0] or ! length $pkvals[0]->[0] ) and ! $fullcopy;
 
     ## Get ready to export from the source
     ## This may have multiple versions depending on the customcols table
@@ -8441,7 +8684,7 @@ sub push_rows {
 
             ## The columns we are pushing to, both as an arrayref and a CSV:
             my $cols = $goat->{tcolumns}{$SELECT};
-            my $columnlist = $t->{does_sql} ? 
+            my $columnlist = $t->{does_sql} ?
                 ('(' . (join ',', map { $t->{dbh}->quote_identifier($_) } @$cols) . ')')
               : ('(' . (join ',', map { $_ } @$cols) . ')');
 
@@ -8495,14 +8738,15 @@ sub push_rows {
 
         ## Put dummy data into @pkvals if using fullcopy
         if ($fullcopy) {
-            push @pkvals => 'fullcopy';
+            push @pkvals => ['fullcopy'];
         }
 
         my $loop = 1;
         my $pcount = @pkvals;
 
         ## Loop through each chunk of primary keys to copy over
-        for my $pkvs (@pkvals) {
+        for my $pk_values (@pkvals) {
+            my $pkvs = join ',' => @{ $pk_values };
 
             ## Message to prepend to the statement if chunking
             my $pre = $pcount <= 1 ? '' : "/* $loop of $pcount */";
@@ -8643,19 +8887,41 @@ sub push_rows {
 
         ## Perform final cleanups for each target
         for my $t (@{ $srccmd{$clause} }) {
-
             my $type = $t->{dbtype};
-
             my $tname = $newname->{$t->{name}};
 
             if ('postgres' eq $type) {
-                $t->{dbh}->pg_putcopyend();
+                my $dbh = $t->{dbh};
+                $dbh->pg_putcopyend();
                 ## Same bug as above
                 if ($self->{dbdpgversion} < 21801) {
-                    $t->{dbh}->do('SELECT 1');
+                    $dbh->do('SELECT 1');
                 }
                 $self->glog(qq{Rows copied to $t->{name}.$tname: $total}, LOG_VERBOSE);
                 $count += $total;
+                ## If this table is set to makedelta, add rows to bucardo.delta to simulate the
+                ##   normal action of a trigger and add a row to bucardo.track to indicate that
+                ##   it has already been replicated here.
+                my $dbinfo = $sync->{db}{ $t->{name} };
+                if (!$fullcopy and exists $dbinfo->{is_makedelta}{$S}{$T}) {
+                    my ($cols, $vals);
+                    if ($numpks == 1) {
+                        $cols = "($pkcols)";
+                        $vals = join ',', map { "($_)" } map { @{ $_ } } @pkvals;
+                    } else {
+                        $cols = $pkcols;
+                        $vals = join ',', map { @{ $_ } } @pkvals;
+                    }
+                    $dbh->do(qq{
+                        INSERT INTO bucardo.$goat->{deltatable} $cols
+                        VALUES $vals
+                    });
+                    # Make sure we track it!
+                    $dbh->do(qq{
+                        INSERT INTO bucardo.$goat->{tracktable}
+                        VALUES (NOW(), ?)
+                    }, undef, $t->{TARGETNAME});
+                }
             }
             elsif ('flatpg' eq $type) {
                 print {$t->{filehandle}} "\\\.\n\n";
@@ -8986,7 +9252,7 @@ Bucardo - Postgres multi-master replication system
 
 =head1 VERSION
 
-This document describes version 4.99.6 of Bucardo
+This document describes version 4.99.7 of Bucardo
 
 =head1 WEBSITE
 
@@ -9038,7 +9304,7 @@ Greg Sabino Mullane <greg@endpoint.com>
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright (c) 2005-2012 Greg Sabino Mullane <greg@endpoint.com>.
+Copyright (c) 2005-2013 Greg Sabino Mullane <greg@endpoint.com>.
 
 This software is free to use: see the LICENSE file for details.
 

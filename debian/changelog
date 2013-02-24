@@ -1,3 +1,10 @@
+bucardo (4.99.7-1) unstable; urgency=low
+
+  * Imported Upstream version 4.99.7
+  * Bumped Standards-Version to 3.9.4, no changes needed.
+
+ -- Michael Meskes <meskes@debian.org>  Sun, 24 Feb 2013 10:57:08 +0100
+
 bucardo (4.99.6-1) unstable; urgency=low
 
   [ Christoph Berg ]

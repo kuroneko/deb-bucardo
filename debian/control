@@ -3,7 +3,7 @@ Priority: optional
 Maintainer: Nicholas Jefferson <nicholas@pythonic.com.au>
 Uploaders: Michael Meskes <meskes@debian.org>
 Build-Depends: cdbs, debhelper (>= 5), perl (>= 5.10.0), quilt
-Standards-Version: 3.9.3
+Standards-Version: 3.9.4
 Section: database
 Homepage: http://bucardo.org/
 Vcs-Git: git://git.debian.org/git/pkg-postgresql/bucardo.git
