@@ -29,6 +29,9 @@ my (%gsth, %gdbh);
 
 my $dbname = 'bucardo_test';
 
+## We need to use the local Bucardo.pm, not a system installed one!
+$ENV{PERL5LIB} = '.';
+
 ## Shortcuts for ease of changes and smaller text:
 our $addtable_msg = 'Added the following tables';
 our $deltable_msg = 'Removed the following tables';
@@ -1140,7 +1143,7 @@ sub wait_for_notice {
 
     ## Wait until a named NOTIFY is issued
     ## Arguments:
-    ## 1. The listen string
+    ## 1. The listen string or array of strings
     ## 2. Seconds until we give up
     ## 3. Seconds we sleep between checks
     ## 4. Boolean: bail out if not found (defaults to true)
@@ -1154,6 +1157,11 @@ sub wait_for_notice {
     my $bail = shift;
     $bail = 1 if !defined($bail);
     my $n;
+    my %wait_for;
+    for my $str (ref $text ? @{ $text } : $text) {
+        $wait_for{$str}++;
+    }
+
     eval {
         local $SIG{ALRM} = sub { die "Lookout!\n"; };
         alarm $timeout;
@@ -1161,8 +1169,11 @@ sub wait_for_notice {
             while ($n = $dbh->func('pg_notifies')) {
                 my ($name, $pid, $payload) = @$n;
                 $name = $payload if length $payload;
-                if ($name eq $text) {
-                    last N;
+                if (exists $wait_for{$name}) {
+                    if (--$wait_for{$name} == 0) {
+                        delete $wait_for{$name};
+                        last N unless %wait_for;
+                    }
                 }
                 else {
                     debug("notice was $name", 1);
@@ -1177,7 +1188,9 @@ sub wait_for_notice {
         if ($@ =~ /Lookout/o) {
             my $line = (caller)[2];
             my $now = scalar localtime;
-            my $notice = qq{Gave up waiting for notice "$text": timed out at $timeout from line $line. Time=$now};
+            my $texts = join '", "', keys %wait_for;
+            my $pl = keys %wait_for > 1 ? 's' : '';
+            my $notice = qq{Gave up waiting for notice$pl "$texts": timed out at $timeout from line $line. Time=$now};
             if ($bail) {
                 Test::More::BAIL_OUT ($notice);
             }
@@ -1190,7 +1203,6 @@ sub wait_for_notice {
     return 1;
 
 } ## end of wait_for_notice
-
 
 ## Older methods:
 
@@ -1612,7 +1624,7 @@ sub truncate_all_tables {
 
     ## Loop through each table we know about
     for my $table (sort keys %tabletype) {
-        $dbh->do(qq{TRUNCATE Table ONLY "$table"});
+        $dbh->do(qq{TRUNCATE Table "$table"});
     }
 
     $dbh->commit() if $commit;
@@ -1620,6 +1632,33 @@ sub truncate_all_tables {
     return undef;
 
 } ## end of truncate_all_tables
+
+
+sub delete_all_tables {
+
+    ## Delete all the tables.
+    ## Mostly for old versions that do not support truncate triggers.
+    ## Arguments: two
+    ## 1. Database to use
+    ## 3. Do we commit or not? Boolean, defaults to true
+    ## Returns: undef
+
+    my ($self, $dbname, $commit) = @_;
+
+    $commit = 1 if ! defined $commit;
+
+    my $dbh = $gdbh{$dbname} or die "No such database: $dbname";
+
+    ## Loop through each table we know about
+    for my $table (sort keys %tabletype) {
+        $dbh->do(qq{DELETE FROM "$table"});
+    }
+
+    $dbh->commit() if $commit;
+
+    return undef;
+
+} ## end of delete_all_tables
 
 
 sub check_for_row {
@@ -1637,6 +1676,16 @@ sub check_for_row {
     ## Get largest tablename
     my $maxtable = 1;
     for my $table (keys %tabletype) {
+        ## Allow skipping tables
+        if (defined $filter) {
+            my $f = $filter;
+            if ($f =~ s/^\!//) {
+                next if $table =~ /$f$/;
+            }
+            else {
+                next if $table !~ /$f$/;
+            }
+        }
         $maxtable = length $table if length $table > $maxtable;
     }
 

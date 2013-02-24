@@ -3,31 +3,31 @@
 
 ## Script to control Bucardo
 ##
-## Copyright 2006-2012 Greg Sabino Mullane <greg@endpoint.com>
+## Copyright 2006-2013 Greg Sabino Mullane <greg@endpoint.com>
 ##
 ## Please see http://bucardo.org/ for full documentation
 ##
-## Run as bucardo --help for some basic instructions
+## Run with a --help argument for some basic instructions
 
 package bucardo;
 use strict;
 use warnings;
 use 5.008003;
 use DBI;
-use IO::Handle;
-use Getopt::Long;
-Getopt::Long::Configure(qw/no_ignore_case/);
-use Time::HiRes 'sleep';
-use POSIX qw/ceil setsid localeconv/;
-use Data::Dumper 'Dumper';
+use IO::Handle    qw/ autoflush /;
+use Time::HiRes   qw/ sleep gettimeofday tv_interval /;
+use POSIX         qw/ ceil setsid localeconv /;
+use Data::Dumper  qw/ Dumper /;
 $Data::Dumper::Indent = 1;
+use Getopt::Long;
+Getopt::Long::Configure(qw/ no_ignore_case pass_through no_autoabbrev /);
 
-our $VERSION = '4.99.6';
+our $VERSION = '4.99.7';
 
 ## For the tests, we want to check that it compiles without actually doing anything
 return 1 if $ENV{BUCARDO_TEST};
 
-## No buffering on the standard output streams
+## No buffering on the standard streams
 *STDOUT->autoflush(1);
 *STDERR->autoflush(1);
 
@@ -36,11 +36,11 @@ use vars qw/$dbh $SQL $sth %sth $count $info %global $SYNC $GOAT $TABLE $SEQUENC
             $CUSTOMCODE $CUSTOMNAME $CUSTOMCOLS /;
 
 ## How to show dates from the database, e.g. start time of a sync
-my $DATEFORMAT       = q{Mon DD, YYYY HH24:MI:SS};
-my $SHORTDATEFORMAT  = q{HH24:MI:SS};
+my $DATEFORMAT       = $ENV{BUCARDO_DATEFORMAT} || q{Mon DD, YYYY HH24:MI:SS};
+my $SHORTDATEFORMAT  = $ENV{BUCARDO_SHORTDATEFORMAT} || q{HH24:MI:SS};
 
-## How long we hang out between checks after a kick or when waiting for notices
-my $WAITSLEEP        = 1;
+## How long we hang out between checks after a kick - or when waiting for notices
+my $WAITSLEEP = 1;
 
 ## Determine how we were called
 ## If we were called from a different directory, and the base directory is in our path,
@@ -75,9 +75,8 @@ my $bcargs = {
               batch        => 0,
           };
 
-## These options must come before the GetOptions call
+## These options must come before the main GetOptions call
 my @opts = @ARGV;
-Getopt::Long::Configure(qw(pass_through));
 GetOptions(
     $bcargs,
     'no-bucardorc',
@@ -110,15 +109,15 @@ if (defined $file) {
         ## Skip any lines starting with a hash
         next if /^\s*#/;
 
-        ## Format is foo=bar, with whitespace allowed
-        next unless /^\s*(\w+)\s*=\s*(.+?)\s*$/o;
+        ## Format is foo=bar or foo:bar, with whitespace allowed
+        next unless /^\s*(\w[\w-]+)\s*[:=]\s*(.+?)\s*$/o;
         my ($name,$value) = ($1,$2); ## no critic (ProhibitCaptureWithoutTest)
-        $bcargs->{$name} = $value;
+        $bcargs->{$name} = $name eq 'logdest' ? [$value] : $value;
     }
     close $rc or die;
 }
 
-Getopt::Long::Configure(qw(no_pass_through));
+Getopt::Long::Configure(qw(no_pass_through autoabbrev));
 GetOptions ## no critic (ProhibitCallsToUndeclaredSubs)
     ($bcargs,
      'verbose+',
@@ -181,7 +180,12 @@ if ($bcargs->{version}) {
 }
 
 # Determine the logging destination.
-unless (exists $bcargs->{logdest}) {
+if (exists $bcargs->{logdest}) {
+    if (! ref $bcargs->{logdest}) {
+        $bcargs->{logdest} = [$bcargs->{logdest}];
+    }
+}
+else {
     if (exists $bcargs->{debugfile} && !delete $bcargs->{debugfile}) {
         # Old --debugfile option can disable logging.
         $bcargs->{logdest} = [];
@@ -600,7 +604,7 @@ sub superhelp {
             all
             config
             customcode
-            customcol
+            customcols
             customname
             dbgroup
             deactivate
@@ -862,26 +866,30 @@ sub reload_config {
         }
     }
 
-    $QUIET or print q{Forcing Bucardo to reload the bucardo_config table};
+    $QUIET or print qq{Forcing Bucardo to reload the bucardo_config table\n};
 
-    ## We may want to wait to hear from the MCP that it is done
+    ## Is Bucardo active?
+    my $pong = 'bucardo_mcp_pong';
+    $dbh->do("LISTEN $pong");
+    $dbh->do('NOTIFY bucardo_mcp_ping');
+    $dbh->commit();
+    ## Wait a little bit, then scan for the confirmation message
+    sleep 0.1;
+    if (! wait_for_notice($dbh, $pong, 2)) {
+        die "Looks like Bucardo is not running, so there is no need to reload\n";
+    }
+
+    ## We want to wait to hear from the MCP that it is done
     my $done = 'bucardo_reload_config_finished';
     $dbh->do('NOTIFY bucardo_reload_config');
-    if (defined $adverb) {
-        print '...';
-        $dbh->do("LISTEN $done");
-    }
+    $dbh->do("LISTEN $done");
     $dbh->commit();
-
-    ## If we are not waiting around for a confirmation, just exit now
-    if (!defined $adverb) {
-        print "\n";
-        exit 0;
-    }
 
     ## Wait a little bit, then scan for the confirmation message
     sleep 0.1;
-    wait_for_notice($dbh, $done);
+    if (! wait_for_notice($dbh, $done, 5) ) {
+        die "Waited, but Bucardo never confirmed the configuration reload!\n";
+    }
     print "DONE!\n";
 
     exit 0;
@@ -892,24 +900,33 @@ sub reload_config {
 sub wait_for_notice {
 
     ## Keep hanging out until we get the notice we are waiting for
-    ## Arguments: two
+    ## Arguments: three
     ## 1. Database handle
     ## 2. String to listen for
+    ## 3. How long to wait (default is forever)
     ## Returns: undef
 
-    my ($ldbh, $string) = @_;
+    my ($ldbh, $string, $howlong) = @_;
+
+    my $start_time = [gettimeofday];
 
   WAITIN: {
         for my $notice (@{ db_get_notices($ldbh) }) {
             my ($name) = @$notice;
             last WAITIN if $name eq $string;
         }
+
+        if (defined $howlong) {
+            my $elapsed = tv_interval( $start_time );
+            return 0 if $elapsed >= $howlong;
+        }
+
         $dbh->commit();
         sleep($WAITSLEEP);
         redo;
     }
 
-    return;
+    return 1;
 
 } ## end of wait_for_notice
 
@@ -1195,8 +1212,6 @@ sub update_item {
     my $code = $thing eq 'customcode' ? \&update_customcode
              : $thing eq 'database'   ? \&update_database
              : $thing eq 'dbgroup'    ? \&update_dbgroup
-             : $thing eq 'relgroup'   ? \&update_herd
-             : $thing eq 'herd'       ? \&update_herd
              : $thing eq 'sync'       ? \&update_sync
              : $thing eq 'table'      ? \&update_table
              : $thing eq 'sequence'   ? \&update_table
@@ -1358,12 +1373,8 @@ sub add_database {
         addallsequences          none                 0                skip
         server_side_prepares|ssp server_side_prepares TF               null
         service|dbservice        dbservice            0                null
-        makedelta                makedelta            =on|off          null
     };
 
-
-    ## TODO: See if makedelta still needed
-    ## If so, add to wiki page: http://bucardo.org/wiki/Bucardo/add_database#Optional_arguments
 
     my ( $dbcols, $cols, $phs, $vals, $extra ) = process_simple_args({
         cols        => $validcols,
@@ -2200,7 +2211,7 @@ sub update_dbgroup {
         my $oldrole = $oldlist->{$db}{role};
         my $newrole = $dblist{$db};
         if ($oldrole ne $newrole) {
-            change_db_role($newrole, $db, $name);
+            change_db_role($newrole, $name, $db);
             $QUIET or print qq{Changed role of database "$db" in group "$name" from $oldrole to $newrole\n};
             $changes++;
         }
@@ -2956,7 +2967,7 @@ sub add_table {
         autokick|ping            autokick             TF               null
         rebuild_index            rebuild_index        numeric          null
         analyze_after_copy       analyze_after_copy   TF               null
-        makedelta                makedelta            =on|off          null
+        makedelta                makedelta            0                null
         herd|relgroup            herd                 0                skip
     };
 
@@ -3133,6 +3144,15 @@ sub update_table {
     my $table = $GOAT->{$name} or die qq{Could not find a table named "$name"\n}
         . "Use 'list tables' to see all available.\n";
 
+    ## If this is an array, then see how many matches we have
+    if (ref $table eq 'ARRAY') {
+        my $matches = @$table;
+        if ($matches > 1) {
+            die qq{More than one matching table: please use a schema\n};
+        }
+        $table = $table->[0];
+    }
+
     ## Store the id so we work with that alone whenever possible
     my $id = $table->{id};
 
@@ -3152,6 +3172,8 @@ sub update_table {
 
     ## Walk through and handle each argument pair
     for my $setting (sort keys %$args) {
+
+        next if $setting eq 'extraargs';
 
         ## Change the name to a more standard form, to better figure out what they really mean
         ## This also excludes all non-alpha characters
@@ -3525,15 +3547,6 @@ sub remove_herd {
 } ## end of remove_herd
 
 
-sub update_herd {
-
-    ## Update one or more herds
-    ## Arguments: none, parses nouns
-    ## Returns: never, exits
-
-    die "update relgroup not implemented yet\n";
-} ## end of update_herd
-
 sub add_goat_to_herd {
     die "Adding to a relgroup not implemented yet\n";
 }
@@ -3764,7 +3777,7 @@ sub add_sync {
             $type = 'source' if $type =~ /^s/i or $type =~ /^master/i;
             $type = 'target' if $type =~ /^t/i or $type =~ /^rep/i;
             $type = 'fullcopy' if $type =~ /^f/i;
-            if ($type !~ /^(source|target|fullcopy)$/) {
+            if ($type !~ /^(?:source|target|fullcopy)$/) {
                 die "Invalid database type: must be source, target, or fullcopy (not $type)\n";
             }
             $db{$db} = $type;
@@ -3817,7 +3830,7 @@ sub add_sync {
                     die qq{Unable to add database "$db" to group "$gname"\n};
                 }
             }
-            print qq{Created database group "$gname"\n};
+            $QUIET or print qq{Created database group "$gname"\n};
             $dbcols->{dbs} = $gname;
             $vals->{dbs} = $gname;
         }
@@ -4677,12 +4690,16 @@ ORDER BY started DESC LIMIT 1
     }
 
     my $result = $sth->fetchall_arrayref({})->[0];
-    (my $whydie = $result->{details}) =~ s/\\n */\n    /g;
+    my $whydie = $result->{status} || '';
+    $whydie =~ s/\\n */\n    /g;
     $whydie =~ s/: ERROR:/:\n    ERROR:/;
     $whydie =~ s/ (at .+ line \d+\.)/\n      $1/g;
     $whydie =~ s/\t/<tab>/g;
     my $message = sprintf "  Started: %s\n  Ended: %s\n    %s",
-        $result->{pid}, $result->{started}, $result->{ended}, $whydie;
+        $result->{pid} || '?',
+        $result->{started} || '?',
+        $result->{ended} || '?',
+        $whydie;
 
     return $message;
 
@@ -5926,7 +5943,7 @@ sub add_all_goats {
     ## --schema or -n: limit to one or more comma-separated schemas
     ## --exclude-schema or -N: exclude these schemas
     ## --table or -t: limit to the given tables
-    ## --exclude-table or -t: exclude these tables
+    ## --exclude-table or -T: exclude these tables
     ## --relgroup: name of the herd to add new tables to
     ## pkonly: exclude tables with no pkey
     ## Returns: text string of results, with a newline
@@ -5998,16 +6015,16 @@ sub add_all_goats {
     my @clause;
 
     ## If they gave a schema option, restrict the query by namespace
-    push @clause => generate_clause({col => 'nspname', items => [$bcargs->{schema}]});
+    push @clause => generate_clause({col => 'nspname', items => $bcargs->{schema}});
 
     ## If they have asked to exclude schemas, append that to the namespace clause
-    push @clause => generate_clause({col => 'nspname', items => [$bcargs->{'exclude-schema'}], not => 1});
+    push @clause => generate_clause({col => 'nspname', items => $bcargs->{'exclude-schema'}, not => 1});
 
     ## If they gave a table option, restrict the query by relname
-    push @clause => generate_clause({col => 'relname', items => [$bcargs->{table}]});
+    push @clause => generate_clause({col => 'relname', items => $bcargs->{table}});
 
     ## If they have asked to exclude tables, append that to the relname clause
-    push @clause => generate_clause({col => 'relname', items => [$bcargs->{'exclude-table'}], not => 1});
+    push @clause => generate_clause({col => 'relname', items => $bcargs->{'exclude-table'}, not => 1});
 
     for my $c (@clause) {
         next if ! $c;
@@ -6768,6 +6785,7 @@ sub upgrade {
     );
 
     my @old_columns = (
+        ['bucardo', 'db',    'makedelta'],
         ['bucardo', 'dbmap', 'makedelta'],
         ['bucardo', 'sync',  'disable_rules'],
         ['bucardo', 'sync',  'disable_triggers'],
@@ -7383,7 +7401,7 @@ sub usage_exit {
         '-exitval'  => $exitval,
     );
 
-} ## end of usage
+} ## end of usage_exit
 
 
 sub connect_database {
@@ -7498,7 +7516,7 @@ sub config {
         }
 
         $sth->execute($val,$setting);
-        print qq{Set "$setting" to "$val"\n};
+        $QUIET or print qq{Set "$setting" to "$val"\n};
 
     }
 
@@ -7601,13 +7619,16 @@ sub install {
   GOOEY:
     {
 
-        print "Current connection settings:\n";
+        ## We only don't print this in quiet batch mode
+        if (! $QUIET or ! $bcargs->{batch}) {
+            print "Current connection settings:\n";
 
-        print "1. Host:           $host\n";
-        print "2. Port:           $port\n";
-        print "3. User:           $user\n";
-        print "4. Database:       $dbname\n";
-        print "5. PID directory:  $piddir\n";
+            print "1. Host:           $host\n";
+            print "2. Port:           $port\n";
+            print "3. User:           $user\n";
+            print "4. Database:       $dbname\n";
+            print "5. PID directory:  $piddir\n";
+        }
 
         ## If in batch mode, we accept everything right away and move on
         last GOOEY if $bcargs->{batch};
@@ -7730,7 +7751,9 @@ sub install {
     }
 
     ## Try to connect
-    my $PSQL = "psql -p $port -U $user -d $dbname";
+    my $PSQL = sprintf '%s -p %d -U %s -d %s',
+        $ENV{PGBINDIR} ? "$ENV{PGBINDIR}/psql" : 'psql',
+            $port, $user, $dbname;
     $host !~ /</ and $PSQL .= " --host=$host";
 
     ## We also want the version, so we grab that as the initial connection test
@@ -7761,7 +7784,7 @@ sub install {
     $rev =~ s/^\.//;
     $rev =~ s/(\d+)\.\d+/$1/;
 
-    print "Postgres version is: $maj.$min\n";
+    $QUIET or print "Postgres version is: $maj.$min\n";
 
     ## Bare minimum for the install is 8.1
     if ($maj < 8 or (8 == $maj and $min < 1)) {
@@ -7859,7 +7882,7 @@ sub install {
     }
     $dbh->commit();
 
-    print "Installation is now complete.\n";
+    $QUIET or print "Installation is now complete.\n";
     ## A little less verbose if in batch mode
     if (! $bcargs->{batch}) {
         print "If you see errors or need help, please email bucardo-general\@bucardo.org\n\n";
@@ -8727,7 +8750,7 @@ bucardo - utility script for controlling the Bucardo program
 
 =head1 VERSION
 
-This document describes version 4.99.6 of bucardo
+This document describes version 4.99.7 of bucardo
 
 =head1 USAGE
 
@@ -9222,11 +9245,6 @@ them. Defaults to 1.
 
 The service name to use for a Postgres database. Optional.
 
-=item C<makedelta>
-
-Turns makedelta magic on or off. Value must be one of "on" or "off". Defaults
-to "on".
-
 =back
 
 =head3 add dbgroup
@@ -9279,8 +9297,9 @@ exist, it will be created. Optional.
 
 =item C<makedelta>
 
-Turns makedelta magic on or off. Value must be one of "on" or "off". Defaults
-to "on".
+Turns makedelta magic on or off. Value is a list of databases which need makedelta 
+for this table. Value can also be "on" to enable makedelta for all databases. 
+Defaults to "off".
 
 =back
 
@@ -9849,9 +9868,9 @@ for each type are the same as those for L</add>. The supported types are:
 
 =over
 
-=item C<db>
+=item C<customcode>
 
-=item C<dbgroup>
+=item C<db>
 
 =item C<sync>
 
@@ -10033,10 +10052,6 @@ them.
 
 The service name to use for a Postgres database.
 
-=item C<makedelta>
-
-Turns makedelta magic on or off. Value must be one of "on" or "off".
-
 =item C<group>
 
 A comma-separated list of database groups to which to add the database. The
@@ -10044,17 +10059,6 @@ database will be removed from any other groups of which it was previously a
 member.
 
 =back
-
-=head3 update dbgroup
-
-  bucardo update dbgroup name=newname
-  bucardo update dbgroup db1:source db2:source db3:target ...
-
-Updates a database group. The name can be changed, or the databases in the
-group updated. The database parameters should specify their roles, either
-"source" or "target". If database parameters are specified, they will replace
-the existing list of databases in the group. If you just want to add
-databases, use L<C<add dbgroup>|/add dbgroup> instead.
 
 =head3 update sync
 
@@ -10244,7 +10248,7 @@ The table will be removed from any other relation groups.
 
 =item C<makedelta>
 
-Turns makedelta magic on or off. Value must be one of "on" or "off".
+Specifies which databases need makedelta enabled for this table.
 
 =back
 
@@ -10385,7 +10389,7 @@ Which DDL changing conditions do we try to remedy automatically? Default: C<newc
 
 =item C<bucardo_current_version>
 
-Current version of Bucardo. Default: C<4.99.6>.
+Current version of Bucardo. Default: C<4.99.7>.
 
 =item C<bucardo_vac>
 
@@ -10393,7 +10397,7 @@ Do we want the automatic VAC daemon to run? Default: C<1>.
 
 =item C<bucardo_version>
 
-Bucardo version this schema was created with. Default: C<4.99.6>.
+Bucardo version this schema was created with. Default: C<4.99.7>.
 
 =item C<ctl_checkonkids_time>
 
@@ -10832,7 +10836,7 @@ Bucardo
 
 =head1 COPYRIGHT
 
-Copyright 2006-2012 Greg Sabino Mullane <greg@endpoint.com>
+Copyright 2006-2013 Greg Sabino Mullane <greg@endpoint.com>
 
 This program is free to use, subject to the limitations in the LICENSE file.
 
