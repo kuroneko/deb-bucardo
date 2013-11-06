@@ -22,7 +22,7 @@ $Data::Dumper::Indent = 1;
 use Getopt::Long;
 Getopt::Long::Configure(qw/ no_ignore_case pass_through no_autoabbrev /);
 
-our $VERSION = '4.99.7';
+our $VERSION = '4.99.8';
 
 ## For the tests, we want to check that it compiles without actually doing anything
 return 1 if $ENV{BUCARDO_TEST};
@@ -95,7 +95,7 @@ if (! $bcargs->{'no-bucardorc'}) {
     elsif (-e '.bucardorc') {
         $file = '.bucardorc';
     }
-    elsif (-e "$ENV{HOME}/.bucardorc") {
+    elsif (defined $ENV{HOME} && -e "$ENV{HOME}/.bucardorc") {
         $file = "$ENV{HOME}/.bucardorc";
     }
     elsif (-e '/etc/bucardorc') {
@@ -191,7 +191,7 @@ else {
         $bcargs->{logdest} = [];
     }
     elsif (my $dir = $bcargs->{debugdir}) {
-        # Old --debugdir option determins log directory.
+        # Old --debugdir option determines log directory.
         $bcargs->{logdest} = [$dir];
     }
     else {
@@ -252,6 +252,9 @@ my $adverb;
 
 ## Installation must happen before we try to connect!
 install() if $verb =~ /instal/i;
+
+## Display more detailed help than --help
+superhelp() if $verb eq 'help';
 
 ## For everything else, we need to connect to a previously installed Bucardo database
 
@@ -321,9 +324,6 @@ my $re_dbname = qr{\w[\w\d]*};
 ## Send a ping to the MCP to make sure it is alive and responding
 ping() if $verb eq 'ping';
 
-## Display more detailed help than --help
-superhelp() if $verb eq 'help';
-
 ## Make sure the Bucardo database has the latest schema
 upgrade() if $verb eq 'upgrade' or $verb eq 'uprgade' or $verb eq 'ugprade';
 
@@ -341,7 +341,7 @@ start()         if $verb eq 'start' or $verb eq 'strt';
 restart()       if $verb eq 'restart';
 
 ## Reload the configuration file
-reload_config() if $verb eq 'reload' && $nouns eq 'config';
+reload_config() if $verb eq 'reload' && $nouns[0] eq 'config';
 
 ## Reload the whole daemon
 reload()        if $verb eq 'reload';
@@ -860,7 +860,7 @@ sub reload_config {
     ## If found, set as the adverb.
     ## This will cause us to wait for confirmation or reload before exiting
     for (@nouns) {
-        if (/^\d+$/) {
+        if (/^(\d+)$/) {
             $adverb = $1;
             last;
         }
@@ -887,8 +887,11 @@ sub reload_config {
 
     ## Wait a little bit, then scan for the confirmation message
     sleep 0.1;
-    if (! wait_for_notice($dbh, $done, 5) ) {
-        die "Waited, but Bucardo never confirmed the configuration reload!\n";
+    my $timeout = $adverb || get_config('reload_config_timeout') || 30;
+    if (! wait_for_notice($dbh, $done, $timeout) ) {
+        die "Waited ${timeout}s, but Bucardo never confirmed the configuration reload!\n"
+          . "HINT: Pass a longer timeout to the reload_config command or set the\n"
+          . "reload_config_timeout configuration setting to wait longer\n";
     }
     print "DONE!\n";
 
@@ -904,7 +907,7 @@ sub wait_for_notice {
     ## 1. Database handle
     ## 2. String to listen for
     ## 3. How long to wait (default is forever)
-    ## Returns: undef
+    ## Returns: 1
 
     my ($ldbh, $string, $howlong) = @_;
 
@@ -1023,26 +1026,38 @@ sub validate {
 
     ## Loop through and validate each in turn,
     ## waiting for a positive response from the MCP
+    my $exitval = 0;
     for my $name (@synclist) {
 
-        printf "Validating sync $name%s",
+        printf "Validating sync $name %s ",
             '.' x ($maxsize - length $name);
 
-        my $done = "bucardo_validated_sync_$name";
-        $dbh->do(qq{LISTEN "$done"});
+        my ($evalok, $success);
+        eval {
+            my ($msg) = $dbh->selectrow_array(
+                'SELECT validate_sync(?)',
+                undef, $name
+            );
+            $dbh->commit;
+            if ($msg eq 'MODIFY') {
+                $success = 1;
+            } else {
+                warn "$msg\n";
+                $exitval++;
+            }
+            $evalok = 1;
+        };
 
-        $SQL = 'SELECT validate_sync(?)';
-        $sth = $dbh->prepare($SQL);
-        $sth->execute($name);
-        $dbh->commit();
+        if ($evalok) {
+            print "OK\n" if $success;
+        } else {
+            warn $dbh->errstr || $@;
+            $exitval++;
+        }
 
-        ## Wait a bit, then hang out until the MCP confirms the validation
-        sleep 0.1;
-        wait_for_notice($dbh, $done);
-        print "DONE!\n";
     }
 
-    exit 0;
+    exit $exitval;
 
 } ## end of validate
 
@@ -1466,12 +1481,9 @@ sub add_database {
         ## We put it here as we may move around with the Postgres bucardo user trick
         my ($type,$dsn,$user,$pass) = split /\n/ => $dbconn;
 
-        ## Sometimes we need to adjust the username on the fly and retry
-        my $realuser = $user;
 
         ## Handle all of the ones that do not use standard DBI first
 
-        my @users;
         if ('mongo' eq $dbtype) {
 
             my $dsn = {};
@@ -1514,64 +1526,59 @@ sub add_database {
 
         ## Anything else must be something with a standard DBI driver
         else {
-          DBICONNTEST: {
-              push @users => $user;
-                eval {
-                    $testdbh = DBI->connect($dsn, $user, $pass, {AutoCommit=>0,RaiseError=>1,PrintError=>0});
-                    $evalok = 1;
-                };
-            }
+            eval {
+                $testdbh = DBI->connect($dsn, $user, $pass, {AutoCommit=>0,RaiseError=>1,PrintError=>0});
+                $evalok = 1;
+            };
         }
 
         ## At this point, we have eval'd a connection
-
-        if (! $evalok) {
+        if ($evalok) {
+            ## Disconnect from DBI.
+            $testdbh->disconnect if $module =~ /DBD/;
+        } else {
+            my $err = $DBI::errstr || $@;
+            my $msg;
 
             ## For Postgres, we get a little fancy and try to account for instances
             ## where the bucardo user may not exist yet, by reconnecting and
             ## creating said user if needed.
-            if ('postgres' eq $dbtype and $user eq 'bucardo' and $@ =~ /FATAL.*"bucardo"/) {
-                $user = 'postgres';
-                goto DBICONNTEST;
-            }
+            if ($DBI::errstr && 'postgres' eq $dbtype && $user eq 'bucardo' && eval { require Digest::MD5; 1 }) {
 
-            my $as = join ' or ', @users;
-            if ($bcargs->{force}) {
-                print "Connection to $fullname as $as failed, but will add anyway.\nError was: $@\n\n";
-            }
-            else {
-                die "Connection to $fullname as $as failed. You may force add it with the --force argument. Error was: $@\n\n";
-            }
-        }
-        else {
-
-            ## If we connected twice to Postgres using a different user,
-            ## create the bucardo user now
-            if ('postgres' eq $dbtype and $realuser ne $user) {
-                if (eval { require Digest::MD5; 1 }) {
-                    ## We need a password. If one was not supplied, create one
-                    $evalok = 0;
+                # Try connecting as postgres instead.
+                print "Connection to $fullname as bucardo failed.\nError was: $DBI::errstr\n\n";
+                print qq{Will try to connect as postgres and create superuser $user...\n\n};
+                my $dbh = eval {
+                    DBI->connect($dsn, 'postgres', $pass, {AutoCommit=>1,RaiseError=>1,PrintError=>0});
+                };
+                if ($dbh) {
+                    ## Create the bucardo user now. We'll need a password;
+                    ## create one if we don't have one.
+                    my $connok = 0;
                     eval {
-                        my $newpass = $pass;
-                        if (! length $pass) {
-                            $newpass = generate_password();
-                        }
+                        my $newpass = $pass || generate_password();
                         my $encpass = Digest::MD5::md5_hex($newpass);
-                        $testdbh->do(qq{CREATE USER $realuser SUPERUSER ENCRYPTED PASSWORD '$encpass'});
-                        $testdbh->commit();
-                        my $extrauser = length $pass ? '' : " with password $newpass";
-                        warn "Created superuser '$realuser'$extrauser\n";
-                        $evalok = 1;
+                        $dbh->do(qq{CREATE USER $user SUPERUSER ENCRYPTED PASSWORD '$encpass'});
+                        $dbh->disconnect;
+                        my $extrauser = $pass ? '' : qq{ with password "$newpass"};
+                        warn "Created superuser '$user'$extrauser\n\n";
+                        $pass = $newpass;
+                        $connok = 1;
                     };
-                    if (! $evalok) {
-                        warn "Unable to create superuser $realuser: $@\n";
-                        $bcargs->{force} or exit 1;
-                    }
+                    goto TESTCONN if $connok;
+                    $err = $DBI::errstr || $@;
+                    $msg = "Unable to create superuser $user";
+                } else {
+                    $err = $DBI::errstr || $@;
+                    $msg = 'Connection as postgres failed, too';
                 }
+            } else {
+                $msg = "Connection to $fullname as $user failed";
             }
 
-            ## Disconnect
-            $testdbh->disconnect() if $module =~ /DBD/;
+            die "$msg. You may force add it with the --force argument.\nError was: $err\n\n"
+                unless $bcargs->{force};
+            warn "$msg, but will add anyway.\nError was: $err\n";
         }
 
     } ## end of TESTCONN
@@ -2343,13 +2350,21 @@ sub add_customname {
     usage_exit($doc_section) unless length $item_name && length $newname;
 
     ## Does this number or name exist?
-    if (! exists $GOAT->{$item_name}) {
+    my $goat;
+    if (exists $GOAT->{by_fullname}{$item_name}) {
+        $goat = $GOAT->{by_fullname}{$item_name};
+    }
+    elsif (exists $GOAT->{by_table}{$item_name}) {
+        $goat = $GOAT->{by_table}{$item_name};
+    }
+    elsif (exists $GOAT->{by_id}{$item_name}) {
+        $goat = $GOAT->{by_id}{$item_name};
+    }
+    else {
         print qq{Could not find a matching table for "$item_name"\n};
         exit 1;
     }
 
-    ## Gather the name variations
-    my $goat = $GOAT->{$item_name};
     ## If this is a ref due to it being an unqualified name, just use the first one
     $goat = $goat->[0] if ref $goat eq 'ARRAY';
     my ($sname,$tname) = ($goat->{schemaname},$goat->{tablename});
@@ -2633,6 +2648,86 @@ sub list_customnames {
 
 } ## end of list_customnames
 
+sub find_goat_by_item {
+    ## Finds a goat in the %GOAT hash, using one argument as a search key
+    ## Arguments: name. Can be a goat id or a name, possibly including schema, or wildcards
+    ##            nouns. Ref to array of other args; right now only supports "db=###"
+    ## Results: An array of goat objects that match these keys
+
+    my $name = shift;
+    my $nouns = shift;
+    my @nouns = ( defined $nouns ? @$nouns : ());
+
+    $DEBUG and warn "Finding goats with name $name, noun: " . Dumper(@nouns);
+
+    my @results;
+
+    ## Handle ID values
+    if ($name =~ /^\d+$/) {
+        $DEBUG and warn "\$name is an ID value";
+        push @results, $GOAT->{by_id}{$name};
+    }
+    ## Handle names, with or without schemas, and with or without wildcards
+    else {
+        $DEBUG and warn "\$name is a name value";
+
+        my @found_keys;
+
+        ## Find GOAT keys that may include matches
+        map {
+            if (exists $GOAT->{$_}{$name}) {
+                push @found_keys, [ $_, $name ];
+            }
+        } qw/by_table by_fullname/;
+
+        ## Handle wildcards
+        if (index($name, '*') >= 0 || index($name, '%') >= 0) {
+            my $reg_name = $name;
+
+            ## Change to a regexier form
+            $reg_name =~ s/\./\\./g;
+            $reg_name =~ s/[*%]/\.\*/g;
+            $reg_name = "$reg_name" if $reg_name !~ /^[\^\.\%]/;
+            $reg_name .= '$' if $reg_name !~ /[\$\*]$/;
+            $DEBUG and warn "There's a wildcard here. This is the regex version: $reg_name";
+
+            map {
+                push @found_keys, [ 'by_fullname', $_ ];
+            } grep { /$reg_name/ } keys %{$GOAT->{by_fullname}};
+        }
+
+        ## The found goat keys point to arrayrefs. Turn all that into a
+        ## one-dimensional array of goats
+        $DEBUG and warn "Found these candidate keys: ". Dumper(@found_keys);
+        map {
+            for my $b (@{$GOAT->{$_->[0]}{$_->[1]}}) {
+                push(@results, $b);
+            }
+        } @found_keys;
+        $DEBUG and warn "Here are the goats we've found, before filtering: " . Dumper(@results);
+    }
+
+    if (@results && defined $results[0] && @nouns && defined $nouns[0]) {
+        my @filters = grep(/^(?:db|database)\s*=/, @nouns);
+        if (@filters) {
+            ## The @nouns array will only contain one db= value, even if the command includes several
+            my $db_filter = $filters[0];
+
+            $DEBUG and warn "Database filter starting value: $db_filter";
+            $db_filter =~ /^(?:db|database)\s*=\s*(.+)/;
+            $db_filter = $1;
+            $DEBUG and warn "Database filter value: $db_filter";
+            @results = grep {
+                $DEBUG and warn "Comparing $_->{db} to filter value $db_filter";
+                $_->{db} eq $db_filter;
+            } @results;
+        }
+    }
+
+    $DEBUG and warn "Here are the filtered results: " . Dumper(@results);
+    @results = () if (@results and !defined $results[0]);
+    return @results;
+} ## end of find_goat_by_item
 
 ##
 ## Customcols-related subroutines: add, exists, remove, list
@@ -2658,15 +2753,23 @@ sub add_customcols {
     usage_exit($doc_section) unless length $item_name && length $clause;
 
     ## Does this number or name exist?
-    if (! exists $GOAT->{$item_name}) {
+    my @candidate_goats = find_goat_by_item($item_name, @nouns);
+    if (! @candidate_goats) {
         print qq{Could not find a matching table for "$item_name"\n};
         exit 1;
     }
 
-    ## Gather the name variations
-    my $goat = $GOAT->{$item_name};
-    ## If this is a ref due to it being an unqualified name, just use the first one
-    $goat = $goat->[0] if ref $goat eq 'ARRAY';
+# The code lower in the function is meant to handle multiple matching goats,
+# but if we didn't want that, this would bleat when we ran into multiple goats.
+#    if ($#candidate_goats > 0) {
+#        print qq{Could not uniquely identify the desired table for "$item_name"\n};
+#        print qq{Possible choices:\n};
+#        print "\tdb: $_->{db}\tschema: $_->{schemaname}\ttable: $_->{tablename}\n"
+#            for @candidate_goats;
+#        exit 1;
+#    }
+
+    my $goat = $candidate_goats[0];
     my ($sname,$tname) = ($goat->{schemaname},$goat->{tablename});
 
     ## Make sure the clause looks sane
@@ -2949,11 +3052,12 @@ sub list_customcols {
 ##
 
 sub add_table {
+    my $reltype = shift;
 
-    ## Add one or more tables. Inserts to the bucardo.goat table
+    ## Add one or more tables or sequences. Inserts to the bucardo.goat table
     ## May also update the bucardo.herd and bucardo.herdmap tables
-    ## Arguments: one or more
-    ## 1+ Names of tables to be added
+    ## Arguments: one. Also parses @nouns for table / sequence names
+    ## 1. Type of object to be added: table, or sequence
     ## Returns: undef
     ## Example: bucardo add table pgbench_accounts foo% myschema.abc
 
@@ -2969,6 +3073,7 @@ sub add_table {
         analyze_after_copy       analyze_after_copy   TF               null
         makedelta                makedelta            0                null
         herd|relgroup            herd                 0                skip
+        strict_checking          strict_checking      TF               1
     };
 
     my ( $dbcols, $cols, $phs, $vals, $extra ) = process_simple_args({
@@ -2979,7 +3084,7 @@ sub add_table {
 
     ## Loop through all the args and attempt to add the tables
     ## This returns a hash with the following keys: relations, match, nomatch
-    my $goatlist = get_goat_ids(args => \@nouns, dbcols => $dbcols);
+    my $goatlist = get_goat_ids(args => \@nouns, type => $reltype, dbcols => $dbcols);
 
     ## The final output. Store it up all at once for a single QUIET check
     my $message = '';
@@ -2994,7 +3099,7 @@ sub add_table {
 
     ## Now we need to output which ones were recently added
     if (keys %{ $goatlist->{new} }) {
-        $message .= "Added the following tables:\n";
+        $message .= "Added the following tables or sequences:\n";
         for (sort keys %{ $goatlist->{new} }) {
             $message .= "  $_\n";
         }
@@ -3011,7 +3116,7 @@ sub add_table {
         }
         ## Now load all of these tables into this herd
         $SQL = 'INSERT INTO bucardo.herdmap (herd,priority,goat) VALUES (?,?,'
-            . q{ (SELECT id FROM goat WHERE schemaname||'.'||tablename=? AND db=?))};
+            . qq{ (SELECT id FROM goat WHERE schemaname||'.'||tablename=? AND db=? AND reltype='$reltype'))};
 
         $sth = $dbh->prepare($SQL);
 
@@ -3020,11 +3125,12 @@ sub add_table {
 
         for my $name (sort keys %{ $goatlist->{relations} }) {
             ## Is it already part of this herd?
-            if (exists $HERD->{$herdname}{goat}{$name}) {
+            if (exists $HERD->{$herdname}{goat}{$name} and
+                    $HERD->{$herdname}{goat}{$name}{reltype} eq $reltype) {
                 push @oldnames => $name;
                 next;
             }
-            my $db = $goatlist->{relations}{$name}{goat}{db};
+            my $db = $goatlist->{relations}{$name}{goat}[0]{db};
 
             my $pri = 0;
 
@@ -3034,14 +3140,14 @@ sub add_table {
         }
 
         if (@oldnames) {
-            $message .= qq{The following tables were already in the relgroup "$herdname":\n};
+            $message .= qq{The following tables or sequences were already in the relgroup "$herdname":\n};
             for (@oldnames) {
                 $message .= "  $_\n";
             }
         }
 
         if (@newnames) {
-            $message .= qq{The following tables are now part of the relgroup "$herdname":\n};
+            $message .= qq{The following tables or sequences are now part of the relgroup "$herdname":\n};
             for (sort numbered_relations @newnames) {
                 $message .= "  $_\n";
             }
@@ -3066,19 +3172,31 @@ sub _remove_relation {
     my $doc_section = 'remove';
     usage_exit($doc_section) unless @nouns;
 
+    my $db_filter;
+    for my $name ( @nouns ) {
+        next unless $name =~ /^db=(.*)/;
+        $db_filter = $1;
+    }
+
     ## Prepare our SQL
     $SQL = q{DELETE FROM bucardo.goat WHERE reltype = ? AND schemaname||'.'||tablename = ?};
+    $SQL .= ' AND db = ?' if $db_filter;
     $sth = $dbh->prepare($SQL);
     my @removed;
 
-    for my $name (@nouns) {
+    ## Bucardo won't fully support a table name that starts with "db=". Darn.
+    for my $name (grep { ! /^db=/ } @nouns) {
         if ($name =~ /^\w[\w\d]*\.\w[\w\d]*$/) {
-            if (! exists $GOAT->{$name}) {
+            if (! exists $GOAT->{by_fullname}{$name}) {
                 print qq{No such $reltype: $name\n};
                 next;
             }
             eval {
-                $sth->execute($reltype, $name);
+                if ($db_filter) {
+                    $sth->execute($reltype, $name, $db_filter);
+                } else {
+                    $sth->execute($reltype, $name);
+                }
             };
             if ($@) {
                 die qq{Could not delete $reltype "$name"\n$@\n};
@@ -3093,7 +3211,7 @@ sub _remove_relation {
     if (@removed) {
         print "Removed the following ${reltype}s:\n";
         for my $name (sort numbered_relations @removed) {
-            print qq{  $name\n};
+            print qq{  $name} . ($db_filter ? " (DB: $db_filter)" : '') . "\n";
         }
     }
 
@@ -3141,31 +3259,31 @@ sub update_table {
     exit 0 if ! check_recurse($GOAT, $name, @actions);
 
     ## Make sure this table exists!
-    my $table = $GOAT->{$name} or die qq{Could not find a table named "$name"\n}
-        . "Use 'list tables' to see all available.\n";
+    my @tables = find_goat_by_item($name, \@nouns);
 
-    ## If this is an array, then see how many matches we have
-    if (ref $table eq 'ARRAY') {
-        my $matches = @$table;
-        if ($matches > 1) {
-            die qq{More than one matching table: please use a schema\n};
-        }
-        $table = $table->[0];
+    if (!@tables) {
+        die qq{Didn't find any matching tables\n};
     }
+    ## If this is an array, then see how many matches we have
+    if ($#tables > 0) {
+        die qq{More than one matching table: please use a schema\n};
+    }
+    my $table = $tables[0];
 
     ## Store the id so we work with that alone whenever possible
     my $id = $table->{id};
 
-    ## Everything is a name=value setting after this point
+    ## Everything is a name=value setting after this point, except stuff that
+    ##   matches /^db=/
     ## We will ignore and allow noise word "set"
-    for my $arg (@actions) {
+    for my $arg (grep { ! /^db=/ } @actions) {
         next if $arg =~ /set/i;
         next if $arg =~ /\w+=\w+/o;
         usage_exit($doc_section);
     }
 
     ## Change the arguments into a hash
-    my $args = process_args(join ' ' => @actions);
+    my $args = process_args(join ' ' => ( grep { ! /^db=/ } @actions));
 
     ## Track what changes we made
     my %change;
@@ -3322,7 +3440,8 @@ sub list_tables {
     ## If not doing all, keep track of which to show
     my %matchtable;
 
-    for my $term (@nouns) {
+    my @filters = grep { /^db=/ } @nouns;
+    for my $term (grep { ! /^db=/ } @nouns) {
 
         ## Special case for all: same as no nouns at all, so simply remove them!
         if ($term =~ /\ball\b/i) {
@@ -3331,18 +3450,7 @@ sub list_tables {
             last;
         }
 
-        ## Check for wildcards
-        if ($term =~ s/[*%]/.*/) {
-            for my $id (keys %$TABLE) {
-                $matchtable{$id} = 1 if $TABLE->{$id}{tablename} =~ /^$term$/;
-            }
-            next;
-        }
-
-        ## Must be an exact match
-        for my $id (keys %$TABLE) {
-            $matchtable{$id} = 1 if $TABLE->{$id}{tablename} eq $term;
-        }
+        map { $matchtable{$_->{id}} = 1; } find_goat_by_item($term, \@filters);
 
     } ## end each term
 
@@ -3450,9 +3558,9 @@ sub add_herd {
 
     ## Now we need to output which ones were recently added
     if (keys %{ $goatlist->{new} }) {
-        $message .= "Added the following tables:\n";
+        $message .= "Added the following tables or sequences:\n";
         for (sort keys %{ $goatlist->{new} }) {
-            $message .= "  $_\n";
+            $message .= "  $_ (DB: $goatlist->{relations}{$_}{goat}[0]{db})\n";
         }
     }
 
@@ -3471,24 +3579,31 @@ sub add_herd {
             push @oldnames => $name;
             next;
         }
-        my $db = $goatlist->{relations}{$name}{goat}{db};
 
-        my $pri = 0;
+        my @a;
+        eval {
+            @a = @{$goatlist->{relations}{$name}{goat}};
+        };
+        for my $tmpgoat (@a) {
+            my $db = $tmpgoat->{db};
 
-        $count = $sth->execute($herdname,$pri,$name, $db);
+            my $pri = 0;
 
-        push @newnames => $name;
+            $count = $sth->execute($herdname,$pri,$name, $db);
+
+            push @newnames => $name;
+        }
     }
 
     if (@oldnames) {
-        $message .= qq{The following tables were already in the relgroup "$herdname":\n};
+        $message .= qq{The following tables or sequences were already in the relgroup "$herdname":\n};
         for (@oldnames) {
             $message .= "  $_\n";
         }
     }
 
     if (@newnames) {
-        $message .= qq{The following tables are now part of the relgroup "$herdname":\n};
+        $message .= qq{The following tables or sequences are now part of the relgroup "$herdname":\n};
         for (@newnames) {
             $message .= "  $_\n";
         }
@@ -3629,6 +3744,7 @@ sub add_sync {
         kidsalive                kidsalive            TF               null
         autokick|ping            autokick             TF               null
         checktime                checktime            interval         null
+        strict_checking          strict_checking      TF               1
         status                   status               =active|inactive null
         conflict_strategy|standard_conflict conflict_strategy  0       null
         priority                 priority             numeric          null
@@ -3639,6 +3755,7 @@ sub add_sync {
         onetimecopy              onetimecopy          =0|1|2           null
         lifetime                 lifetime             interval         null
         maxkicks                 maxkicks             numeric          null
+        isolation_level|txnmode  isolation_level      0                null
         rebuild_index|rebuildindex   rebuild_index    numeric          null
         tables                   tables               0                skip
     };
@@ -3653,6 +3770,10 @@ sub add_sync {
             value => 'fullcopy',
             new_defaults => 'autokick|F stayalive|F kidsalive|F',
         },
+        {
+            field => 'isolation_level',
+            dash_to_white => 1,
+        }
     ];
 
     my ( $dbcols, $cols, $phs, $vals ) = process_simple_args({
@@ -3680,7 +3801,7 @@ sub add_sync {
     if ($dbcols->{herd} =~ /,/) {
         my @tables = split /\s*,\s*/ => $dbcols->{herd};
         for my $table (sort @tables) {
-            if (! exists $global{goat}{$table}) {
+            if (! exists $global{goat}{by_fullname}{$table}) {
                 die "No such table or sequence: $table\n";
             }
         }
@@ -3691,7 +3812,7 @@ sub add_sync {
             my $schema = 'public';
 
             ## Maybe it's a table?
-            if (! exists $global{goat}{$name}) {
+            if (! exists $global{goat}{by_fullname}{$name}) {
                 warn "No such relgroup or table: $name\n";
                 warn "To list all relgroups, use: list relgroups\n";
                 warn "To list all tables, use: list tables\n";
@@ -3998,7 +4119,10 @@ sub update_sync {
                 die "Invalid setting: $setting\n";
             }
 
-            ## Normalize things like t/f 0/1 others?
+            ## Do any magic we need
+            if ($setting eq 'isolation_level') {
+                $value =~ s/_/ /g;
+            }
 
             ## Try setting it
             $SQL = "UPDATE sync SET $setting=? WHERE name = ?";
@@ -4157,6 +4281,7 @@ sub get_goat_ids {
     ## Also checks the live database and adds tables to the goat table as needed.
     ## Arguments: key-value pairs:
     ##  - args: arrayref of names to match against. Can have wildcards.
+    ##  - type: 'table' or 'sequence', depending on what we expect to find.
     ##  - dbcols: optional hashref of fields to populate goat table with (e.g. autokick=1)
     ## Returns: a hash with:
     ##  - relations: hash of goat objects, key is the fully qualified name
@@ -4167,6 +4292,7 @@ sub get_goat_ids {
     ##  - new: hash of newly added tables
 
     my %arg = @_;
+    my $reltype = $arg{type};
     my $names = $arg{args} or die;
     my $dbcols = $arg{dbcols} || {};
 
@@ -4197,13 +4323,18 @@ sub get_goat_ids {
 
     ## SQL to find a table or a sequence
     ## We do not want pg_table_is_visible(c.oid) here
-    my $BASESQL = q{
+    my $BASESQL = sub {
+        my $arg = shift || 'table';
+            ## Assume we're talking about tables unless we say "sequence" explicitly
+        my $type = ( $arg eq 'sequence' ? 'S' : 'r' );
+        return qq{
 SELECT nspname||'.'||relname AS name, relkind, c.oid
 FROM pg_class c
 JOIN pg_namespace n ON (n.oid = c.relnamespace)
-WHERE relkind IN ('r')
+WHERE relkind IN ('$type')
 AND nspname <> 'information_schema'
 AND nspname !~ '^pg_'
+};
 };
 
     ## Loop through each argument, and try and find matching goats
@@ -4223,86 +4354,64 @@ AND nspname !~ '^pg_'
         my @matches;
 
         ## A list of tables to be bulk added to the goat table
-        my %addtable;
+        my @addtable;
 
         ## We may mutate the arg, so stow away the original
         my $original_item = $item;
 
-        ## On the first pass, we look for matches in the existing $GOAT hash
+        ## We look for matches in the existing $GOAT hash
         ## We may also check the live database afterwards
+        map {
+            push @matches, $_ if (! defined $reltype || $_->{reltype} eq $reltype);
+        } find_goat_by_item($item, \@nouns);
 
         ## Wildcards?
+        my $regex_item = $item;
+
+        ## Setup the SQL to search the live database
         if ($hasstar) {
-
             ## Change to a regexier form
-            $item =~ s/\./\\./g;
-            $item =~ s/[*%]/\.\*/g;
-            $item = "^$item" if $item !~ /^[\^\.\%]/;
-            $item .= '$' if $item !~ /[\$\*]$/;
-            ## Pull back all items from the GOAT hash that have a dot in them
-            for my $fullname (grep { /\./ } keys %{ $GOAT }) {
-
-                ## We match against the whole thing if we have a dot
-                ## in our search term, otherwise we only match the table
-                my $searchname = $fullname;
-                if (! $hasadot) {
-                    (undef,$searchname) = split /\./ => $fullname;
-                }
-
-                ## If we got a match, store the item from the GOAT that caused it
-                if ($searchname =~ /^$item$/) {
-                    push @matches => $fullname;
-                }
-            }
+            $regex_item =~ s/\./\\./g;
+            $regex_item =~ s/[*%]/\.\*/g;
+            $regex_item = "^$regex_item" if $regex_item !~ /^[\^\.\%]/;
+            $regex_item .= '$' if $regex_item !~ /[\$\*]$/;
 
             ## Setup the SQL to search the live database
-            $SQL = $BASESQL . ($hasadot
+            $SQL = $BASESQL->($reltype) . ($hasadot
                 ? q{AND nspname||'.'||relname ~ ?}
                 : 'AND relname ~ ?');
 
         } ## end wildcards
-
-        ## A dot with no wildcards: exact match
-        ## TODO: Allow foobar. to mean foobar.% ??
         elsif ($hasadot) {
-
-            if (exists $GOAT->{$item}) {
-                push @matches => $item;
-            }
-
-            ## Setup the SQL to search the live database
-            $SQL = $BASESQL . q{AND nspname||'.'||relname = ?};
+            ## A dot with no wildcards: exact match
+            ## TODO: Allow foobar. to mean foobar.% ??
+            $SQL = $BASESQL->($reltype) . q{AND nspname||'.'||relname = ?};
         }
-
-        ## No wildcards and no dot, so we match all tables regardless of the schema
         else {
-
-            ## Pull back all items from the GOAT hash that have a dot in them
-            for my $fullname (grep { /\./ } keys %{ $GOAT }) {
-                my ($schema,$table) = split /\./ => $fullname;
-                if ($table eq $item) {
-                    push @matches => $fullname;
-                }
-            }
-
-            ## Setup the SQL to search the live database
-            $SQL = $BASESQL . 'AND relname = ?';
+            ## No wildcards and no dot, so we match all tables regardless of the schema
+            $SQL = $BASESQL->($reltype) . 'AND relname = ?';
         }
 
         ## We do not check the live database if the match was exact
         ## *and* something was found. In all other cases, we go live.
         if ($hasstar or !$hasadot or !@matches) {
+            debug(qq{NB! Found some existing matches; searching for other possibilities, because "$item" }
+                . ( $hasstar ? "includes wildcard characters " : '' )
+                . ( !$hasadot ? "doesn't include a dot" : '' )) if @matches;
             ## Search the live database for matches
             $sth = $rdbh->prepare($SQL);
-            ($count = $sth->execute($item)) =~ s/0E0/0/;
+            $regex_item ||= $item;
+            ($count = $sth->execute($regex_item)) =~ s/0E0/0/;
             debug(qq{Searched live database "$bestdb" for arg "$item", count was $count});
+            debug(qq{SQL: $SQL}, 2);
+            debug(qq{Arg: $item ($regex_item)}, 2);
             for my $row (@{ $sth->fetchall_arrayref({}) }) {
 
                 ## The 'name' is combined "schema.relname"
                 my $name = $row->{name};
 
                 ## Don't bother if we have already added this!
-                next if exists $GOAT->{$name};
+                next if find_goat_by_item($row->{name}, [ "db=$bestdb" ]);
 
                 ## Document the string that led us to this one
                 $relation{$name}{original}{$item}++;
@@ -4314,23 +4423,44 @@ AND nspname !~ '^pg_'
                 $match{$item}++;
 
                 ## Set this table to be added to the goat table below
-                $addtable{$name} = {db => $bestdb, reltype => $row->{relkind}, dbcols => $dbcols};
+                push @addtable, {name => $name, db => $bestdb, reltype => $row->{relkind}, dbcols => $dbcols};
 
                 ## Add this to our matching list
-                push @matches => $name;
+                # This happens after add_items_to_goat_table now
+                #push @matches => $name;
 
             }
         }
 
         ## Add all the tables we just found from searching the live database
-        if (keys %addtable) {
-            add_items_to_goat_table(\%addtable);
+        my $added_tables;
+        if (@addtable) {
+            $added_tables = add_items_to_goat_table(\@addtable);
+        }
+        for my $tmp (@$added_tables) {
+            push @matches, $GOAT->{by_id}{$tmp};
         }
 
         ## Populate the final hashes based on the match list
-        for my $name (@matches) {
+        for my $match (@matches) {
+            next unless defined $match;
+            my $name;
+            if (ref $match eq 'HASH') {
+                $name = "$match->{schemaname}.$match->{tablename}";
+            }
+            else {
+                $name = $match;
+            }
             $relation{$name}{original}{$original_item}++;
-            $relation{$name}{goat} ||= $GOAT->{$name};
+
+            ## This goat entry should be an array, if there are multiple goats
+            ## with that name (e.g. from different databases)
+            if (exists $relation{$name}{goat}) {
+                push @{$relation{$name}{goat}}, $match;
+            }
+            else {
+                $relation{$name}{goat} = [ $match ];
+            }
             $match{$item}++;
         }
 
@@ -4355,7 +4485,8 @@ sub add_items_to_goat_table {
 
     ## Given a list of tables, add them to the goat table as needed
     ## Arguments: one
-    ## 1. Hashref where keys are the relnames, and values are additional info:
+    ## 1. Arrayref where keys are:
+    ##   - name: name of relation to add (mandatory)
     ##   - db: the database name (mandatory)
     ##   - reltype: table or sequence (optional, defaults to table)
     ##   - dbcols: optional hashref of goat columns to set
@@ -4372,26 +4503,27 @@ sub add_items_to_goat_table {
 
     my @newid;
 
-    for my $name (sort keys %$info) {
+    for my $rel (sort { $a->{name} cmp $b->{name} } @$info) {
+        my $name = $rel->{name};
         if ($name !~ /^([\w ]+)\.([\w ]+)$/o) {
             die qq{Invalid name, got "$name", but expected format "schema.relname"};
         }
         my ($schema,$table) = ($1,$2);
 
-        my $db = $info->{$name}{db} or die q{Must provide a database};
+        my $db = $rel->{db} or die q{Must provide a database};
 
-        my $reltype = $info->{$name}{reltype} || 't';
+        my $reltype = $rel->{reltype} || 't';
         $reltype = $reltype =~ /s/i ? 'sequence' : 'table';
 
         ## Adjust the SQL as necessary for this goat
         $SQL = $NEWGOATSQL;
         my @args = ($schema, $table, $reltype, $db);
-        if (exists $info->{$name}{dbcols}) {
-            for my $newcol (sort keys %{ $info->{$name}{dbcols} }) {
+        if (exists $rel->{dbcols}) {
+            for my $newcol (sort keys %{ $rel->{dbcols} }) {
                 next if $newcol eq 'db';
                 $SQL =~ s/\)/,$newcol)/;
                 $SQL =~ s/\?,/?,?,/;
-                push @args => $info->{$name}{dbcols}{$newcol};
+                push @args => $rel->{dbcols}{$newcol};
             }
         }
         $sth = $dbh->prepare($SQL);
@@ -4405,15 +4537,15 @@ sub add_items_to_goat_table {
     ## Update the global
     load_bucardo_info('force_reload');
 
-    ## Return a list of goat objects
-    my %newlist;
-    for my $id (@newid) {
-        my $goat = $global{goat}{$id};
-        my $name = "$goat->{schemaname}.$goat->{tablename}";
-        $newlist{$name} = $goat;
-    }
+    ## Return a list of goat IDs we've just added
+#    my %newlist;
+#    for my $id (@newid) {
+#        my $goat = $global{goat}{by_id}{$id};
+#        my $name = "$goat->{schemaname}.$goat->{tablename}";
+#        $newlist{$name} = $goat;
+#    }
 
-    return \%newlist;
+    return \@newid;
 
 
 } ## end of add_items_to_goat_table
@@ -5143,7 +5275,7 @@ AND (   lastgood  IS TRUE
             my $highepoch = 0;
             undef $s->{latestrow};
             my $wintype;
-            for my $type (qw/ bad good /) {
+            for my $type (qw/ bad good empty /) {
                 my $r = $s->{"row$type"};
                 next if ! defined $r;
                 my $etime = $r->{ended_epoch};
@@ -5158,10 +5290,12 @@ AND (   lastgood  IS TRUE
                 $max{state} = length($s->{state}) if length($s->{state}) > $max{state};
                 next;
             }
-            $s->{state} =
-                $wintype eq 'empty' ? 'Empty'
-                : $wintype eq 'bad' ? 'Bad'
-                : 'Good';
+            if ($wintype eq 'empty') {
+                # Empty is good, as far as status is concerned.
+                $s->{rowgood} = $s->{latestrow};
+                $wintype = 'good';
+            }
+            $s->{state} = ucfirst $wintype;
         }
 
         ## deletes/inserts/truncates/conflicts
@@ -5266,7 +5400,7 @@ sub inspect_table {
             ## Make sure that each herd with this table also has this new table
             my $ggoat = $global{goat};
             my $hherd = $global{herd};
-            for my $herd (sort keys %{$ggoat->{$id}{herd}}) {
+            for my $herd (sort keys %{$ggoat->{by_id}{$id}{herd}}) {
                 $seenit{fktable} = 1;
                 next if exists $hherd->{$herd}{hasgoat}{$schema}{$table};
                 printf "Table %s.%s is in relgroup %s, but %s.%s (used as FK%s) is not\n",
@@ -6507,7 +6641,7 @@ sub constraint_definition {
 
     ## Do some cleanups to standardize across versions and match bucardo.schema cleanly
     $def =~ s/\((\(.+\))\)/$1/;
-    $def =~ s/\"?(\w+)\"? = ANY \(ARRAY\[(.+)\]\)/$1 IN ($2)/;
+    $def =~ s/= ANY \(ARRAY\[(.+)\]\)/IN ($1)/;
     $def =~ s/<> ALL \(ARRAY\[(.+)\]\)/NOT IN ($1)/;
     $def =~ s/::text//g;
     $def =~ s/(\w+) ~ '/$1 ~ E'/g;
@@ -7244,6 +7378,8 @@ sub upgrade {
             next;
         }
 
+##CHECK ((isolation_level IS NULL) OR (lower(isolation_level) = ANY (ARRAY['serializable', 'repeatable read']))) vs CHECK (isolation_level IS NULL OR (LOWER(isolation_level) IN ('serializable', 'repeatable read')))
+
         ## Clean up the constraint to make it match what comes back from the database:
         $cdef =~ s/;$//;
         $cdef =~ s/','/', '/g;
@@ -7256,6 +7392,7 @@ sub upgrade {
             upgrade_and_log("ALTER TABLE $tcname DROP CONSTRAINT $cname");
             upgrade_and_log("ALTER TABLE $tcname ADD CONSTRAINT $cname $cdef");
             clog "Altered constraint $cname on $tcname";
+            clog "$condef vs\n$cdef";
             $changes++;
         }
     }
@@ -7904,13 +8041,17 @@ sub install {
 sub debug {
 
     ## Print a debug line if needed
-    ## Arguments: one
+    ## Arguments: one or two
     ## 1. String to be printed
+    ## 2. Required debug level: defaults to 1
     ## Returns: undef
 
     return if ! $DEBUG;
 
     my $string = shift;
+    my $level = shift || 1;
+
+    return if $DEBUG < $level;
 
     chomp $string;
 
@@ -8096,11 +8237,15 @@ sub process_simple_args {
         for my $mline (@{$arg->{morph}}) {
             if (exists $mline->{field}) {
                 next unless exists $dbcol{$mline->{field}};
-                next if $dbcol{$mline->{field}} ne $mline->{value};
-                for my $change (split /\s+/ => $mline->{new_defaults}) {
-                    my ($f,$v) = split /\|/ => $change;
-                    next if exists $dbcol{$f};
-                    $dbcol{$f} = $v;
+                if (exists $mline->{new_defaults}) {
+                    for my $change (split /\s+/ => $mline->{new_defaults}) {
+                        my ($f,$v) = split /\|/ => $change;
+                        next if exists $dbcol{$f};
+                        $dbcol{$f} = $v;
+                    }
+                }
+                if (exists $mline->{dash_to_white}) {
+                    $dbcol{$mline->{field}} =~ s/_/ /g;
                 }
             }
             else {
@@ -8223,7 +8368,6 @@ sub extract_name_and_role {
 
 
 sub load_bucardo_info {
-
     ## Load of all information from the database into global hashes
     ## Arguments: one
     ## 1. Boolean: if true, force run even if we've run once already
@@ -8274,15 +8418,32 @@ sub load_bucardo_info {
     $SQL = 'SELECT * FROM bucardo.goat';
     $sth = $dbh->prepare($SQL);
     $sth->execute();
-    my $goat = $sth->fetchall_hashref('id');
-    ## Since relations cannot start with a number, we can also safely add the name to the hash
-    for my $key (%$goat) {
+
+    my $goat;
+    $goat->{by_id} = $sth->fetchall_hashref('id');
+    $goat->{by_table} = {};
+
+    for my $key (%{$goat->{by_id}}) {
         next if $key !~ /^\d/;
-        my $tname = $goat->{$key}{tablename};
-        my $name = "$goat->{$key}{schemaname}.$tname";
-        $goat->{$name} = $goat->{$key};
+        my $tname = $goat->{by_id}{$key}{tablename};
+        my $name = "$goat->{by_id}{$key}{schemaname}.$tname";
+        my $dbname = $goat->{by_id}{$key}{db};
+
+        ## Index by database, so different databases containing matching object
+        ##   names can be handled
+        $goat->{by_db}{$dbname}{$name} = $goat->{by_id}{$key};
+
+        ## Index by full object name
+        if (! exists $goat->{by_fullname}{$name}) {
+            $goat->{by_fullname}{$name} = [ $goat->{by_id}{$key} ];
+        }
+        else {
+            push @{$goat->{by_fullname}{$name}}, $goat->{by_id}{$key};
+        }
+
         ## Also want a table-only version:
-        push @{$goat->{$tname}} => $goat->{$key};
+        $goat->{by_table}{$tname} = [] unless exists $goat->{by_table}{$tname};
+        push @{$goat->{by_table}{$tname}} => $goat->{by_id}{$key};
     }
 
     ## Grab all herd information
@@ -8297,18 +8458,18 @@ sub load_bucardo_info {
     $sth->execute();
     for my $row (@{$sth->fetchall_arrayref({})}) {
         my ($g,$h,$p) = @$row{qw/goat herd priority/};
-        $goat->{$g}{herd}{$h} = $p;
-        $herd->{$h}{goat}{"$goat->{$g}{schemaname}.$goat->{$g}{tablename}"} = {
+        $goat->{by_id}{$g}{herd}{$h} = $p;
+        $herd->{$h}{goat}{"$goat->{by_id}{$g}{schemaname}.$goat->{by_id}{$g}{tablename}"} = {
             id       => $g,
             priority => $p,
-            reltype  => $goat->{$g}{reltype},
-            schema   => $goat->{$g}{schemaname},
-            table    => $goat->{$g}{tablename},
+            reltype  => $goat->{by_id}{$g}{reltype},
+            schema   => $goat->{by_id}{$g}{schemaname},
+            table    => $goat->{by_id}{$g}{tablename},
         };
-        my ($s,$t) = @{$goat->{$g}}{qw/schemaname tablename/};
+        my ($s,$t) = @{$goat->{by_id}{$g}}{qw/schemaname tablename/};
         $herd->{$h}{hasgoat}{$s}{$t} = $p;
         ## Assign each herd to a datbase via its included goats
-        $herd->{$h}{db} = $goat->{$g}{db};
+        $herd->{$h}{db} = $goat->{by_id}{$g}{db};
     }
 
     ## Grab all sync information
@@ -8331,7 +8492,7 @@ sub load_bucardo_info {
         }
         ## Note which syncs are used by each goat
         for my $row2 (sort keys %{$row->{herd}{goat}}) {
-            $goat->{$row2}{sync}{$name} = 1;
+            $goat->{by_id}{$row2}{sync}{$name} = 1;
         }
     }
 
@@ -8405,15 +8566,15 @@ JOIN goat g ON (g.id = c.goat)
     $global{sync}    = $SYNC = $sync;
 
     ## Separate goat into tables and sequences
-    for my $id (keys %$GOAT) {
+    for my $id (keys %{$GOAT->{by_id}}) {
         ## Ids only please
         next if $id !~ /^\d+$/;
-        my $type = $GOAT->{$id}{reltype};
+        my $type = $GOAT->{by_id}{$id}{reltype};
         if ($type eq 'table') {
-            $TABLE->{$id} = $GOAT->{$id};
+            $TABLE->{$id} = $GOAT->{by_id}{$id};
         }
         elsif ($type eq 'sequence') {
-            $SEQUENCE->{$id} = $GOAT->{$id};
+            $SEQUENCE->{$id} = $GOAT->{by_id}{$id};
         }
         else {
             die "Unknown relation type $type!";
@@ -8750,7 +8911,7 @@ bucardo - utility script for controlling the Bucardo program
 
 =head1 VERSION
 
-This document describes version 4.99.7 of bucardo
+This document describes version 4.99.8 of bucardo
 
 =head1 USAGE
 
@@ -9123,8 +9284,6 @@ include:
 
 =item C<customcols>
 
-=item C<customcols>
-
 =back
 
 =head3 add db
@@ -9247,6 +9406,13 @@ The service name to use for a Postgres database. Optional.
 
 =back
 
+B<Note:> As a convenience, if the C<dbuser> value is its default value,
+"bucardo", in the event that Bucardo cannot connect to the database, it will
+try connecting as "postgres" and create a superuser named "bucardo". This is
+to make things easier for folks getting started with Bucardo, but will not
+work if it cannot connect as "postgres", or if it the connection failed due to
+an authentication failure.
+
 =head3 add dbgroup
 
   bucardo add dbgroup name db1:source db2:source db3:target ...
@@ -9300,6 +9466,14 @@ exist, it will be created. Optional.
 Turns makedelta magic on or off. Value is a list of databases which need makedelta 
 for this table. Value can also be "on" to enable makedelta for all databases. 
 Defaults to "off".
+
+=item C<strict_check>
+
+Boolean indicating whether or not to be strict when comparing the table
+between syncs. If the columns have different names or data types, the
+validation will fail. But perhaps the columns are allowed to have different
+names or data types. If so, disable C<strict_check> and column diffrences will
+result in warnings rather than failing the validation. Defaults to true.
 
 =back
 
@@ -9582,6 +9756,14 @@ Boolean indicating whether or not to track synchronization rates.
 
 Boolean indicating whether or not to rebuild indexes after every sync. Off by
 default. Optional.
+
+=item C<strict_check>
+
+Boolean indicating whether or not to be strict when comparing tables in the
+sync. If the columns have different names or data types, the validation will
+fail. But perhaps the columns are allowed to have different names or data
+types. If so, disable C<strict_check> and column diffrences will result in
+warnings rather than failing the validation. Defaults to true.
 
 =back
 
@@ -9910,8 +10092,6 @@ Number indicating the priority in which order to execute custom codes. Lower num
 are higher priority. Useful for subroutines that set C<lastcode> in order to
 cancel the execution of subsequent custom codes for the same C<when_run>.
 
-=back
-
 =item C<status>
 
 The current status of this customcode. Anything other than "active" means the
@@ -9946,6 +10126,8 @@ A string indicating when the custom code should be run. Supported values include
 =item C<before_sync>
 
 =item C<after_sync>
+
+=back
 
 =back
 
@@ -10071,7 +10253,7 @@ what to replicate from where to where. The supported parameters are:
 
 =item C<name>
 
-The name of the sync.
+The name of the sync. Required.
 
 =item C<dbs>
 
@@ -10084,7 +10266,10 @@ The name of a relation group to synchronize.
 =item C<status>
 
 Indicates whether or not the sync is active. Must be either "active" or
-"inactive".
+"inactive". Note that this will not change the current run status of the sync,
+just mark whether it should be active or inactive on the next reload. Use the
+C<activate sync> and <deactivate sync> commands to actually activate or
+deactivate a sync.
 
 =item C<rebuild_index>
 
@@ -10097,6 +10282,11 @@ Number of seconds a KID can live before being reaped.
 =item C<maxkicks>
 
 Number of times a KID may be kicked before being reaped.
+
+=item C<isolation_level>
+
+The transation isolation level this sync should use.
+Only choices are "serializable" and "repeatable read"
 
 =item C<conflict_strategy>
 
@@ -10199,6 +10389,14 @@ Boolean indicating whether or not to track synchronization rates.
 
 Boolean indicating whether or not to rebuild indexes after every sync.
 
+=item C<strict_check>
+
+Boolean indicating whether or not to be strict when comparing tables in the
+sync. If the columns have different names or data types, the validation will
+fail. But perhaps the columns are allowed to have different names or data
+types. If so, disable C<strict_check> and column diffrences will result in
+warnings rather than failing the validation. Defaults to true.
+
 =back
 
 =head3 update table
@@ -10249,6 +10447,14 @@ The table will be removed from any other relation groups.
 =item C<makedelta>
 
 Specifies which databases need makedelta enabled for this table.
+
+=item C<strict_check>
+
+Boolean indicating whether or not to be strict when comparing the table
+between syncs. If the columns have different names or data types, the
+validation will fail. But perhaps the columns are allowed to have different
+names or data types. If so, disable C<strict_check> and column diffrences will
+result in warnings rather than failing the validation. Defaults to true.
 
 =back
 
@@ -10389,7 +10595,7 @@ Which DDL changing conditions do we try to remedy automatically? Default: C<newc
 
 =item C<bucardo_current_version>
 
-Current version of Bucardo. Default: C<4.99.7>.
+Current version of Bucardo. Default: C<4.99.8>.
 
 =item C<bucardo_vac>
 
@@ -10397,7 +10603,7 @@ Do we want the automatic VAC daemon to run? Default: C<1>.
 
 =item C<bucardo_version>
 
-Bucardo version this schema was created with. Default: C<4.99.7>.
+Bucardo version this schema was created with. Default: C<4.99.8>.
 
 =item C<ctl_checkonkids_time>
 
@@ -10442,6 +10648,11 @@ Directory to store the flatfile output inside of. Default: C<.>.
 =item C<host_safety_check>
 
 Regex to make sure we don't accidentally run where we should not. Default: None.
+
+=item C<isolation_level>
+
+The transaction isolation level all sync should use. Defaults to 'serializable'. 
+The only other valid option is 'repeatable read'
 
 =item C<kid_deadlock_sleep>
 
@@ -10520,6 +10731,11 @@ Directory holding Bucardo PID files. Default: C</var/run/bucardo>.
 =item C<reason_file>
 
 File to hold reasons for stopping and starting. Default: C<bucardo.restart.reason.txt>.
+
+=item C<reload_config_timeout>
+
+Number of seconds the C<reload_config> command should wait for the reload to complete.
+Default: C<30>.
 
 =item C<semaphore_table>
 
@@ -10612,7 +10828,8 @@ The name of the sync
 
 =item 2. B<State>
 
-The state of the sync. Can be 'Good', 'Bad', 'Empty', or 'No records found'
+The state of the sync. Can be 'Good', 'Bad', 'Empty', 'No records found',
+'Unknown', or the run state for a currently-running sync.
 
 =item 3. B<Last good>
 
@@ -10712,6 +10929,9 @@ C<STDOUT>. The supported types include:
 
 Validates one or more syncs. Use the keyword "all" to validate all syncs, or
 specify one or more syncs to validate.
+
+Note that this command executes a subset of all the validation done when a
+sync is started or activated.
 
 =head2 purge
 

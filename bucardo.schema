@@ -1,6 +1,6 @@
 
 -- Schema for the main Bucardo database
--- Version 4.99.7
+-- Version 4.99.8
 
 -- Should be run as a superuser
 -- This should not need to be run directly: use either
@@ -124,6 +124,7 @@ ctl_createkid_time|0.5|How long do we sleep to allow kids-on-demand to get on th
 tcp_keepalives_idle|0|How long to wait between each keepalive probe.
 tcp_keepalives_interval|0|How long to wait for a response to a keepalive probe.
 tcp_keepalives_count|0|How many probes to send. 0 indicates sticking with system defaults.
+reload_config_timeout|30|How long to wait for reload_config to finish.
 \.
 
 
@@ -145,8 +146,8 @@ warning_file|bucardo.warning.log|File containing all log lines starting with "Wa
 COPY bucardo.bucardo_config(name,setting,about)
 FROM STDIN
 WITH DELIMITER '|';
-bucardo_version|4.99.7|Bucardo version this schema was created with
-bucardo_current_version|4.99.7|Current version of Bucardo
+bucardo_version|4.99.8|Bucardo version this schema was created with
+bucardo_current_version|4.99.8|Current version of Bucardo
 \.
 
 -- Other settings:
@@ -161,6 +162,7 @@ default_conflict_strategy|bucardo_latest|Default conflict strategy for all syncs
 email_debug_file||File to save a copy of all outgoing emails to
 flatfile_dir|.|Directory to store the flatfile output inside of
 host_safety_check||Regex to make sure we don't accidentally run where we should not
+isolation_level|repeatable read|Default isolation level: can be serializable or repeatable read
 piddir|/var/run/bucardo|Directory holding Bucardo PID files
 reason_file|bucardo.restart.reason.txt|File to hold reasons for stopping and starting
 semaphore_table|bucardo_status|Table to let apps know a sync is ongoing
@@ -206,6 +208,7 @@ ALTER TABLE bucardo.db ADD CONSTRAINT db_status CHECK (status IN ('active','inac
 CREATE TABLE bucardo.dbgroup (
   name      TEXT        NOT NULL,
               CONSTRAINT dbgroup_name_pk PRIMARY KEY (name),
+  about     TEXT            NULL,
   cdate     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE bucardo.dbgroup IS $$Named groups of databases: used as 'targetgroup' for syncs$$;
@@ -309,6 +312,7 @@ CREATE UNIQUE INDEX bucardo_custom_trigger_goat_type_unique ON bucardo.bucardo_c
 CREATE TABLE bucardo.herd (
   name       TEXT        NOT NULL,
                CONSTRAINT herd_name_pk PRIMARY KEY (name),
+  about      TEXT            NULL,
   cdate      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE bucardo.herd IS $$Named group of tables or sequences from the goat table: used as the 'source' for syncs$$;
@@ -405,6 +409,7 @@ CREATE TABLE bucardo.sync (
   onetimecopy        SMALLINT    NOT NULL DEFAULT 0,
   lifetime           INTERVAL        NULL,                   -- force controller and kids to restart
   maxkicks           INTEGER     NOT NULL DEFAULT 0,         -- force controller and kids to restart
+  isolation_level    TEXT            NULL DEFAULT 'serializable',
   cdate              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE bucardo.sync IS $$Defines a single replication event from a herd to one or more target databases$$;
@@ -418,6 +423,9 @@ ALTER TABLE bucardo.dbgroup ADD CONSTRAINT dbgroup_name_sane CHECK (name ~ E'^[a
 
 ALTER TABLE bucardo.sync    ADD CONSTRAINT sync_name_sane
   CHECK (name ~ E'^[a-zA-Z]\\w*$' AND lower(name) NOT IN ('pushdelta','fullcopy','swap'));
+
+ALTER TABLE bucardo.sync    ADD CONSTRAINT sync_isolation_level
+  CHECK ((isolation_level IS NULL) OR (lower(isolation_level) IN ('serializable', 'repeatable read')));
 
 CREATE SEQUENCE bucardo.customcode_id_seq;
 CREATE TABLE bucardo.customcode (
@@ -1080,11 +1088,6 @@ CREATE TRIGGER validate_goat
 -- Check that the goat tables are ready and compatible
 --
 
-
-
-
-
--- this is spaced so the func starts at at at even lint for debugging help
 CREATE OR REPLACE FUNCTION bucardo.validate_sync(text,integer)
 RETURNS TEXT
 LANGUAGE plperlu
@@ -1537,6 +1540,11 @@ END;
             }
         }
 
+        ## Delete any tables that are no longer in the database.
+        $dbh->do(q{
+            DELETE FROM bucardo.bucardo_delta_targets
+             WHERE tablename NOT IN (select oid from pg_class)
+        });
 
         ## Create the bucardo_note_truncation function as needed
         $sth = $sth{hazfunc};
