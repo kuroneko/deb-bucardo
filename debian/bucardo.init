@@ -34,16 +34,12 @@ start)
 	fi
 	log_daemon_msg "Starting $DESC" $NAME
 	su bucardo --command "$DAEMON start"
-	if [ -f "$PIDFILE" ] ; then
-		log_end_msg 0
-	else
-		log_end_msg 1
-	fi
+	log_end_msg $?
 	;;
 force-reload|reload)
 	log_daemon_msg "Reloading $DESC configuration files" $NAME
 	su bucardo --command "$DAEMON reload_config"
-	log_end_msg 0
+	log_end_msg $?
 	;;
 restart)
 	$0 stop
@@ -52,7 +48,7 @@ restart)
 stop)
 	log_daemon_msg "Stopping $DESC" $NAME
 	su bucardo --command "$DAEMON stop"
-	log_end_msg 0
+	log_end_msg $?
 	;;
 status)
 	status_of_proc -p "$PIDFILE" bucardo
