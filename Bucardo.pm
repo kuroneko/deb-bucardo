@@ -15,7 +15,7 @@ use strict;
 use warnings;
 use utf8;
 
-our $VERSION = '4.99.7';
+our $VERSION = '4.99.8';
 
 use DBI 1.51;                               ## How Perl talks to databases
 use DBD::Pg 2.0   qw( :async             ); ## How Perl talks to Postgres databases
@@ -634,7 +634,7 @@ sub start_mcp {
         { exec $RUNME, @{ $opts }, 'start', $reason };
         $self->glog("Could not exec $RUNME: $!", LOG_WARN);
 
-    }; ## end SIG{__DIE_} handler sub
+    }; ## end SIG{__DIE__} handler sub
 
     ## This resets listeners, kills kids, and loads/activates syncs
     my $active_syncs = $self->reload_mcp();
@@ -1050,13 +1050,14 @@ sub mcp_main {
                     $self->glog(qq{Sync "$syncname" is already activated}, LOG_TERSE);
                     $self->db_notify($maindbh, "activated_sync_$syncname", 1);
                 }
-                else {
-                    if ($self->activate_sync($sync->{$syncname})) {
-                        $sync->{$syncname}{mcp_active} = 1;
-                    }
+                elsif ($self->activate_sync($sync->{$syncname})) {
+                    $sync->{$syncname}{mcp_active} = 1;
+                    $maindbh->do(
+                        'UPDATE sync SET status = ? WHERE name = ?',
+                        undef, 'active', $syncname
+                    );
                 }
             }
-
             ## Request that a named sync get deactivated
             elsif ($name =~ /^deactivate_sync_(.+)/o) {
                 my $syncname = $1;
@@ -1069,6 +1070,10 @@ sub mcp_main {
                 }
                 elsif ($self->deactivate_sync($sync->{$syncname})) {
                     $sync->{$syncname}{mcp_active} = 0;
+                    $maindbh->do(
+                        'UPDATE sync SET status = ? WHERE name = ?',
+                        undef, 'inactive', $syncname
+                    );
                 }
             }
 
@@ -2448,36 +2453,40 @@ sub start_kid {
                                SELECT 1
                                FROM   bucardo.$g->{tracktable} t
                                WHERE  d.txntime = t.txntime
-                               AND    t.target = TARGETNAME::text
+                               AND    (t.target = DBGROUP::text OR t.target ~ '^T:')
+                            )
+                    };
+
+                ## We also need secondary queries to catch the case of partial replications
+                ## This is a per-target check
+                $SQL{deltatarget}{$g} = qq{
+                    SELECT  DISTINCT $g->{pklist}
+                    FROM    bucardo.$g->{deltatable} d
+                    WHERE   NOT EXISTS (
+                               SELECT 1
+                               FROM   bucardo.$g->{tracktable} t
+                               WHERE  d.txntime = t.txntime
+                               AND    (t.target = TARGETNAME::text)
                             )
                     };
 
                 ## Mark all unclaimed visible delta rows as done in the track table
                 $SQL{track}{$g} = qq{
                     INSERT INTO bucardo.$g->{tracktable} (txntime,target)
-                    SELECT DISTINCT txntime, TARGETNAME::text
+                    SELECT DISTINCT txntime, DBGROUP::text
                     FROM bucardo.$g->{deltatable} d
                     WHERE NOT EXISTS (
                         SELECT 1
                         FROM   bucardo.$g->{tracktable} t
                         WHERE  d.txntime = t.txntime
-                        AND    t.target = TARGETNAME::text
+                        AND    (t.target = DBGROUP::text OR t.target ~ '^T:')
                     );
                 };
 
                 ## The same thing, but to the staging table instead, as we have to
                 ## wait for all targets to succesfully commit in multi-source situations
-                $SQL{stage}{$g} = qq{
-                    INSERT INTO bucardo.$g->{stagetable} (txntime,target)
-                    SELECT DISTINCT txntime, TARGETNAME::text
-                    FROM bucardo.$g->{deltatable} d
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM   bucardo.$g->{tracktable} t
-                        WHERE  d.txntime = t.txntime
-                        AND    t.target = TARGETNAME::text
-                    );
-                };
+                ($SQL{stage}{$g} = $SQL{track}{$g}) =~ s/$g->{tracktable}/$g->{stagetable}/;
+
 
             } ## end each table
 
@@ -2486,9 +2495,8 @@ sub start_kid {
 
                 $x = $sync->{db}{$dbname};
 
-                ## Set the TARGETNAME for each database: the bucardo.track_* target entry
-                ## Unless we start using gangs again, just use the dbgroup
-                $x->{TARGETNAME} = "dbgroup $dbs";
+                ## Set the DBGROUP for each database: the bucardo.track_* target entry
+                $x->{DBGROUPNAME} = "dbgroup $dbs";
 
                 for my $g (@$goatlist) {
 
@@ -2497,7 +2505,7 @@ sub start_kid {
                     ($S,$T) = ($g->{safeschema},$g->{safetable});
 
                     ## Replace with the target name for source delta querying
-                    ($SQL = $SQL{delta}{$g}) =~ s/TARGETNAME/'$x->{TARGETNAME}'/o;
+                    ($SQL = $SQL{delta}{$g}) =~ s/DBGROUP/'$x->{DBGROUPNAME}'/o;
 
                     ## As these can be expensive, make them asynchronous
                     $sth{getdelta}{$dbname}{$g} = $x->{dbh}->prepare($SQL, {pg_async => PG_ASYNC});
@@ -2506,12 +2514,12 @@ sub start_kid {
                     ## There is no way to know beforehand which we will need, so we prepare both
 
                     ## Replace with the target name for source track updating
-                    ($SQL = $SQL{track}{$g}) =~ s/TARGETNAME/'$x->{TARGETNAME}'/go;
+                    ($SQL = $SQL{track}{$g}) =~ s/DBGROUP/'$x->{DBGROUPNAME}'/go;
                     ## Again, async as they may be slow
                     $sth{track}{$dbname}{$g} = $x->{dbh}->prepare($SQL, {pg_async => PG_ASYNC});
 
                     ## Same thing for stage
-                    ($SQL = $SQL{stage}{$g}) =~ s/TARGETNAME/'$x->{TARGETNAME}'/go;
+                    ($SQL = $SQL{stage}{$g}) =~ s/DBGROUP/'$x->{DBGROUPNAME}'/go;
                     $sth{stage}{$dbname}{$g} = $x->{dbh}->prepare($SQL, {pg_async => PG_ASYNC});
 
                     ## Set the per database/per table makedelta setting now
@@ -2629,7 +2637,7 @@ sub start_kid {
                 $xdbh->do('SET statement_timeout = 0');
 
                 ## Using the same time zone everywhere keeps us sane
-                $xdbh->do(q{SET TIME ZONE 'UTC'});
+                $xdbh->do(q{SET TIME ZONE 'GMT'});
 
                 ## Rare, but allow for tcp fiddling
                 if ($config{tcp_keepalives_idle}) { ## e.g. not 0, should always exist
@@ -2715,7 +2723,7 @@ sub start_kid {
         } ## end DBIX::Safe creations
         $did_setup = 1;
     };
-    $err_handler->(@_) if !$did_setup;
+    $err_handler->($@) if !$did_setup;
 
     ## Begin the main KID loop
     my $didrun = 0;
@@ -2877,6 +2885,11 @@ sub start_kid {
         ## Add a note to the syncrun table
         $sth{kid_syncrun_update_status}->execute("Begin txn (KID $$)", $syncname);
 
+        ## Figure out our isolation level. Only used for Postgres
+        ## All others are hard-coded as 'serializable'
+        my $isolation_level = defined $sync->{isolation_level} ? $sync->{isolation_level} : 
+            $config{isolation_level} || 'serializable';
+
         ## Commit so our dbrun and syncrun stuff is visible to others
         ## This should be done just before we start transactions on all dbs
         $maindbh->commit();
@@ -2893,8 +2906,8 @@ sub start_kid {
             $x->{dbh}->rollback();
 
             if ($x->{dbtype} eq 'postgres') {
-                $x->{dbh}->do('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE');
-                $self->glog(qq{Set database "$dbname" to serializable read write}, LOG_DEBUG);
+                $x->{dbh}->do(qq{SET TRANSACTION ISOLATION LEVEL $isolation_level READ WRITE});
+                $self->glog(qq{Set database "$dbname" to $isolation_level read write}, LOG_DEBUG);
             }
 
             if ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
@@ -3608,7 +3621,7 @@ sub start_kid {
                                             $SQL = qq{SELECT COUNT(*) FROM bucardo.$g->{deltatable} d }
                                                  . qq{WHERE d.txntime > }
                                                  . qq{(SELECT MAX(txntime) FROM bucardo.$g->{tracktable} }
-                                                 . qq{WHERE target = '$x->{TARGETNAME}')};
+                                                 . qq{WHERE target = '$x->{SYNCNAME}')};
                                             $g->{sql_got_delta} = $SQL;
                                         }
                                         $sth = $x->{dbh}->prepare($g->{sql_got_delta});
@@ -3945,7 +3958,8 @@ sub start_kid {
                         ## XXX no possible conflicting changes.
                         ## XXX Finally, we skip if the first run already had a canonical winner
                         if (!$g->{has_exception_code}) {
-                            $self->glog("Warning! Aborting due to exception for $S.$T:$pkval Error was $err", LOG_WARN);
+                            $self->glog("Warning! Aborting due to exception for $S.$T:$pkval Error was $err",
+                                        $err =~ /serialize|deadlock/ ? LOG_VERBOSE : LOG_WARN);
                             die "$err\n";
                         }
 
@@ -4051,24 +4065,26 @@ sub start_kid {
 
                 ## Gather up our rate information - just store for now, we can write it after the commits
                 ## XX Redo with sourcename etc.
-                if ($deltacount{source}{$S}{$T} and $sync->{track_rates}) {
-                    $self->glog('Gathering source rate information', LOG_VERBOSE);
-                    my $sth = $sth{source}{$g}{deltarate};
-                    $count = $sth->execute();
-                    $g->{rateinfo}{source} = $sth->fetchall_arrayref();
-                }
-
-                for my $dbname (@dbs_source) {
-
-                    if ($deltacount{dbtable}{$dbname}{$S}{$T} and $sync->{track_rates}) {
-                        $self->glog('Gathering target rate information', LOG_VERBOSE);
-                        my $sth = $sth{target}{$g}{deltarate};
+                ## Skip as {deltarate} is not even defined!
+                if (0) {
+                    if ($deltacount{source}{$S}{$T} and $sync->{track_rates}) {
+                        $self->glog('Gathering source rate information', LOG_VERBOSE);
+                        my $sth = $sth{source}{$g}{deltarate};
                         $count = $sth->execute();
-                        $g->{rateinfo}{target} = $sth->fetchall_arrayref();
+                        $g->{rateinfo}{source} = $sth->fetchall_arrayref();
                     }
 
-                }
+                    for my $dbname (@dbs_source) {
 
+                        if ($deltacount{dbtable}{$dbname}{$S}{$T} and $sync->{track_rates}) {
+                            $self->glog('Gathering target rate information', LOG_VERBOSE);
+                            my $sth = $sth{target}{$g}{deltarate};
+                            $count = $sth->execute();
+                            $g->{rateinfo}{target} = $sth->fetchall_arrayref();
+                        }
+
+                    }
+                }
                 ## For each database that had delta changes, insert rows to bucardo_track
                 ## We also need to consider makedelta:
                 ## For all tables that are marked as makedelta, we need to ensure
@@ -4611,7 +4627,7 @@ sub start_kid {
                     $dmlcount{allinserts}{target} ? LOG_NORMAL : LOG_VERBOSE);
 
         ## Update our rate information as needed
-        if ($sync->{track_rates}) {
+        if (0 and $sync->{track_rates}) {
             $SQL = 'INSERT INTO bucardo_rate(sync,goat,target,mastercommit,slavecommit,total) VALUES (?,?,?,?,?,?)';
             $sth = $maindbh->prepare($SQL);
             for my $g (@$goatlist) {
@@ -4757,7 +4773,7 @@ sub start_kid {
         $err_handler->($err) if $err !~ /DBD::Pg/;
 
         ## We only do special things for certain errors, so check for those.
-        my ($sleeptime,$payload_detail) = (0,'');
+        my ($sleeptime, $fail_msg) = (0,'');
         my @states = map { $sync->{db}{$_}{dbh}->state } @dbs_dbi;
         if (first { $_ eq '40001' } @states) {
             $sleeptime = $config{kid_serial_sleep};
@@ -4773,7 +4789,7 @@ sub start_kid {
             else {
                 $self->glog('Could not serialize, will try again', LOG_NORMAL);
             }
-            $payload_detail = "Serialization failure. Sleep=$sleeptime";
+            $fail_msg = "Serialization failure";
         }
         elsif (first { $_ eq '40P01' } @states) {
             $sleeptime = $config{kid_deadlock_sleep};
@@ -4789,11 +4805,21 @@ sub start_kid {
             else {
                 $self->glog('Encountered a deadlock, will try again', LOG_NORMAL);
             }
-            $payload_detail = "Deadlock detected. Sleep=$sleeptime";
+            $fail_msg = "Deadlock detected";
             ## TODO: Get more information via gett_deadlock_details()
         }
         else {
             $err_handler->($err);
+        }
+
+        if ($config{log_level_number} >= LOG_VERBOSE) {
+            ## Show complete error information in debug mode.
+            for my $dbh (map { $sync->{db}{$_}{dbh} } @dbs_dbi) {
+                $self->glog(
+                    sprintf('*  %s: %s - %s', $dbh->{Name}, $dbh->state, $dbh->errstr),
+                    LOG_VERBOSE
+                ) if $dbh->err;
+            }
         }
 
         ## Roll everyone back
@@ -4802,12 +4828,14 @@ sub start_kid {
             $dbh->pg_cancel if $dbh->{pg_async_status} > 0;
             $dbh->rollback;
         }
-        $maindbh->rollback;
+
+        # End the syncrun.
+        $self->end_syncrun($maindbh, 'bad', $syncname, "Failed : $fail_msg (KID $$)" );
+        $maindbh->commit;
 
         ## Tell listeners we are about to sleep
         ## TODO: Add some sweet payload information: sleep time, which dbs/tables failed, etc.
-        $self->db_notify($maindbh, "syncsleep_${syncname}", 0, $payload_detail);
-        $maindbh->commit;
+        $self->db_notify($maindbh, "syncsleep_${syncname}", 0, "$fail_msg. Sleep=$sleeptime");
 
         ## Sleep and try again.
         sleep $sleeptime if $sleeptime;
@@ -4953,7 +4981,8 @@ sub connect_database {
 
     ## Set the application name if we can
     if ($dbh->{pg_server_version} >= 90000) {
-        $dbh->do(q{SET application_name='bucardo'});
+        my $role = $self->{logprefix} || '???';
+        $dbh->do("SET application_name='bucardo $role'");
         $dbh->commit();
     }
 
@@ -5161,7 +5190,7 @@ sub glog { ## no critic (RequireArgUnpacking)
 
     ## Prepend the loglevel to the message
     if ($config{log_showlevel}) {
-        $header = "$loglevel $header";
+        $header = sprintf "%s $header", qw(WARN TERSE NORMAL VERBOSE DEBUG)[$loglevel];
     }
 
     ## Warning messages may also get written to a separate file
@@ -5498,6 +5527,7 @@ sub db_unlisten_all {
     $ldbh->do('UNLISTEN *');
 
     delete $self->{listening}{$ldbh};
+    delete $self->{listen_payload}{$ldbh};
 
     return;
 
@@ -6330,12 +6360,13 @@ sub validate_sync {
     ## If autokick, listen for a triggerkick on all source databases
     if ($s->{autokick}) {
         my $l = "kick_sync_$syncname";
-        for my $dbname (sort keys %{ $self->{sdb} }) {
-            $x = $self->{sdb}{$dbname};
+        for my $dbname (sort keys %{ $s->{db} }) {
+            $x = $s->{db}{$dbname};
+            $self->glog("Listen for $l on $dbname ($x->{role})", LOG_DEBUG);
             next if $x->{role} ne 'source';
-
-            $self->db_listen($x->{dbh}, $l, $dbname, 0);
-            $x->{dbh}->commit();
+            my $dbh = $self->{sdb}{$dbname}{dbh};
+            $self->db_listen($dbh, $l, $dbname, 0);
+            $dbh->commit;
         }
     }
 
@@ -6532,12 +6563,16 @@ sub fork_and_inactivate {
             delete $self->{dbhlist}{$iname};
         }
         ## Now go through common shared database handle locations, and delete them
+        $self->{masterdbh}->{InactiveDestroy} = 1
+            if $self->{masterdbh};
         delete $self->{masterdbh};
 
         ## Clear the 'sdb' structure of any existing database handles
         if (exists $self->{sdb}) {
             for my $dbname (keys %{ $self->{sdb} }) {
-                for my $item (qw/ dbh backend kicked /) {
+                for my $item (qw/ dbh /) {
+                    $self->{sdb}{$dbname}{$item}->{InactiveDestroy} = 1
+                        if exists $self->{sdb}{$dbname}{$item};
                     delete $self->{sdb}{$dbname}{$item};
                 }
             }
@@ -6548,7 +6583,9 @@ sub fork_and_inactivate {
             if (exists $self->{sync}{name}) { ## This is a controller/kid with a single sync
                 for my $dbname (sort keys %{ $self->{sync}{db} }) {
                     $self->glog("Removing reference to database $dbname", LOG_DEBUG);
-                        for my $item (qw/ dbh backend kicked /) {
+                        for my $item (qw/ dbh /) {
+                            $self->{sync}{db}{$dbname}{$item}->{InactiveDestroy} = 1
+                                if exists $self->{sync}{db}{$dbname}{$item};
                             delete $self->{sync}{db}{$dbname}{$item};
                         }
                     }
@@ -6557,7 +6594,9 @@ sub fork_and_inactivate {
                 for my $syncname (keys %{ $self->{sync} }) {
                     for my $dbname (sort keys %{ $self->{sync}{$syncname}{db} }) {
                         $self->glog("Removing reference to database $dbname in sync $syncname", LOG_DEBUG);
-                        for my $item (qw/ dbh backend kicked /) {
+                        for my $item (qw/ dbh /) {
+                            $self->{sync}{$syncname}{db}{$dbname}{$item}->{InactiveDestroy} = 1
+                                if exists $self->{sync}{$syncname}{db}{$dbname}{$item};
                             delete $self->{sync}{$syncname}{db}{$dbname}{$item};
                         }
                     }
@@ -6601,7 +6640,7 @@ sub fork_vac {
 
     ## Start normal log output for this controller: basic facts
     my $msg = qq{New VAC daemon. PID=$$};
-    $self->glog($msg, LOG_TERSE);
+    $self->glog($msg, LOG_NORMAL);
 
     ## Allow the MCP to signal us (request to exit)
     local $SIG{USR1} = sub {
@@ -6622,8 +6661,8 @@ sub fork_vac {
         my $line = (caller)[2];
 
         ## Don't issue a warning if this was simply a MCP request
-        my $warn = $diemsg =~ /MCP request|not needed/ ? '' : 'Warning! ';
-        $self->glog(qq{${warn}VAC was killed at line $line: $diemsg}, LOG_WARN);
+        my $warn = ($diemsg =~ /MCP request|Not needed/ ? '' : 'Warning! ');
+        $self->glog(qq{${warn}VAC was killed at line $line: $diemsg}, $warn ? LOG_WARN :LOG_VERBOSE);
 
         ## Not a whole lot of cleanup to do on this one: just shut database connections and leave
         $self->{masterdbh}->disconnect() if exists $self->{masterdbhvac};
@@ -6633,7 +6672,7 @@ sub fork_vac {
 
         exit 0;
 
-    }; ## end SIG{__DIE_} handler sub
+    }; ## end SIG{__DIE__} handler sub
 
     ## Connect to the master database
     ($self->{master_backend}, $self->{masterdbh}) = $self->connect_database();
@@ -6755,7 +6794,7 @@ sub fork_vac {
             ## If we found no backends, we can leave right away, and not run again
             if (! $valid_backends) {
 
-                $self->glog("Warning! No valid backends, so disabling the VAC daemon", LOG_WARN);
+                $self->glog('No valid backends, so disabling the VAC daemon', LOG_VERBOSE);
 
                 $config{bucardo_vac} = 0;
 
@@ -7197,7 +7236,7 @@ sub kill_bucardo_pid {
         if ($info !~ /^COMMAND/) {
             $self->glog(qq{Could not determine ps information for pid $pid}, LOG_VERBOSE);
         }
-        elsif ($info !~ /\bBucardo\s+/o) {
+        elsif ($info !~ /\bbucardo\s+/oi) {
             $self->glog(qq{Will not kill process $pid: ps args is not 'Bucardo', got: $info}, LOG_TERSE);
             return 0;
         }
@@ -8920,7 +8959,7 @@ sub push_rows {
                     $dbh->do(qq{
                         INSERT INTO bucardo.$goat->{tracktable}
                         VALUES (NOW(), ?)
-                    }, undef, $t->{TARGETNAME});
+                    }, undef, $t->{SYNCNAME});
                 }
             }
             elsif ('flatpg' eq $type) {
@@ -9252,7 +9291,7 @@ Bucardo - Postgres multi-master replication system
 
 =head1 VERSION
 
-This document describes version 4.99.7 of Bucardo
+This document describes version 4.99.8 of Bucardo
 
 =head1 WEBSITE
 
