@@ -2,6 +2,7 @@ bucardo (4.99.8-1) unstable; urgency=low
 
   * Imported Upstream version 4.99.8
   * Made init script report correct result. (Closes: #724878)
+  * Canonicalized VCS fields.
 
  -- Michael Meskes <meskes@debian.org>  Wed, 06 Nov 2013 15:40:17 +0100
 

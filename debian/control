@@ -6,8 +6,8 @@ Build-Depends: cdbs, debhelper (>= 5), perl (>= 5.10.0), quilt
 Standards-Version: 3.9.4
 Section: database
 Homepage: http://bucardo.org/
-Vcs-Git: git://git.debian.org/git/pkg-postgresql/bucardo.git
-Vcs-Browser: http://git.debian.org/?p=pkg-postgresql/bucardo.git
+Vcs-Git: git://anonscm.debian.org/pkg-postgresql/bucardo.git
+Vcs-Browser: http://anonscm.debian.org/gitweb/?p=pkg-postgresql/bucardo.git
 
 Package: bucardo
 Architecture: all
