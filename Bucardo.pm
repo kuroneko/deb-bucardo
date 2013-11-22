@@ -15,7 +15,7 @@ use strict;
 use warnings;
 use utf8;
 
-our $VERSION = '4.99.8';
+our $VERSION = '4.99.10';
 
 use DBI 1.51;                               ## How Perl talks to databases
 use DBD::Pg 2.0   qw( :async             ); ## How Perl talks to Postgres databases
@@ -114,6 +114,9 @@ $shorthost =~ s/^(.+?)\..*/$1/;
 ## Items pulled from bucardo_config and shared everywhere:
 our %config;
 our %config_about;
+
+## Set a default in case we call glog before we load the configs:
+$config{log_level_number} = LOG_NORMAL;
 
 ## Sequence columns we care about and how to change them via ALTER:
 my @sequence_columns = (
@@ -533,9 +536,16 @@ sub start_mcp {
 
     ## Print each object, aligned, and show 'undef' for undefined values
     ## Yes, this prints things like HASH(0x8fbfc84), but we're okay with that
+    $Data::Dumper::Indent = 0;
+    $Data::Dumper::Terse = 1;
     for (sort keys %$self) {
-        $objdump .= sprintf " %-*s => %s\n", $maxlen, $_, (defined $self->{$_}) ? qq{'$self->{$_}'} : 'undef';
+        $objdump .= sprintf " %-*s => %s\n", $maxlen, $_,
+            (defined $self->{$_}) ?
+                (ref $self->{$_} eq 'ARRAY') ? Dumper($self->{$_})
+                    : qq{'$self->{$_}'} : 'undef';
     }
+    $Data::Dumper::Indent = 1;
+    $Data::Dumper::Terse = 0;
     $self->glog($objdump, LOG_TERSE);
 
     ## Restore the password
@@ -967,7 +977,7 @@ sub mcp_main {
                 $count = $sth->execute();
                 if ($count ne '0E0') {
                     for my $row (@{$sth->fetchall_arrayref()}) {
-                        $self->glog("MESSAGE ($row->[1]): $row->[0]", LOG_VERBOSE);
+                        $self->glog("MESSAGE ($row->[1]): $row->[0]", LOG_TERSE);
                     }
                     $maindbh->do('TRUNCATE TABLE bucardo_log_message');
                     $maindbh->commit();
@@ -1982,6 +1992,10 @@ sub start_kid {
     ## Adjust the process name, start logging
     $0 = qq{Bucardo Kid.$self->{extraname} Sync "$syncname"};
     my $extra = $sync->{onetimecopy} ? "OTC: $sync->{onetimecopy}" : '';
+    if ($config{log_showsyncname}) {
+        $self->{logprefix} .= " ($syncname)";
+    }
+
     $self->glog(qq{New kid, sync "$syncname" alive=$kidsalive Parent=$self->{ctlpid} PID=$$ kicked=$kicked $extra}, LOG_TERSE);
 
     ## Store our PID into a file
@@ -2244,6 +2258,9 @@ sub start_kid {
                 $self->glog("Missing $dbname database handle", LOG_WARN);
                 next;
             };
+
+            ## Just in case we were in the middle of an async call:
+            $dbh->pg_cancel() if $dbh->{pg_async_status} > 0;
 
             $dbh->rollback();
 
@@ -2832,6 +2849,7 @@ sub start_kid {
         ## Reset the numbers to track total bucardo_delta matches
         undef %deltacount;
         $deltacount{all} = 0;
+        $deltacount{table} = {};
 
         ## Reset our counts of total inserts, deletes, truncates, and conflicts
         undef %dmlcount;
@@ -3110,6 +3128,34 @@ sub start_kid {
             ## so this tracks the largest number returned
             my $maxcount = 0;
 
+            ## Use the bucardo_delta_check function on each database, which gives us
+            ## a quick summary of whether each table has any active delta rows
+            ## This is a big win on slow networks!
+            if ($config{quick_delta_check}) {
+                for my $dbname (@dbs_source) {
+
+                    $x = $sync->{db}{$dbname};
+
+                    $SQL = 'SELECT * FROM bucardo.bucardo_delta_check(?,?)';
+                    $sth = $x->{dbh}->prepare($SQL);
+                    $sth->execute($syncname, $x->{DBGROUPNAME});
+                    $x->{deltazero} = $x->{deltatotal} = 0;
+                    for my $row (@{$sth->fetchall_arrayref()}) {
+                        my ($number,$tablename) = split /,/ => $row->[0], 2;
+                        $x->{deltaquick}{$tablename} = $number;
+                        if ($number) {
+                            $x->{deltatotal}++;
+                            $deltacount{table}{$tablename}++;
+                        }
+                        else {
+                            $x->{deltazero}++;
+                        }
+                    }
+                    $self->glog("Tables with deltas on $dbname: $x->{deltatotal} Without: $x->{deltazero}", LOG_VERBOSE);
+
+                } ## end quick delta check for each database
+            } ## end quick delta check
+
             ## Grab the delta information for each table from each source database
             ## While we could do this as per-db/per-goat instead of per-goat/per-db,
             ## we want to take advantage of the async requests as much as possible,
@@ -3130,6 +3176,13 @@ sub start_kid {
                     ## We still need these, as we want to respect changes made after the truncation!
                     next if exists $g->{truncatewinner} and $g->{truncatewinner} ne $dbname;
 
+                    $x = $sync->{db}{$dbname};
+
+                    ## No need to grab information if we know there are no deltas for this table
+                    if ($config{quick_delta_check}) {
+                        next if ! $x->{deltaquick}{"$S.$T"};
+                    }
+
                     ## Gets all relevant rows from bucardo_deltas: runs asynchronously
                     $sth{getdelta}{$dbname}{$g}->execute();
 
@@ -3143,6 +3196,15 @@ sub start_kid {
                     next if exists $g->{truncatewinner} and $g->{truncatewinner} ne $dbname;
 
                     $x = $sync->{db}{$dbname};
+
+                    ## If we skipped this, set the deltacount to zero and move on
+                    if ($config{quick_delta_check}) {
+                        if (! $x->{deltaquick}{"$S.$T"}) {
+                            $self->glog("Skipping $S.$T: no delta rows", LOG_DEBUG);
+                            $deltacount{dbtable}{$dbname}{$S}{$T} = 0;
+                            next;
+                        }
+                    }
 
                     ## pg_result tells us to wait for the query to finish
                     $count = $x->{dbh}->pg_result();
@@ -3322,10 +3384,17 @@ sub start_kid {
                 $self->db_notify($maindbh, "ctl_syncdone_${syncname}");
                 $maindbh->commit();
 
+                ## Even with no changes, we like to know how long this took
+                my $synctime = sprintf '%.2f', tv_interval($kid_start_time);
+                $self->glog((sprintf 'Total time for sync "%s" (no rows): %s%s',
+                    $syncname,
+                    pretty_time($synctime),
+                    $synctime < 120 ? '' : " ($synctime seconds)",),
+                    LOG_DEBUG);
+
                 ## Sleep a hair
                 sleep $config{kid_nodeltarows_sleep};
 
-                $self->glog('No changes made this round', LOG_DEBUG);
                 redo KID if $kidsalive;
                 last KID;
 
@@ -4141,6 +4210,21 @@ sub start_kid {
 
             } ## end each goat
 
+            ## Get sizing for the next printout
+            my $maxsize = 10;
+            my $maxcount2 = 1;
+
+            for my $g (@$goatlist) {
+                next if $g->{reltype} ne 'table';
+                ($S,$T) = ($g->{safeschema},$g->{safetable});
+                for my $dbname (keys %{ $sync->{db} }) {
+                    $x = $sync->{db}{$dbname};
+                    next if ! $deltacount{dbtable}{$dbname}{$S}{$T};
+                    $maxsize = length " $dbname.$S.$T" if length " $dbname.$S.$T" > $maxsize;
+                    $maxcount2 = length $count if length $count > $maxcount2;
+                }
+            }
+
             ## Pretty print the number of rows per db/table
             for my $g (@$goatlist) {
                 next if $g->{reltype} ne 'table';
@@ -4152,9 +4236,9 @@ sub start_kid {
                         $count = $self->{insertcount}{dbname}{$S}{$T};
                         $self->glog((sprintf 'Rows inserted to bucardo_%s for %-*s: %*d',
                              $x->{trackstage} ? 'stage' : 'track',
-                             $self->{maxdbstname},
+                             $maxsize,
                              "$dbname.$S.$T",
-                             length $maxcount,
+                             length $maxcount2,
                              $count),
                              LOG_DEBUG);
                     }
@@ -4618,9 +4702,12 @@ sub start_kid {
 
         ## Put a note in the logs for how long this took
         my $synctime = sprintf '%.2f', tv_interval($kid_start_time);
-        $self->glog((sprintf 'Total time for sync "%s" (%s rows): %s%s',
+        $self->glog((sprintf 'Total time for sync "%s" (%s %s, %s %s): %s%s',
                     $syncname,
                     $dmlcount{inserts},
+                    (1==$dmlcount{inserts} ? 'row' : 'rows'),
+                    scalar keys %{$deltacount{table}},
+                    (1== keys %{$deltacount{table}} ? 'table' : 'tables'),
                     pretty_time($synctime),
                     $synctime < 120 ? '' : " ($synctime seconds)",),
                     ## We don't want to output a "finished" if no changes made unless verbose
@@ -4961,6 +5048,8 @@ sub connect_database {
         $ssp = $d->{server_side_prepares};
     }
 
+    $self->glog("DSN: $dsn", LOG_NORMAL) if exists $config{log_level};
+
     $dbh = DBI->connect
         (
          $dsn,
@@ -5119,8 +5208,9 @@ sub _logto {
             $fn .= ".$self->{logextension}" if length $self->{logextension};
 
             ## If we are writing each process to a separate file,
-            ## append the prefix and the PID to the file name
-            $fn .= "$self->{logprefix}.$$"  if $self->{logseparate};
+            ## append the prefix (first three letters) and the PID to the file name
+            my $tla = substr($self->{logprefix},0,3);
+            $fn .= "$tla.$$"  if $self->{logseparate};
 
             open my $fh, '>>', $fn or die qq{Could not append to "$fn": $!\n};
             ## Turn off buffering on this handle
@@ -5269,6 +5359,7 @@ sub show_db_version_and_time {
     $self->glog("${prefix}Local timezone: $systemtime  DB timezone: $dbtime->[2]", LOG_WARN);
     $self->glog("${prefix}Postgres version: " . $ldbh->{pg_server_version}, LOG_WARN);
     $self->glog("${prefix}Database port: " . $ldbh->{pg_port}, LOG_WARN);
+    $ldbh->{pg_host} and $self->glog("${prefix}Database host: " . $ldbh->{pg_host}, LOG_WARN);
 
     return;
 
@@ -5438,7 +5529,7 @@ sub db_listen {
         $self->{listen_payload}{$ldbh} = 1;
 
         ## We use 'bucardo', 'bucardo_ctl', or 'bucardo_kid'
-        my $suffix = $self->{logprefix} =~ /KID|CTL/ ? ('_' . lc $self->{logprefix}) : '';
+        my $suffix = $self->{logprefix} =~ /(KID|CTL)/ ? ('_' . lc $1) : '';
         $string = "bucardo$suffix";
     }
     elsif (exists $self->{listening}{$ldbh}{$string}) {
@@ -6335,14 +6426,14 @@ sub validate_sync {
             ## The referenced table is not being tracked in this sync
             if (! exists $s->{tableoid}{$oid2}) {
                 ## Nothing to do except report this problem and move on
-                $self->glog("Table $t1 references $t2, which is not part of this sync!", LOG_NORMAL);
+                $self->glog("Table $t1 references $t2($conname), which is not part of this sync!", LOG_NORMAL);
                 next;
             }
 
             ## A table referencing us is not being tracked in this sync
             if (! exists $s->{tableoid}{$oid1}) {
                 ## Nothing to do except report this problem and move on
-                $self->glog("Table $t2 is referenced by $t1, which is not part of this sync!", LOG_NORMAL);
+                $self->glog("Table $t2 is referenced by $t1($conname), which is not part of this sync!", LOG_NORMAL);
                 next;
             }
 
@@ -6705,6 +6796,8 @@ sub fork_vac {
         ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
         $self->glog(qq{Connected to database "$dbname" with backend PID of $x->{backend}}, LOG_NORMAL);
         $self->{pidmap}{$x->{backend}} = "DB $dbname";
+        ## We don't want details about the purging
+        $x->{dbh}->do(q{SET client_min_messages = 'warning'});
     }
 
     ## Track how long since we last came to life for vacuuming
@@ -8791,7 +8884,8 @@ sub push_rows {
             my $pre = $pcount <= 1 ? '' : "/* $loop of $pcount */";
             $loop++;
 
-            ## Kick off the copy on the source 
+            ## Kick off the copy on the source
+            $self->glog(qq{${pre}Copying from $fromname.$S.$T}, LOG_VERBOSE);
             my $srccmd = sprintf '%s%sCOPY (%s FROM %s.%s%s) TO STDOUT%s',
                 $pre,
                 $self->{sqlprefix},
@@ -8803,7 +8897,6 @@ sub push_rows {
             $fromdbh->do($srccmd);
 
             my $buffer = '';
-            $self->glog(qq{Copying from $fromname.$S.$T}, LOG_VERBOSE);
 
             ## Loop through all changed rows on the source, and push to the target(s)
             my $multirow = 0;
@@ -9291,7 +9384,7 @@ Bucardo - Postgres multi-master replication system
 
 =head1 VERSION
 
-This document describes version 4.99.8 of Bucardo
+This document describes version 4.99.10 of Bucardo
 
 =head1 WEBSITE
 

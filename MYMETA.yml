@@ -34,4 +34,4 @@ requires:
   Test::Harness: 2.03
   Test::More: 0.61
   boolean: 0
-version: 4.99.8
+version: 4.99.10
