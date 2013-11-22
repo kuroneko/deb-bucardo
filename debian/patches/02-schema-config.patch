@@ -1,19 +1,20 @@
 diff -Nur bucardo/bucardo.schema bucardo.new/bucardo.schema
---- bucardo/bucardo.schema	2013-01-08 13:17:52.000000000 +0100
-+++ bucardo.new/bucardo.schema	2013-01-08 13:29:17.968256714 +0100
-@@ -136,9 +136,9 @@
+--- bucardo/bucardo.schema	2013-11-22 16:04:06.508566734 +0100
++++ bucardo.new/bucardo.schema	2013-11-22 16:06:37.542437659 +0100
+@@ -140,10 +140,10 @@
  log_showlevel|0|Show log level in the log output?
  log_showline|0|Show line number in the log output?
  log_showtime|3|Show timestamp in the log output?  0=off  1=seconds since epoch  2=scalar gmtime  3=scalar localtime
 -log_conflict_file|bucardo_conflict.log|Name of the conflict detail log file
 +log_conflict_file|/var/log/bucardo/conflict.log|Name of the conflict detail log file
+ log_showsyncname|1|Show the name of the sync next to the 'KID' prefix
  log_level|NORMAL|How verbose to make the logging. Higher is more verbose.
 -warning_file|bucardo.warning.log|File containing all log lines starting with "Warning"
-+warning_file|/var/local/bucardo/warning.log|File containing all log lines starting with "Warning"
++warning_file|/var/log/bucardo/warning.log|File containing all log lines starting with "Warning"
  \.
  
  -- Versioning
-@@ -155,8 +155,8 @@
+@@ -159,8 +159,8 @@
  FROM STDIN
  WITH DELIMITER '|';
  bucardo_vac|1|Do we want the automatic VAC daemon to run?
@@ -24,12 +25,12 @@ diff -Nur bucardo/bucardo.schema bucardo.new/bucardo.schema
  default_email_host|localhost|Which host to send email through
  default_conflict_strategy|bucardo_latest|Default conflict strategy for all syncs
  email_debug_file||File to save a copy of all outgoing emails to
-@@ -164,7 +164,7 @@
- host_safety_check||Regex to make sure we don't accidentally run where we should not
+@@ -169,7 +169,7 @@
  isolation_level|repeatable read|Default isolation level: can be serializable or repeatable read
  piddir|/var/run/bucardo|Directory holding Bucardo PID files
+ quick_delta_check|1|Whether to do a quick scan of delta activity
 -reason_file|bucardo.restart.reason.txt|File to hold reasons for stopping and starting
 +reason_file|/var/log/bucardo/restart.reason|File to hold reasons for stopping and starting
  semaphore_table|bucardo_status|Table to let apps know a sync is ongoing
- statement_chunk_size|10000|How many primary keys to shove into a single statement
+ statement_chunk_size|8000|How many primary keys to shove into a single statement
  stats_script_url|http://www.bucardo.org/|Location of the stats script

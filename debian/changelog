@@ -1,3 +1,9 @@
+bucardo (4.99.10-1) unstable; urgency=low
+
+  * Imported Upstream version 4.99.10
+
+ -- Michael Meskes <meskes@debian.org>  Fri, 22 Nov 2013 16:02:27 +0100
+
 bucardo (4.99.8-1) unstable; urgency=low
 
   * Imported Upstream version 4.99.8
