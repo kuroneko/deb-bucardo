@@ -8,6 +8,10 @@ package BucardoTesting;
 
 use strict;
 use warnings;
+use utf8;
+
+use Encode qw/ decode /;
+use Encode::Locale;
 use DBI;
 use DBD::Pg;
 use Time::HiRes qw/sleep gettimeofday tv_interval/;
@@ -17,6 +21,8 @@ use Data::Dumper;
 use vars qw/$SQL $sth $count $COM %dbh/;
 
 my $DEBUG = $ENV{BUCARDO_DEBUG} || 0;
+
+$ENV{BUCARDO_CONFIRM} = 0 if exists $ENV{BUCARDO_CONFIRM};
 
 use base 'Exporter';
 our @EXPORT = qw/%tabletype %tabletypemysql %tabletypemariadb %tabletypeoracle %tabletypesqlite
@@ -59,8 +65,13 @@ if ($FRESHLOG) {
     unlink 'tmp/bucardo.log';
 }
 
+my $piddir = 'pid';
+if (! -e $piddir) {
+    mkdir $piddir;
+}
+
 ## Test databases are labelled as A, B, C, etc.
-my @dbs = qw/A B C D/;
+my @dbs = qw/A B C D E/;
 
 ### TODO: Add point type (which has no natural ordering operator!)
 
@@ -415,13 +426,22 @@ sub create_cluster {
 
     my $dirname = $info->{dirname};
 
-    return if -d $dirname;
+    if (-d $dirname) {
+        ## Sometimes these test clusters get left in a broken state.
+        my $file = "$dirname/postgresql.conf";
+        if (! -e $file) {
+            ## Just move it out of the way, rather than deleting it
+            rename $dirname, "$dirname.old";
+        }
+        return;
+    }
 
     my $localinitdb = $info->{initdb};
 
     debug(qq{Running $localinitdb for cluster "$clustername"});
-
-    my $res = qx{$localinitdb -D $dirname 2>&1};
+    my $com = qq{$localinitdb -D $dirname 2>&1};
+    debug($com);
+    my $res = qx{$com};
     die $res if $? != 0;
     if ($DEBUG) {
         warn Dumper $res;
@@ -617,6 +637,19 @@ sub connect_database {
     }
 
     $dbh->do(q{SET TIME ZONE 'UTC'});
+
+    if ($DEBUG) {
+        my $file = 'bucardo.debug.dsns.txt';
+        if (open my $fh, '>>', $file) {
+            print {$fh} "\n$dsn\n";
+            my ($host,$port,$db);
+            $dsn =~ /port=(\d+)/ and $port=$1;
+            $dsn =~ /dbname=(.+?);/ and $db=$1;
+            $dsn =~ /host=(.+)/ and $host=$1;
+            printf {$fh} "psql%s%s%s\n", " -h $host", " -p $port", " $db";
+            close $fh or die qq{Could not close file "$file": $!\n};
+        }
+    }
 
     $dbh->commit();
 
@@ -935,9 +968,11 @@ sub ctl {
     ## Emulates a command-line invocation
     ## Arguments:
     ## 1. String to pass to bucardo
+    ## 2. Database name to connect to. Used only when we're not confident the bucardo database exists already.
     ## Returns: answer as a string
 
-    my ($self,$args) = @_;
+    my ($self,$args, $db) = @_;
+    $db ||= 'bucardo';
 
     my $info;
     my $ctl = $self->{bucardo};
@@ -950,7 +985,7 @@ sub ctl {
         next unless exists $bc->{$val} and length $bc->{$val};
         $connopts .= " --db$arg=$bc->{$val}";
     }
-    $connopts .= " --dbname=bucardo --log-dest .";
+    $connopts .= " --dbname=$db --log-dest .";
     $connopts .= " --dbuser=$user";
     ## Just hard-code these, no sense in multiple Bucardo base dbs yet:
     $connopts .= " --dbport=58921";
@@ -971,7 +1006,7 @@ sub ctl {
         local $SIG{ALRM} = sub { die "Alarum!\n"; };
         alarm $ALARM_BUCARDO;
         debug("Script: $ctl Connection options: $connopts Args: $args", 3);
-        $info = qx{$ctl $connopts $args 2>&1};
+        $info = decode( locale => qx{$ctl $connopts $args 2>&1} );
         debug("Exit value: $?", 3);
         die $info if $? != 0;
         alarm 0;
@@ -981,7 +1016,7 @@ sub ctl {
         return __PACKAGE__ . ' timeout hit, giving up';
     }
     if ($@) {
-        return "Error running bucardo: $@\n";
+        return "Error running bucardo: " . decode( locale => $@ ) . "\n";
     }
 
     debug("bucardo said: $info", 3);
@@ -1095,7 +1130,7 @@ sub setup_bucardo {
 
     ## Now run the install. Timeout after a few seconds
     debug(qq{Running bucardo install on cluster $clustername});
-    my $info = $self->ctl('install --batch');
+    my $info = $self->ctl('install --batch', 'postgres');
 
     if ($info !~ /Installation is now complete/) {
         die "Installation failed: $info\n";

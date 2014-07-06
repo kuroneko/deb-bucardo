@@ -1,6 +1,6 @@
 
 -- Schema for the main Bucardo database
--- Version 4.99.10
+-- Version 5.0.0
 
 -- Should be run as a superuser
 -- This should not need to be run directly: use either
@@ -150,8 +150,8 @@ warning_file|bucardo.warning.log|File containing all log lines starting with "Wa
 COPY bucardo.bucardo_config(name,setting,about)
 FROM STDIN
 WITH DELIMITER '|';
-bucardo_version|4.99.10|Bucardo version this schema was created with
-bucardo_current_version|4.99.10|Current version of Bucardo
+bucardo_initial_version|5.0.0|Bucardo version this schema was created with
+bucardo_version|5.0.0|Current version of Bucardo
 \.
 
 -- Other settings:
@@ -191,13 +191,13 @@ CREATE TABLE bucardo.db (
   name                 TEXT        NOT NULL,  -- local name for convenience, not necessarily database name
                          CONSTRAINT db_name_pk PRIMARY KEY (name),
   dbtype               TEXT        NOT NULL DEFAULT 'postgres',
-  dbhost               TEXT        NOT NULL DEFAULT '',
-  dbport               TEXT        NOT NULL DEFAULT '',
-  dbname               TEXT        NOT NULL, -- the actual name of the database, not the primary key 'local' name
-  dbuser               TEXT        NOT NULL,
+  dbhost               TEXT            NULL DEFAULT '',
+  dbport               TEXT            NULL DEFAULT '',
+  dbname               TEXT            NULL, -- the actual name of the database, not the primary key 'local' name
+  dbuser               TEXT            NULL,
   dbpass               TEXT            NULL,
   dbconn               TEXT        NOT NULL DEFAULT '',  -- string to add to the generated dsn
-  dbservice            TEXT            NULL,
+  dbservice            TEXT            NULL DEFAULT '',
   pgpass               TEXT            NULL,      -- local file with connection info same as pgpass
   status               TEXT        NOT NULL DEFAULT 'active',
   server_side_prepares BOOLEAN     NOT NULL DEFAULT 'true',
@@ -205,7 +205,9 @@ CREATE TABLE bucardo.db (
 );
 COMMENT ON TABLE bucardo.db IS $$Holds information about each database used in replication$$;
 
-ALTER TABLE bucardo.db ADD CONSTRAINT db_status CHECK (status IN ('active','inactive'));
+ALTER TABLE bucardo.db ADD CONSTRAINT db_status CHECK (status IN ('active','inactive','stalled'));
+
+ALTER TABLE bucardo.db ADD CONSTRAINT db_service_valid CHECK ((dbservice IS NOT NULL) OR ((((dbname IS NOT NULL) AND (dbuser IS NOT NULL)) AND (dbhost IS NOT NULL)) AND (dbport IS NOT NULL)));
 
 --
 -- Databases can belong to zero or more named groups
@@ -414,7 +416,7 @@ CREATE TABLE bucardo.sync (
   onetimecopy        SMALLINT    NOT NULL DEFAULT 0,
   lifetime           INTERVAL        NULL,                   -- force controller and kids to restart
   maxkicks           INTEGER     NOT NULL DEFAULT 0,         -- force controller and kids to restart
-  isolation_level    TEXT            NULL DEFAULT 'serializable',
+  isolation_level    TEXT            NULL DEFAULT 'repeatable read',
   cdate              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE bucardo.sync IS $$Defines a single replication event from a herd to one or more target databases$$;
@@ -427,7 +429,7 @@ ALTER TABLE bucardo.db      ADD CONSTRAINT db_name_sane      CHECK (name ~ E'^[a
 ALTER TABLE bucardo.dbgroup ADD CONSTRAINT dbgroup_name_sane CHECK (name ~ E'^[a-zA-Z]\\w*$');
 
 ALTER TABLE bucardo.sync    ADD CONSTRAINT sync_name_sane
-  CHECK (name ~ E'^[a-zA-Z]\\w*$' AND lower(name) NOT IN ('pushdelta','fullcopy','swap'));
+  CHECK (name ~ E'^[a-zA-Z]\\w*$' AND lower(name) NOT IN ('pushdelta','fullcopy','swap','sync'));
 
 ALTER TABLE bucardo.sync    ADD CONSTRAINT sync_isolation_level
   CHECK ((isolation_level IS NULL) OR (lower(isolation_level) IN ('serializable', 'repeatable read')));
@@ -675,7 +677,7 @@ if (!$rv->{processed}) {
 }
 $row = $rv->{rows}[0];
 
-for (qw(host port name user pass conn)) {
+for (qw(host port name user pass conn service)) {
     $db{$_} = exists $row->{"db$_"} ? $row->{"db$_"} : '';
 }
 
@@ -707,14 +709,18 @@ if ($dbtype eq 'postgres') {
         }
     }
 
-    length $db{name} or elog(ERROR, qq{Database name is mandatory\n});
-    length $db{user} or elog(ERROR, qq{Database username is mandatory\n});
+    ## These may be specified in the service name
+    $db{service} = '' if ! defined $db{service};
+    if (! length($db{service})) {
+        length $db{name} or elog(ERROR, qq{Database name is mandatory\n});
+        length $db{user} or elog(ERROR, qq{Database username is mandatory\n});
+    }
 
-    my $connstring = "dbi:Pg:dbname=$db{name}";
-    $db{host} ||= ''; $db{port} ||= ''; $db{pass} ||= '';
-    length $db{host} and $connstring .= ";host=$db{host}";
-    length $db{port} and $connstring .= ";port=$db{port}";
-    length $db{conn} and $connstring .= ";$db{conn}";
+    my $connstring = "dbi:Pg:";
+    $db{host} ||= ''; $db{port} ||= ''; $db{pass} ||= ''; $db{user} ||= '';
+    $connstring .= join ';', map {
+        ( $_ eq 'name' ? 'dbname' : $_ ) . "=$db{$_}";
+    } grep { length $db{$_} } qw/name host port conn service/;
 
     my $ssp = $row->{server_side_prepares};
     $ssp = 1 if ! defined $ssp;
@@ -1064,20 +1070,28 @@ if (!defined $uniq) {
    die "Could not find a suitable unique index for table $schema.$table\n";
 }
 
+my $found = 0;
+
 ## If the user is not trying a manual override, set the best one and leave
 if ((!defined $new->{pkey} or !length $new->{pkey}) or ($old and $new->{pkey} eq $old->{pkey})) {
     ($new->{pkey} = $uniq->{indkey}) =~ s/(\d+)(\s+)?/$col->{$1}{attname} . ($2 ? '|' : '')/ge;
-    ($new->{qpkey} = $uniq->{indkey}) =~ s/(\d+)(\s+)?/$col->{$1}{qattname} . ($2 ? '|' : '')/ge;
-    ($new->{pkeytype} = $uniq->{indkey}) =~ s/(\d+)(\s+)?/$col->{$1}{typname} . ($2 ? '|' : '')/ge;
-    return 'MODIFY';
+    $found = 1;
+}
+else {
+    ## They've attempted a manual override of pkey. Make sure it is valid.
+    for (@$cons) {
+        (my $name = $_->{indkey}) =~ s/(\d+)(\s+)?/$col->{$1}{attname} . ($2 ? '|' : '')/ge;
+        next unless $name eq $new->{pkey};
+        last;
+    }
 }
 
-## They've attempted a manual override of pkey. Make sure it is valid.
-for (@$cons) {
-    (my $name = $_->{indkey}) =~ s/(\d+)(\s+)?/$col->{$1}{attname} . ($2 ? '|' : '')/ge;
-    next unless $name eq $new->{pkey};
+if ($found) {
     ($new->{qpkey} = $uniq->{indkey}) =~ s/(\d+)(\s+)?/$col->{$1}{qattname} . ($2 ? '|' : '')/ge;
     ($new->{pkeytype} = $uniq->{indkey}) =~ s/(\d+)(\s+)?/$col->{$1}{typname} . ($2 ? '|' : '')/ge;
+    $new->{pkeytype} =~ s/int2/smallint/;
+    $new->{pkeytype} =~ s/int4/integer/;
+    $new->{pkeytype} =~ s/int8/bigint/;
     return 'MODIFY';
 }
 
@@ -1182,7 +1196,7 @@ $SQL = qq{
     };
 $rv = spi_exec_query($SQL);
 if (!@{$rv->{rows}}) {
-    elog(ERROR, qq{Could not find a database group of $dbs});
+    elog(ERROR, qq{Could not find a dbgroup of $dbs});
 }
 
 ## We also want to count up each type of role
@@ -1204,7 +1218,7 @@ for (@{$rv->{rows}}) {
 
 ## No source databases? Does not compute!
 if ($role{source} < 1) {
-    die "Invalid database group: at least one database must have a role of 'source'!\n";
+    die "Invalid dbgroup: at least one database must have a role of 'source'!\n";
 }
 
 ## Unless we are fullcopy, we must have PKs on each table
@@ -2104,7 +2118,7 @@ SELECT 'Fixme'::TEXT;
             ORDER BY attnum
         };
     my $columninfo;
-    if (@tablelist) {
+    if (@tableoids) {
         $SQL =~ s/COLIST/join ',' => @tableoids/e;
         $sth = $dbh->prepare($SQL);
         $sth->execute();
@@ -2461,7 +2475,7 @@ SELECT 'Fixme'::TEXT;
 
             ## Need to index both columns of the txntime table
             if (! exists $bindexoid{$noquote_index3_name}) {
-                $SQL = qq{CREATE INDEX $index3_name ON bucardo.$track_table(target, txntime)};
+                $SQL = qq{CREATE INDEX $index3_name ON bucardo.$track_table(target text_pattern_ops, txntime)};
                 $run_sql->($SQL,$dbh);
             }
 
@@ -2528,12 +2542,6 @@ SELECT 'Fixme'::TEXT;
                     };
                 }
                 $run_sql->($SQL,$dbh);
-
-                ## We want these to always fire, even in replica mode!
-                if ($dbh->{pg_server_version} >= 80300) {
-                    $SQL = qq{ALTER TABLE $safeschema.$safetable ENABLE ALWAYS TRIGGER "$kickfunc"};
-                    $run_sql->($SQL,$dbh);
-                }
 
             }
         } ## end each TABLE
@@ -2762,7 +2770,7 @@ COMMENT ON TABLE bucardo.upgrade_log IS $$Historical record of upgrade actions$$
 INSERT INTO bucardo.upgrade_log(action,summary,version)
   SELECT 'Initial install', '', setting
   FROM bucardo.bucardo_config
-  WHERE name = 'bucardo_version';
+  WHERE name = 'bucardo_initial_version';
 
 -- Allow users to insert messages in the Bucardo logs
 
