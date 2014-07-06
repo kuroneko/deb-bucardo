@@ -1,3 +1,9 @@
+bucardo (5.0.0-0kuroneko1) unstable; urgency=low
+
+  * Imported Upstream version 5.0.0 
+
+ -- Chris Collins <kuroneko@sysadninjas.net>  Sun, 06 Jul 2014 16:55:36 +1000
+
 bucardo (4.99.10-1) unstable; urgency=low
 
   * Imported Upstream version 4.99.10
