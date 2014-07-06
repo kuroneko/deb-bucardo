@@ -59,10 +59,10 @@ $t = q{Adding all sequences on the master works};
 $res = $bct->ctl("bucardo add all sequences relgroup=trelgroup");
 like ($res, qr/New sequences added: \d/, $t);
 
-## Create a new database group going from A to B and C
-$t = q{Created a new database group};
+## Create a new dbgroup going from A to B and C
+$t = q{Created a new dbgroup};
 $res = $bct->ctl(q{ bucardo add dbgroup pg A:source B:target C:target });
-like ($res, qr/Created database group "pg"/, $t);
+like ($res, qr/Created dbgroup "pg"/, $t);
 
 ## Create a new sync
 $t = q{Created a new sync};
@@ -111,7 +111,7 @@ for my $table (sort keys %tabletype) {
     $res = $dbhA->selectall_arrayref($SQL);
     my $type = $tabletype{$table};
     my $val1 = $val{$type}{1};
-    is_deeply ($res, [[$val1]], $t);
+    is_deeply ($res, [[$val1]], $t) or die;
 }
 
 ## Kick off the sync

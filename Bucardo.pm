@@ -5,7 +5,7 @@
 ##
 ## This script should only be called via the 'bucardo' program
 ##
-## Copyright 2006-2013 Greg Sabino Mullane <greg@endpoint.com>
+## Copyright 2006-2014 Greg Sabino Mullane <greg@endpoint.com>
 ##
 ## Please visit http://bucardo.org for more information
 
@@ -14,8 +14,9 @@ use 5.008003;
 use strict;
 use warnings;
 use utf8;
+use open qw( :std :utf8 );
 
-our $VERSION = '4.99.10';
+our $VERSION = '5.0.0';
 
 use DBI 1.51;                               ## How Perl talks to databases
 use DBD::Pg 2.0   qw( :async             ); ## How Perl talks to Postgres databases
@@ -222,7 +223,7 @@ sub new {
         created      => scalar localtime,
         mcppid       => $$,
         verbose      => 1,
-        logdest      => ['/var/log/bucardo'],
+        logdest      => ['.'],#'/var/log/bucardo'],
         warning_file => '',
         logseparate  => 0,
         logextension => '',
@@ -365,19 +366,23 @@ sub start_mcp {
         my $fh;
 
         ## Failing to open is not fatal here, just means no PID shown
+        my $oldpid;
         if (open ($fh, '<', $self->{pidfile})) {
             if (<$fh> =~ /(\d+)/) {
-                $extra = " (PID=$1)";
+                $oldpid = $1;
+                $extra = " (PID=$oldpid)";
             }
             close $fh or warn qq{Could not close "$self->{pidfile}": $!\n};
         }
 
         ## Output to the logfile, to STDERR, then exit
-        my $msg = qq{File "$self->{pidfile}" already exists$extra: cannot run until it is removed};
-        $self->glog($msg, LOG_WARN);
-        warn $msg;
+        if ($oldpid != $$) {
+            my $msg = qq{File "$self->{pidfile}" already exists$extra: cannot run until it is removed};
+            $self->glog($msg, LOG_WARN);
+            warn $msg;
 
-        exit 1;
+            exit 1;
+        }
     }
 
     ## We also refuse to run if the global stop file exists
@@ -520,6 +525,16 @@ sub start_mcp {
                  $DBIx::Safe::VERSION),
                 LOG_WARN);
 
+    ## Attempt to print the git hash to help with debugging if running a dev version
+    if (-d '.git') {
+        my $COM = 'git log -1';
+        my $log = '';
+        eval { $log = qx{$COM}; };
+        if ($log =~ /^commit ([a-f0-9]{40}).+Date:\s+(.+?)$/ms) {
+            $self->glog("Last git commit sha and date: $1 $2", LOG_NORMAL);
+        }
+    }
+
     ## Store some PIDs for later debugging use
     $self->{pidmap}{$$} = 'MCP';
     $self->{pidmap}{$self->{mcp_backend}} = 'Bucardo DB';
@@ -580,6 +595,44 @@ sub start_mcp {
         }
     }
 
+    local $SIG{USR2} = sub {
+
+        $self->glog("Received USR2 from pid $$, who is a $self->{logprefix}", LOG_DEBUG);
+
+        ## Go through and reopen anything that needs reopening
+        ## For now, that is only plain text files
+        for my $logdest (sort keys %{$self->{logcodes}}) {
+            my $loginfo = $self->{logcodes}{$logdest};
+
+            next if $loginfo->{type} ne 'textfile';
+
+            my $filename = $loginfo->{filename};
+
+            ## Reopen the same (named) file with a new filehandle
+            my $newfh;
+            if (! open $newfh, '>>', $filename) {
+                $self->glog("Warning! Unable to open new filehandle for $filename", LOG_WARN);
+                next;
+            }
+
+            ## Turn off buffering on this handle
+            $newfh->autoflush(1);
+
+            ## Overwrite the old sub and point to the new filehandle
+            my $oldfh = $loginfo->{filehandle};
+
+            $self->glog("Switching to new filehandle for log file $filename", LOG_NORMAL);
+            $loginfo->{code} = sub { print {$newfh} @_, $/ };
+            $self->glog("Completed reopen of file $filename", LOG_NORMAL);
+
+            ## Close the old filehandle, then remove it from our records
+            close $oldfh or warn "Could not close old filehandle for $filename: $!\n";
+            $loginfo->{filehandle} = $newfh;
+
+        }
+
+     };
+
     ## From this point forward, we want to die gracefully
     ## We setup our own subroutine to catch any die signals
     local $SIG{__DIE__} = sub {
@@ -591,6 +644,35 @@ sub start_mcp {
         my $msg = shift;
         my $line = (caller)[2];
         $self->glog("Warning: Killed (line $line): $msg", LOG_WARN);
+
+        ## Was this a database problem?
+        ## We can carefully handle certain classes of errors
+        if ($msg =~ /DBI|DBD/) {
+
+            ## How many bad databases we found
+            my $bad = 0;
+            for my $db (sort keys %{ $self->{sdb} }) { ## need a better name!
+                if (! exists $self->{sdb}{$db}{dbh} ) {
+                    $self->glog("Database $db has no database handle", LOG_NORMAL);
+                    $bad++;
+                }
+                elsif (! $self->{sdb}{$db}{dbh}->ping()) {
+                    $self->glog("Database $db failed ping check", LOG_NORMAL);
+                    $bad++;
+                }
+            }
+
+            if ($bad) {
+                my $changes = $self->check_sync_health();
+                if ($changes) {
+                    ## If we already made it MCP label, go there
+                    ## Else fallthrough and assume our bucardo.sync changes stick!
+                    if ($self->{mcp_loop_started}) {
+                        goto MCP;
+                    }
+                }
+            }
+        }
 
         ## The error message determines if we try to resurrect ourselves or not
         my $respawn = (
@@ -629,6 +711,26 @@ sub start_mcp {
         ## We will attempt a restart, but sleep a while first to avoid constant restarts
         $self->glog("Sleep time: $config{mcp_dbproblem_sleep}", LOG_TERSE);
         sleep($config{mcp_dbproblem_sleep});
+
+        ## Do a quick check for a stopfile
+        ## Bail if the stopfile exists
+        if (-e $self->{stopfile}) {
+            $self->glog(qq{Found stopfile "$self->{stopfile}": exiting}, LOG_WARN);
+            my $msg = 'Found stopfile';
+
+            ## Grab the reason, if it exists, so we can propagate it onward
+            my $mcpreason = get_reason(0);
+            if ($mcpreason) {
+                $msg .= ": $mcpreason";
+            }
+
+            ## Stop controllers, disconnect, remove PID file, etc.
+            $self->cleanup_mcp("$msg\n");
+
+            $self->glog('Exiting', LOG_WARN);
+            exit 0;
+        }
+
 
         ## We assume this is bucardo, and that we are in same directory as when called
         my $RUNME = $old0;
@@ -676,8 +778,8 @@ sub start_mcp {
 
         my $s = $self->{sync}{$syncname};
 
-        ## Skip inactive syncs
-        next unless $s->{mcp_active};
+        ## Skip inactive or paused syncs
+        next if !$s->{mcp_active} or $s->{paused};
 
         ## Walk through each database and check the roles, discarding inactive dbs
         my %rolecount;
@@ -710,8 +812,8 @@ sub start_mcp {
         ## Default to starting in a non-kicked mode
         $s->{kick_on_startup} = 0;
 
-        ## Skip inactive syncs
-        next unless $s->{mcp_active};
+        ## Skip inactive or paused syncs
+        next if  !$s->{mcp_active} or $s->{paused};
 
         ## Skip fullcopy syncs
         next if $s->{fullcopy};
@@ -739,10 +841,6 @@ sub start_mcp {
 
     die 'We should never reach this point!';
 
-    ##
-    ## Everything from this point forward in start_mcp is subroutines
-    ##
-
     return; ## no critic
 
 } ## end of start_mcp
@@ -769,6 +867,8 @@ sub mcp_main {
     my $lastvaccheck = 0;
 
     $self->glog('Entering main loop', LOG_TERSE);
+
+    $self->{mcp_loop_started} = 1;
 
   MCP: {
 
@@ -821,6 +921,8 @@ sub mcp_main {
 
                 next if $x->{dbtype} =~ /flat|mongo|redis/o;
 
+                next if $x->{status} eq 'stalled';
+
                 if (! $x->{dbh}->ping) {
                     ## Database is not reachable, so we'll try and reconnect
                     $self->glog("Ping failed for database $dbname, trying to reconnect", LOG_NORMAL);
@@ -856,16 +958,10 @@ sub mcp_main {
 
             next if $x->{dbtype} ne 'postgres';
 
-            ## Start listening for KIDs if we have not done so already
-            if (! exists $self->{kidpidlist}{$dbname}) {
-                $self->{kidpidlist}{$dbname} = 1;
-                $self->db_listen($x->{dbh}, 'kid_pid_start', $dbname, 1);
-                $self->db_listen($x->{dbh}, 'kid_pid_stop', $dbname, 1);
-                $x->{dbh}->commit();
-            }
+            next if $x->{status} eq 'stalled';
 
             my $nlist = $self->db_get_notices($x->{dbh});
-            $x->{dbh}->rollback();
+             $x->{dbh}->rollback();
             for my $name (keys %{ $nlist } ) {
                 if (! exists $notice->{$name}) {
                     $notice->{$name} = $nlist->{$name};
@@ -904,6 +1000,9 @@ sub mcp_main {
                 elsif (! $self->{sync}{$syncname}{mcp_active}) {
                     $msg = qq{Cannot kick inactive sync "$syncname"};
                 }
+                elsif ($self->{sync}{$syncname}{paused}) {
+                    $msg = qq{Cannot kick paused sync "$syncname"};
+                }
                 ## We also won't kick if this was created by a kid
                 ## This can happen as our triggerkicks may be set to 'always'
                 elsif (exists $self->{kidpidlist}{$npid}) {
@@ -915,7 +1014,7 @@ sub mcp_main {
                 }
 
                 if ($msg) {
-                    $self->glog($msg, LOG_TERSE);
+                    $self->glog($msg, $msg =~ /Unknown/ ? LOG_TERSE : LOG_VERBOSE);
                     ## As we don't want people to wait around for a syncdone...
                     $self->db_notify($maindbh, "syncerror_$syncname", 1);
                 }
@@ -938,6 +1037,60 @@ sub mcp_main {
                 $self->glog("Sync $syncdone has been killed", LOG_DEBUG);
                 ## Echo out to anyone listening
                 $self->db_notify($maindbh, $name, 1);
+                ## Check on the health of our databases, in case that was the reason the sync was killed
+                $self->check_sync_health($syncdone);
+            }
+            ## Request to pause a sync
+            elsif ($name =~ /^pause_sync_(.+)/o) {
+                my $syncname = $1;
+                my $msg;
+
+                ## We will not pause if this sync does not exist or it is inactive
+                if (! exists $self->{sync}{$syncname}) {
+                    $msg = qq{Warning: Unknown sync to be paused: "$syncname"\n};
+                }
+                elsif (! $self->{sync}{$syncname}{mcp_active}) {
+                    $msg = qq{Cannot pause inactive sync "$syncname"};
+                }
+                else {
+                    ## Mark it as paused, stop the kids and controller
+                    $sync->{$syncname}{paused} = 1;
+                    my $stopsync = "stopsync_$syncname";
+                    $self->db_notify($maindbh, "kid_$stopsync");
+                    $self->db_notify($maindbh, "ctl_$stopsync");
+                    $maindbh->commit();
+                    $self->glog(qq{Set sync "$syncname" as paused}, LOG_VERBOSE);
+                }
+                if (defined $msg) {
+                    $self->glog($msg, LOG_TERSE);
+                }
+            }
+            ## Request to resume a sync
+            elsif ($name =~ /^resume_sync_(.+)/o) {
+                my $syncname = $1;
+                my $msg;
+
+                ## We will not resume if this sync does not exist or it is inactive
+                if (! exists $self->{sync}{$syncname}) {
+                    $msg = qq{Warning: Unknown sync to be resumed: "$syncname"\n};
+                }
+                elsif (! $self->{sync}{$syncname}{mcp_active}) {
+                    $msg = qq{Cannot resume inactive sync "$syncname"};
+                }
+                else {
+                    ## Mark it as resumed
+                    my $s = $sync->{$syncname};
+                    $s->{paused} = 0;
+                    ## Since we may have accumulated deltas while pasued, set to autokick if needed
+                    if (!$s->{fullcopy} and $s->{autokick}) {
+                        $s->{kick_on_startup} = 1;
+                    }
+                    $self->glog(qq{Set sync "$syncname" as resumed}, LOG_VERBOSE);
+                    ## MCP will restart the CTL on next loop around
+                }
+                if (defined $msg) {
+                    $self->glog($msg, LOG_TERSE);
+                }
             }
             ## Request to reload the configuration file
             elsif ('reload_config' eq $name) {
@@ -990,6 +1143,7 @@ sub mcp_main {
             ## Request that a named sync get reloaded
             elsif ($name =~ /^reload_sync_(.+)/o) {
                 my $syncname = $1;
+                my $succeeded = 0;
 
                 ## Skip if the sync does not exist or is inactive
                 if (! exists $sync->{$syncname}) {
@@ -999,6 +1153,13 @@ sub mcp_main {
                     $self->glog(qq{Cannot reload: sync "$syncname" is not active}, LOG_TERSE);
                 }
                 else {
+
+                    ## reload overrides a pause
+                    if ($sync->{$syncname}{paused}) {
+                        $self->glog(qq{Resuming paused sync "$syncname"}, LOG_TERSE);
+                        $sync->{$syncname}{paused} = 0;
+                    }
+
                     $self->glog(qq{Deactivating sync "$syncname"}, LOG_TERSE);
                     $self->deactivate_sync($sync->{$syncname});
 
@@ -1045,9 +1206,14 @@ sub mcp_main {
                     else {
                         ## Let anyone listening know the sync is now ready
                         $self->db_notify($maindbh, "reloaded_sync_$syncname", 1);
+                        $succeeded = 1;
                     }
                     $maindbh->commit();
+
+                    $self->glog("Succeeded: $succeeded", LOG_WARN);
                 }
+                $self->db_notify($maindbh, "reload_error_sync_$syncname", 1)
+                    if ($succeeded != 1);
             }
 
             ## Request that a named sync get activated
@@ -1062,6 +1228,8 @@ sub mcp_main {
                 }
                 elsif ($self->activate_sync($sync->{$syncname})) {
                     $sync->{$syncname}{mcp_active} = 1;
+                    ## Just in case:
+                    $sync->{$syncname}{paused} = 0;
                     $maindbh->do(
                         'UPDATE sync SET status = ? WHERE name = ?',
                         undef, 'active', $syncname
@@ -1125,10 +1293,16 @@ sub mcp_main {
         ## Startup controllers for all eligible syncs
       SYNC: for my $syncname (keys %$sync) {
 
-            ## Skip if this sync has not been activated
-            next unless $sync->{$syncname}{mcp_active};
-
             my $s = $sync->{$syncname};
+
+            ## Skip if this sync has not been activated
+            next if ! $s->{mcp_active};
+
+            ## Skip if this one is paused
+            next if $s->{paused};
+
+            ## Skip is this one is stalled
+            next if $s->{status} eq 'stalled';
 
             ## If this is not a stayalive, AND is not being kicked, skip it
             next if ! $s->{stayalive} and ! $s->{kick_on_startup};
@@ -1269,6 +1443,204 @@ sub mcp_main {
     return;
 
 } ## end of mcp_main
+
+
+sub check_sync_health {
+
+    ## Check every database used by a sync
+    ## Typically called on demand when we know something is wrong
+    ## Marks any unreachable databases, and their syncs, as stalled
+    ## Arguments: none
+    ## Returns: number of bad databases detected
+
+    my $self = shift;
+
+    $self->glog('Starting check_sync_health', LOG_NORMAL);
+
+    ## How many bad databases did we find?
+    my $bad_dbs = 0;
+
+    ## No need to check databases more than once, as they can span across syncs
+    my $db_checked = {};
+
+    ## Do this at the sync level, rather than 'sdb', as we don't
+    ## want to check non-active syncs at all
+  SYNC: for my $syncname (sort keys %{ $self->{sync} }) {
+
+        my $sync = $self->{sync}{$syncname};
+
+        if ($sync->{status} ne 'active') {
+            $self->glog("Skipping $sync->{status} sync $syncname", LOG_NORMAL);
+            next SYNC;
+        }
+
+        ## Walk through each database used by this sync
+      DB: for my $dbname (sort keys %{ $sync->{db} }) {
+
+            ## Only check each database (by name) once
+            next if $db_checked->{$dbname}++;
+
+            $self->glog("Checking database $dbname for sync $syncname", LOG_DEBUG);
+
+            my $dbinfo = $sync->{db}{$dbname};
+
+            ## We only bother checking ones that are currently active
+            if ($dbinfo->{status} ne 'active') {
+                $self->glog("Skipping $dbinfo->{status} database $dbname for sync $syncname", LOG_NORMAL);
+                next DB;
+            }
+
+            ## Is this database valid or not?
+            my $isbad = 0;
+
+            my $dbh = $dbinfo->{dbh};
+
+            if (! ref $dbh) {
+                $self->glog("Database handle for database $dbname does not look valid", LOG_NORMAL);
+                if ($dbinfo->{dbtype} eq 'postgres') {
+                    $isbad = 1;
+                }
+                else {
+                    ## TODO: Account for other non dbh types
+                    next DB;
+                }
+            }
+            elsif (! $dbh->ping()) {
+                $isbad = 1;
+                $self->glog("Database $dbname failed ping", LOG_NORMAL);
+            }
+
+            ## If not marked as bad, assume good and move on
+            next DB unless $isbad;
+
+            ## Retry connection afresh: wrap in eval as one of these is likely to fail!
+            undef $dbinfo->{dbh};
+            eval {
+                ($dbinfo->{backend}, $dbinfo->{dbh}) = $self->connect_database($dbname);
+                $self->glog(qq{Database "$dbname" backend PID: $dbinfo->{backend}}, LOG_VERBOSE);
+                $self->show_db_version_and_time($dbinfo->{dbh}, qq{Database "$dbname" });
+            };
+
+            ## If we cannot connect, mark the db (and the sync) as stalled
+            if (! defined $dbinfo->{dbh}) {
+                $self->glog("Database $dbname is unreachable, marking as stalled", LOG_NORMAL);
+                $dbinfo->{status} = 'stalled';
+                $bad_dbs++;
+                if ($sync->{status} ne 'stalled') {
+                    $self->glog("Marked sync $syncname as stalled", LOG_NORMAL);
+                    $sync->{status} = 'stalled';
+                    $SQL = 'UPDATE bucardo.sync SET status = ? WHERE name = ?';
+                    eval {
+                        my $sth = $self->{masterdbh}->prepare($SQL);
+                        $sth->execute('stalled',$syncname);
+                    };
+                    if ($@) {
+                        $self->glog("Failed to set sync $syncname as stalled: $@", LOG_WARN);
+                        $self->{masterdbh}->rollback();
+                    }
+                }
+                $SQL = 'UPDATE bucardo.db SET status = ? WHERE name = ?';
+                my $sth = $self->{masterdbh}->prepare($SQL);
+                eval {
+                    $sth->execute('stalled',$dbname);
+                    $self->{masterdbh}->commit();
+                };
+                if ($@) {
+                    $self->glog("Failed to set db $dbname as stalled: $@", LOG_WARN);
+                    $self->{masterdbh}->rollback();
+                }
+
+            }
+
+        } ## end each database in this sync
+
+    } ## end each sync
+
+    ## If any databases were marked as bad, go ahead and stall other syncs that are using them
+    ## (todo)
+
+    return $bad_dbs;
+
+} ## end of check_sync_health
+
+
+sub restore_syncs {
+
+    ## Try to restore stalled syncs by checking its stalled databases
+    ## Arguments: none
+    ## Returns: number of syncs restored
+
+    my $self = shift;
+
+    $self->glog('Starting restore_syncs', LOG_DEBUG);
+
+    ## How many syncs did we restore?
+    my $restored_syncs = 0;
+
+    ## No need to check databases more than once, as they can span across syncs
+    my $db_checked = {};
+
+    ## If a sync is stalled, check its databases
+  SYNC: for my $syncname (sort keys %{ $self->{sync} }) {
+
+        my $sync = $self->{sync}{$syncname};
+
+        next SYNC if $sync->{status} ne 'stalled';
+
+        $self->glog("Checking stalled sync $syncname", LOG_DEBUG);
+
+        ## Number of databases restored for this sync only
+        my $restored_dbs = 0;
+
+        ## Walk through each database used by this sync
+      DB: for my $dbname (sort keys %{ $sync->{db} }) {
+
+            ## Only check each database (by name) once
+            next if $db_checked->{$dbname}++;
+
+            $self->glog("Checking database $dbname for sync $syncname", LOG_DEBUG);
+
+            my $dbinfo = $sync->{db}{$dbname};
+
+            ## All we need to worry about are stalled ones
+            next DB if $dbinfo->{status} ne 'stalled';
+
+            ## Just in case, remove the database handle
+            undef $dbinfo->{dbh};
+            eval {
+                ($dbinfo->{backend}, $dbinfo->{dbh}) = $self->connect_database($dbname);
+                $self->glog(qq{Database "$dbname" backend PID: $dbinfo->{backend}}, LOG_VERBOSE);
+                $self->show_db_version_and_time($dbinfo->{dbh}, qq{Database "$dbname" });
+            };
+
+            if (defined $dbinfo->{dbh}) {
+                $dbinfo->{status} = 'active';
+                $SQL = 'UPDATE bucardo.db SET status = ? WHERE name = ?';
+                my $sth = $self->{masterdbh}->prepare($SQL);
+                $sth->execute('active',$dbname);
+                $self->{masterdbh}->commit();
+                $restored_dbs++;
+                $self->glog("Sucessfully restored database $dbname: no longer stalled", LOG_NORMAL);
+            }
+
+        } ## end each database
+
+        ## If any databases were restored, restore the sync too
+        if ($restored_dbs) {
+            $sync->{status} = 'stalled';
+            $SQL = 'UPDATE bucardo.sync SET status = ? WHERE name = ?';
+            my $sth = $self->{masterdbh}->prepare($SQL);
+            $sth->execute('active',$syncname);
+            $self->{masterdbh}->commit();
+            $restored_syncs++;
+            $self->glog("Sucessfully restored sync $syncname: no longer stalled", LOG_NORMAL);
+        }
+
+    } ## end each sync
+
+    return $restored_syncs;
+
+} ## end of restore_syncs
 
 
 sub start_controller {
@@ -1910,6 +2282,16 @@ sub start_controller {
             ## At this point, the PID file does not exist or the kid is not responding
             if ($resurrect) {
                 ## XXX Try harder to kill it?
+                ## First clear out any old entries in the syncrun table
+                $sth = $sth{ctl_syncrun_end_now};
+                $count = $sth->execute("Old entry died (CTL $$)", $syncname);
+                if (1 == $count) {
+                    $info = $sth->fetchall_arrayref()->[0][0];
+                    $self->glog("Old syncrun entry removed during resurrection, start time was $info", LOG_NORMAL);
+                }
+                else {
+                    $sth->finish();
+                }
                 $self->glog("Resurrecting kid $syncname, resurrect was $resurrect", LOG_DEBUG);
                 $self->{kidpid} = $self->create_newkid($sync);
 
@@ -2040,6 +2422,15 @@ sub start_kid {
             $found_first_source = 1;
         }
 
+        ## If this is inactive, we've already checked that if it is a source in validate_sync
+        ## Thus, if we made it this far, it is a target and should be skipped
+        if ($x->{status} eq 'inactive') {
+            $self->glog(qq{Skipping inactive database "$dbname" entirely}, LOG_NORMAL);
+            ## Don't just skip it: nuke it from orbit! It's the only way to be sure.
+            delete $sync->{db}{$dbname};
+            next;
+        }
+
         ## Now set the default attributes
 
         ## Is this a SQL database?
@@ -2047,6 +2438,12 @@ sub start_kid {
 
         ## Can it do truncate?
         $x->{does_truncate} = 0;
+
+        ## Does it support asynchronous queries well?
+        $x->{does_async} = 0;
+
+        ## Does it have good support for ANY()?
+        $x->{does_ANY_clause} = 0;
 
         ## Can it do savepoints (and roll them back)?
         $x->{does_savepoints} = 0;
@@ -2060,8 +2457,11 @@ sub start_kid {
         ## Can it be queried?
         $x->{does_append_only} = 0;
 
-        ## List of tables in this database that do makedelta
-        $x->{is_makedelta} = {};
+        ## List of tables in this database that need makedelta inserts
+        $x->{does_makedelta} = {};
+
+        ## Does it have that annoying timestamp +dd bug?
+        $x->{has_mysql_timestamp_issue} = 0;
 
         ## Start clumping into groups and adjust the attributes
 
@@ -2073,6 +2473,8 @@ sub start_kid {
             $x->{does_savepoints} = 1;
             $x->{does_cascade}    = 1;
             $x->{does_limit}      = 1;
+            $x->{does_async}      = 1;
+            $x->{does_ANY_clause} = 1;
         }
 
         ## Drizzle
@@ -2082,6 +2484,7 @@ sub start_kid {
             $x->{does_truncate}   = 1;
             $x->{does_savepoints} = 1;
             $x->{does_limit}      = 1;
+            $x->{has_mysql_timestamp_issue} = 1;
         }
 
         ## MongoDB
@@ -2096,6 +2499,7 @@ sub start_kid {
             $x->{does_truncate}   = 1;
             $x->{does_savepoints} = 1;
             $x->{does_limit}      = 1;
+            $x->{has_mysql_timestamp_issue} = 1;
         }
 
         ## Oracle
@@ -2241,6 +2645,9 @@ sub start_kid {
         }
         $msg .= "\n";
 
+        (my $flatmsg = $msg) =~ s/\n/ /g;
+        $self->glog("Kid has died, error is: $flatmsg", LOG_TERSE);
+
         ## Drop connection to the main database, then reconnect
         if (defined $maindbh and $maindbh) {
             $maindbh->rollback;
@@ -2251,6 +2658,8 @@ sub start_kid {
         $self->glog("Final database backend PID: $finalbackend", LOG_VERBOSE);
         $sth{dbrun_delete} = $finaldbh->prepare($SQL{dbrun_delete});
 
+        $self->db_notify($finaldbh, 'kid_pid_stop', 1);
+
         ## Drop all open database connections, clear out the dbrun table
         for my $dbname (@dbs_dbi) {
             $x = $sync->{db}{$dbname};
@@ -2259,17 +2668,24 @@ sub start_kid {
                 next;
             };
 
-            ## Just in case we were in the middle of an async call:
-            $dbh->pg_cancel() if $dbh->{pg_async_status} > 0;
+            ## Is this still around?
+            if (!$dbh->ping) {
+                $self->glog("Ping failed for database $dbname", LOG_TERSE);
+                ## We'll assume no disconnect is necessary - but we'll undef it below just in case
+            }
+            else {
+                ## Rollback, finish all statement handles, and disconnect
+                $dbh->rollback();
+                $self->glog("Disconnecting from database $dbname", LOG_DEBUG);
+                $_->finish for values %{ $dbh->{CachedKids} };
+                $dbh->disconnect();
+            }
 
-            $dbh->rollback();
+            ## Make sure we don't think we are still in the middle of an async query
+            $x->{async_active} = 0;
 
-            ## Deregister ourself with the MCP
-            $self->db_notify($dbh, 'kid_pid_stop', 1);
-
-            $self->glog("Disconnecting from database $dbname", LOG_DEBUG);
-            $_->finish for values %{ $dbh->{CachedKids} };
-            $dbh->disconnect();
+            ## Make sure we never access this connection again
+            undef $dbh;
 
             ## Clear out the entry from the dbrun table
             $sth = $sth{dbrun_delete};
@@ -2301,8 +2717,6 @@ sub start_kid {
             }
         }
 
-        (my $flatmsg = $msg) =~ s/\n/ /g;
-
         ## Mark this syncrun as aborted if needed, replace the 'lastbad'
         my $status = "Failed : $flatmsg (KID $$)";
         $self->end_syncrun($finaldbh, 'bad', $syncname, $status);
@@ -2318,10 +2732,6 @@ sub start_kid {
 
         ## Done with database cleanups, so disconnect
         $finaldbh->disconnect();
-
-        if ($msg =~ /DBD::Pg/) {
-            $self->glog($flatmsg, LOG_TERSE);
-        }
 
         ## Send an email as needed (never for clean exit)
         if (! $self->{clean_exit} and $self->{sendmail} or $self->{sendmail_file}) {
@@ -2435,7 +2845,7 @@ sub start_kid {
 
             ## Register ourself with the MCP (if we are Postgres)
             if ($x->{dbtype} eq 'postgres') {
-                $self->db_notify($x->{dbh}, 'kid_pid_start', 1);
+                $self->db_notify($maindbh, 'kid_pid_start', 1, $dbname);
             }
         }
 
@@ -2470,7 +2880,7 @@ sub start_kid {
                                SELECT 1
                                FROM   bucardo.$g->{tracktable} t
                                WHERE  d.txntime = t.txntime
-                               AND    (t.target = DBGROUP::text OR t.target ~ '^T:')
+                               AND    (t.target = DBGROUP::text)
                             )
                     };
 
@@ -2496,7 +2906,7 @@ sub start_kid {
                         SELECT 1
                         FROM   bucardo.$g->{tracktable} t
                         WHERE  d.txntime = t.txntime
-                        AND    (t.target = DBGROUP::text OR t.target ~ '^T:')
+                        AND    (t.target = DBGROUP::text)
                     );
                 };
 
@@ -2542,7 +2952,7 @@ sub start_kid {
                     ## Set the per database/per table makedelta setting now
                     if (defined $g->{makedelta}) {
                         if ($g->{makedelta} eq 'on' or $g->{makedelta} =~ /\b$dbname\b/) {
-                            $x->{is_makedelta}{$S}{$T} = 1;
+                            $x->{does_makedelta}{$S}{$T} = 1;
                             $self->glog("Set table $dbname.$S.$T to makedelta", LOG_NORMAL);
                         }
                     }
@@ -2669,8 +3079,6 @@ sub start_kid {
 
             elsif ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
 
-                ## Serialize for this session
-                $xdbh->do('SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE');
                 ## ANSI mode: mostly because we want ANSI_QUOTES
                 $xdbh->do(q{SET sql_mode = 'ANSI'});
                 ## Use the same time zone everywhere
@@ -2905,7 +3313,7 @@ sub start_kid {
 
         ## Figure out our isolation level. Only used for Postgres
         ## All others are hard-coded as 'serializable'
-        my $isolation_level = defined $sync->{isolation_level} ? $sync->{isolation_level} : 
+        my $isolation_level = defined $sync->{isolation_level} ? $sync->{isolation_level} :
             $config{isolation_level} || 'serializable';
 
         ## Commit so our dbrun and syncrun stuff is visible to others
@@ -2929,7 +3337,7 @@ sub start_kid {
             }
 
             if ($x->{dbtype} eq 'mysql' or $x->{dbtype} eq 'mariadb') {
-                $x->{dbh}->do('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+                $x->{dbh}->do('SET TRANSACTION READ WRITE ISOLATION LEVEL SERIALIZABLE');
                 $self->glog(qq{Set database "$dbname" to serializable}, LOG_DEBUG);
             }
 
@@ -2938,8 +3346,8 @@ sub start_kid {
             }
 
             if ($x->{dbtype} eq 'oracle') {
-                $x->{dbh}->do('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
-                ## READ WRITE - can we set serializable and read write at the same time??
+                $x->{dbh}->do('SET TRANSACTION READ WRITE');
+                $x->{dbh}->do(q{SET TRANSACTION ISOLATION LEVEL SERIALIZABLE NAME 'bucardo'});
                 $self->glog(qq{Set database "$dbname" to serializable and read write}, LOG_DEBUG);
             }
 
@@ -2956,7 +3364,8 @@ sub start_kid {
 
         ## We may want to lock all the tables. Use sparingly
         my $lock_table_mode = '';
-        my $force_lock_file = "/tmp/bucardo-force-lock-$syncname";
+        my $force_lock_file = File::Spec->catfile( $config{piddir} => "bucardo-force-lock-$syncname" );
+
         ## If the file exists, pull the mode from inside it
         if (-e $force_lock_file) {
             $lock_table_mode = 'EXCLUSIVE';
@@ -2989,7 +3398,7 @@ sub start_kid {
                         $self->glog("Database $dbname: Locking table $com", LOG_TERSE);
                         $x->{dbh}->do("LOCK TABLE $com");
                     }
-                    elsif ('mysql' eq $x->{dbtype} or 'drizzle' eq $x->{dbtype} or 'mariadb' eq $x->{dbtype}) {
+                    elsif ('mysql' eq $x->{dbtype } or 'drizzle' eq $x->{dbtype} or 'mariadb' eq $x->{dbtype}) {
                         my $com = "$tname WRITE";
                         $self->glog("Database $dbname: Locking table $com", LOG_TERSE);
                         $x->{dbh}->do("LOCK TABLE $com");
@@ -3000,7 +3409,7 @@ sub start_kid {
                         $x->{dbh}->do("LOCK TABLE $com");
                     }
                     elsif ('sqlite' eq $x->{dbtype}) {
-                        ## BEGIN EXCLUSIVE? May not be needed...
+                        $x->{dbh}->do('BEGIN EXCLUSIVE TRANSACTION');
                     }
                 }
             }
@@ -3200,7 +3609,6 @@ sub start_kid {
                     ## If we skipped this, set the deltacount to zero and move on
                     if ($config{quick_delta_check}) {
                         if (! $x->{deltaquick}{"$S.$T"}) {
-                            $self->glog("Skipping $S.$T: no delta rows", LOG_DEBUG);
                             $deltacount{dbtable}{$dbname}{$S}{$T} = 0;
                             next;
                         }
@@ -3545,21 +3953,24 @@ sub start_kid {
                         $self->glog('Starting code_conflict', LOG_VERBOSE);
 
                         ## We pass it %conflict, and assume it will modify all the values therein
-                        my $code = $g->{code_conflict};
-                        $code->{info}{conflicts} = \%conflict;
+                        for my $code (@{ $g->{code_conflict} }) {
+                            $code->{info}{conflicts} = \%conflict;
 
-                        $self->run_kid_custom_code($sync, $code);
-                        ## Loop through and make sure the conflict handler has done its job
-                        while (my ($key, $winner) = each %conflict) {
-                            if (! defined $winner or ref $winner) {
-                                ($pkval = $key) =~ s/\0/\|/go;
-                                die "Conflict handler failed to provide a winner for $S.$T.$pkval";
+                            my $result = $self->run_kid_custom_code($sync, $code);
+                            ## Allow it to skip!
+
+                            ## Loop through and make sure the conflict handler has done its job
+                            while (my ($key, $winner) = each %conflict) {
+                                if (! defined $winner or ref $winner) {
+                                    ($pkval = $key) =~ s/\0/\|/go;
+                                    die "Conflict handler failed to provide a winner for $S.$T.$pkval";
+                                }
+                                if (! exists $deltabin{$winner}) {
+                                    ($pkval = $key) =~ s/\0/\|/go;
+                                    die "Conflict handler provided an invalid winner for $S.$T.$pkval: $winner";
+                                }
                             }
-                            if (! exists $deltabin{$winner}) {
-                                ($pkval = $key) =~ s/\0/\|/go;
-                                die "Conflict handler provided an invalid winner for $S.$T.$pkval: $winner";
-                            }
-                        }
+                        } ## end each code_conflict
                     }
                     ## If conflict_strategy is abort, simply die right away
                     elsif ('bucardo_abort' eq $g->{conflict_strategy}) {
@@ -3591,29 +4002,17 @@ sub start_kid {
 
                                 $x = $sync->{db}{$dbname};
 
-                                ## Start by assuming this DB has no changes
-                                $x->{lastmod} = 0;
+                                ## Find the maximum txntime across all tables in this sync
+                                my $maxsql = 'SELECT extract(epoch FROM MAX(txntime)) FROM';
+                                $SQL = join " UNION\n" =>
+                                    map { "$maxsql bucardo.$_->{deltatable}" }
+                                    grep { $_->{reltype} eq 'table'}
+                                        @$goatlist;
+                                $SQL .= ' ORDER BY 1 DESC NULLS LAST LIMIT 1';
 
-                                for my $g (@$goatlist) {
-
-                                    ## This only makes sense for tables
-                                    next if $g->{reltype} ne 'table';
-
-                                    ## Prep our SQL: find the epoch of the latest transaction for this table
-                                    if (!exists $g->{sql_max_delta}) {
-                                        $SQL = qq{SELECT extract(epoch FROM MAX(txntime)) FROM bucardo.$g->{deltatable} };
-                                        $g->{sql_max_delta} = $SQL;
-                                    }
-                                    $sth = $x->{dbh}->prepare($g->{sql_max_delta});
-                                    $sth->execute();
-                                    ## Keep in mind we don't really care which table this is
-                                    my $epoch = $sth->fetchall_arrayref()->[0][0];
-                                    ## May be undefined if no rows in the table yet: MAX forces a row back
-                                    if (defined $epoch and $epoch > $x->{lastmod}) {
-                                        $x->{lastmod} = $epoch;
-                                    }
-
-                                } ## end checking each table in the sync
+                                $sth = $x->{dbh}->prepare($SQL);
+                                $sth->execute();
+                                $x->{lastmod} = $sth->fetchall_arrayref()->[0][0] || 0;
 
                             } ## end checking each source database
 
@@ -3688,7 +4087,7 @@ sub start_kid {
                                             ## We need to know if any have run since the last time we ran this sync
                                             ## In other words, any deltas newer than the highest track entry
                                             $SQL = qq{SELECT COUNT(*) FROM bucardo.$g->{deltatable} d }
-                                                 . qq{WHERE d.txntime > }
+                                                 . q{WHERE d.txntime > }
                                                  . qq{(SELECT MAX(txntime) FROM bucardo.$g->{tracktable} }
                                                  . qq{WHERE target = '$x->{SYNCNAME}')};
                                             $g->{sql_got_delta} = $SQL;
@@ -4023,7 +4422,7 @@ sub start_kid {
                         ## XXX But this time, we want to enter a more aggressive conflict resolution mode
                         ## XXX Specifically, we need to ensure that a single database "wins" and that
                         ## XXX all table changes therein come from that database.
-                        ## XXX No need if we only have a single table, of course, or if there were 
+                        ## XXX No need if we only have a single table, of course, or if there were
                         ## XXX no possible conflicting changes.
                         ## XXX Finally, we skip if the first run already had a canonical winner
                         if (!$g->{has_exception_code}) {
@@ -4155,38 +4554,15 @@ sub start_kid {
                     }
                 }
                 ## For each database that had delta changes, insert rows to bucardo_track
-                ## We also need to consider makedelta:
-                ## For all tables that are marked as makedelta, we need to ensure
-                ## that we call the SQL below for each dbs_source in which
-                ## the deltacount for *any* other source dbname is non-zero
                 for my $dbname (@dbs_source) {
+
                     $x = $sync->{db}{$dbname};
 
                     $x->{needs_track} = 0;
 
                     if ($deltacount{dbtable}{$dbname}{$S}{$T}) {
                         $x->{needs_track} = 1;
-                    }
-                    elsif (exists $x->{is_makedelta}{$S}{$T}) { ## XXX set this earlier!
-                        ## We know that this particular table in this database is makedelta
-                        ## See if any of the other sources had deltas
-                        ## If they did, then rows were inserted here, so we need a track update
-                        my $found = 0;
-                        for my $dbname2 (@dbs_source) {
-                            if ($deltacount{dbtable}{$dbname}{$S}{$T}) {
-                                $found = 1;
-                                last;
-                            }
-                        }
-                    }
-                }
-
-                ## Kick off the track or stage update asynchronously
-                for my $dbname (@dbs_source) {
-                    $x = $sync->{db}{$dbname};
-
-                    if ($x->{needs_track}) {
-                        ## This is async:
+                        ## Kick off the track or stage update asynchronously
                         if ($x->{trackstage}) {
                             $sth{stage}{$dbname}{$g}->execute();
                         }
@@ -4463,7 +4839,6 @@ sub start_kid {
                 } ## end each database to be truncated/deleted
 
 
-
                 ## For this table, copy all rows from source to target(s)
                 $dmlcount{inserts} += $dmlcount{I}{target}{$S}{$T} = $self->push_rows(
                     'fullcopy', $S, $T, $g, $sync, $sourcedbh, $sourcename,
@@ -4571,7 +4946,7 @@ sub start_kid {
         ## If doing truncate, do some cleanup
         if (exists $self->{truncateinfo}) {
             ## For each source database that had a truncate entry, mark them all as done
-            $SQL  = 'UPDATE bucardo.bucardo_truncate_trigger SET replicated = now() WHERE sync = ?';
+            $SQL  = 'UPDATE bucardo.bucardo_truncate_trigger SET replicated = now() WHERE sync = ? AND replicated IS NULL';
             for my $dbname (@dbs_source) {
                 $x = $sync->{db}{$dbname};
                 $x->{sth} = $x->{dbh}->prepare($SQL, {pg_async => PG_ASYNC});
@@ -4819,7 +5194,7 @@ sub start_kid {
 
         redo KID;
 
-      } ## end KID
+    } ## end KID
 
         ## Disconnect from all the databases used in this sync
         for my $dbname (@dbs_dbi) {
@@ -4859,75 +5234,90 @@ sub start_kid {
         ## Bail out unless this error came from DBD::Pg
         $err_handler->($err) if $err !~ /DBD::Pg/;
 
-        ## We only do special things for certain errors, so check for those.
-        my ($sleeptime, $fail_msg) = (0,'');
-        my @states = map { $sync->{db}{$_}{dbh}->state } @dbs_dbi;
-        if (first { $_ eq '40001' } @states) {
-            $sleeptime = $config{kid_serial_sleep};
-            ## If set to -1, this means we never try again
-            if ($sleeptime < 0) {
-                $self->glog('Could not serialize, will not retry', LOG_VERBOSE);
-                $err_handler->($err);
+        eval {
+            ## We only do special things for certain errors, so check for those.
+            my ($sleeptime, $fail_msg) = (0,'');
+            my @states = map { $sync->{db}{$_}{dbh}->state } @dbs_dbi;
+            if (first { $_ eq '40001' } @states) {
+                $sleeptime = $config{kid_serial_sleep};
+                ## If set to -1, this means we never try again
+                if ($sleeptime < 0) {
+                    $self->glog('Could not serialize, will not retry', LOG_VERBOSE);
+                    $err_handler->($err);
+                }
+                elsif ($sleeptime) {
+                    $self->glog((sprintf 'Could not serialize, will sleep for %s %s',
+                                 $sleeptime, 1==$sleeptime ? 'second' : 'seconds'), LOG_NORMAL);
+                }
+                else {
+                    $self->glog('Could not serialize, will try again', LOG_NORMAL);
+                }
+                $fail_msg = 'Serialization failure';
             }
-            elsif ($sleeptime) {
-                $self->glog((sprintf "Could not serialize, will sleep for %s %s",
-                             $sleeptime, 1==$sleeptime ? 'second' : 'seconds'), LOG_NORMAL);
+            elsif (first { $_ eq '40P01' } @states) {
+                $sleeptime = $config{kid_deadlock_sleep};
+                ## If set to -1, this means we never try again
+                if ($sleeptime < 0) {
+                    $self->glog('Encountered a deadlock, will not retry', LOG_VERBOSE);
+                    $err_handler->($err);
+                }
+                elsif ($sleeptime) {
+                    $self->glog((sprintf 'Encountered a deadlock, will sleep for %s %s',
+                                 $sleeptime, 1==$sleeptime ? 'second' : 'seconds'), LOG_NORMAL);
+                }
+                else {
+                    $self->glog('Encountered a deadlock, will try again', LOG_NORMAL);
+                }
+                $fail_msg = 'Deadlock detected';
+                ## TODO: Get more information via get_deadlock_details()
             }
             else {
-                $self->glog('Could not serialize, will try again', LOG_NORMAL);
-            }
-            $fail_msg = "Serialization failure";
-        }
-        elsif (first { $_ eq '40P01' } @states) {
-            $sleeptime = $config{kid_deadlock_sleep};
-            ## If set to -1, this means we never try again
-            if ($sleeptime < 0) {
-                $self->glog('Encountered a deadlock, will not retry', LOG_VERBOSE);
                 $err_handler->($err);
             }
-            elsif ($sleeptime) {
-                $self->glog((sprintf "Encountered a deadlock, will sleep for %s %s",
-                             $sleeptime, 1==$sleeptime ? 'second' : 'seconds'), LOG_NORMAL);
+
+            if ($config{log_level_number} >= LOG_VERBOSE) {
+                ## Show complete error information in debug mode.
+                for my $dbh (map { $sync->{db}{$_}{dbh} } @dbs_dbi) {
+                    $self->glog(
+                        sprintf('*  %s: %s - %s', $dbh->{Name}, $dbh->state, $dbh->errstr),
+                        LOG_VERBOSE
+                    ) if $dbh->err;
+                }
             }
-            else {
-                $self->glog('Encountered a deadlock, will try again', LOG_NORMAL);
+
+            ## Roll everyone back
+            for my $dbname (@dbs_dbi) {
+                my $x = $sync->{db}{$dbname};
+                my $dbh = $x->{dbh};
+                ## Seperate eval{} for the rollback as we are probably still connected to the transaction.
+                eval { $dbh->rollback; };
+                if ($@) {
+                    $self->glog("Result of eval for rollback: $@", LOG_DEBUG);
+                }
+                ## We are certainly not async after this rollback
+                $x->{async_active} = 0;
             }
-            $fail_msg = "Deadlock detected";
-            ## TODO: Get more information via gett_deadlock_details()
-        }
-        else {
+
+            # End the syncrun.
+            $self->end_syncrun($maindbh, 'bad', $syncname, "Failed : $fail_msg (KID $$)" );
+            $maindbh->commit;
+
+            ## Tell listeners we are about to sleep
+            ## TODO: Add some sweet payload information: sleep time, which dbs/tables failed, etc.
+            $self->db_notify($maindbh, "syncsleep_${syncname}", 0, "$fail_msg. Sleep=$sleeptime");
+
+            ## Sleep and try again.
+            sleep $sleeptime if $sleeptime;
+            $kicked = 1;
+        };
+        if (my $err = $@) {
+            # Our recovery failed. :-(
             $err_handler->($err);
         }
-
-        if ($config{log_level_number} >= LOG_VERBOSE) {
-            ## Show complete error information in debug mode.
-            for my $dbh (map { $sync->{db}{$_}{dbh} } @dbs_dbi) {
-                $self->glog(
-                    sprintf('*  %s: %s - %s', $dbh->{Name}, $dbh->state, $dbh->errstr),
-                    LOG_VERBOSE
-                ) if $dbh->err;
-            }
+        else {
+            redo RUNKID;
         }
 
-        ## Roll everyone back
-        for my $dbname (@dbs_dbi) {
-            my $dbh = $sync->{db}{$dbname}{dbh};
-            $dbh->pg_cancel if $dbh->{pg_async_status} > 0;
-            $dbh->rollback;
-        }
-
-        # End the syncrun.
-        $self->end_syncrun($maindbh, 'bad', $syncname, "Failed : $fail_msg (KID $$)" );
-        $maindbh->commit;
-
-        ## Tell listeners we are about to sleep
-        ## TODO: Add some sweet payload information: sleep time, which dbs/tables failed, etc.
-        $self->db_notify($maindbh, "syncsleep_${syncname}", 0, "$fail_msg. Sleep=$sleeptime");
-
-        ## Sleep and try again.
-        sleep $sleeptime if $sleeptime;
-        $kicked = 1;
-        redo RUNKID;
     }
 
 } ## end of start_kid
@@ -4971,7 +5361,7 @@ sub connect_database {
 
         my $d = $db->{$id};
         $dbtype = $d->{dbtype};
-        if ($d->{status} ne 'active') {
+        if ($d->{status} eq 'inactive') {
             return 0, 'inactive';
         }
 
@@ -4981,7 +5371,10 @@ sub connect_database {
         }
 
         if ('postgres' eq $dbtype) {
-            $dsn = "dbi:Pg:dbname=$d->{dbname}";
+            $dsn = 'dbi:Pg:';
+            $dsn .= join ';', map {
+                ($_ eq 'dbservice' ? 'service' : $_ ) . "=$d->{$_}";
+            } grep { defined $d->{$_} and length $d->{$_} } qw/dbname dbservice/;
         }
         elsif ('drizzle' eq $dbtype) {
             $dsn = "dbi:drizzle:database=$d->{dbname}";
@@ -5004,10 +5397,6 @@ sub connect_database {
         }
         elsif ('oracle' eq $dbtype) {
             $dsn = "dbi:Oracle:dbname=$d->{dbname}";
-            $d->{dbhost} ||= ''; $d->{dbport} ||= ''; $d->{conn} ||= '';
-            defined $d->{dbhost} and length $d->{dbhost} and $dsn .= ";host=$d->{dbhost}";
-            defined $d->{dbport} and length $d->{dbport} and $dsn .= ";port=$d->{dbport}";
-            defined $d->{dbconn} and length $d->{dbconn} and $dsn .= ";$d->{dbconn}";
         }
         elsif ('redis' eq $dbtype) {
             my $dsn = {};
@@ -5048,7 +5437,7 @@ sub connect_database {
         $ssp = $d->{server_side_prepares};
     }
 
-    $self->glog("DSN: $dsn", LOG_NORMAL) if exists $config{log_level};
+    $self->glog("DSN: $dsn", LOG_VERBOSE) if exists $config{log_level};
 
     $dbh = DBI->connect
         (
@@ -5064,6 +5453,7 @@ sub connect_database {
     ## for other types.
     $self->{dbhlist}{$dbh} = $dbh;
 
+    ## From here on out we are setting Postgres-specific items, so everyone else is done
     if ($dbtype ne 'postgres') {
         return 0, $dbh;
     }
@@ -5177,33 +5567,42 @@ sub log_config {
 
 
 sub _logto {
+
     my $self = shift;
+
     if ($self->{logpid} && $self->{logpid} != $$) {
         # We've forked! Get rid of any existing handles.
         delete $self->{logcodes};
     }
-    return @{ $self->{logcodes} } if $self->{logcodes};
+
+    return $self->{logcodes} if $self->{logcodes};
 
     # Do no logging if any destination is "none".
-    return @{ $self->{logcodes} = [] }
-        if grep { $_ eq 'none' } @{ $self->{logdest} };
+    if (grep { $_ eq 'none' } @{ $self->{logdest} }) {
+        $self->{logcodes} = {};
+        return $self->{logcodes};
+    }
 
     $self->{logpid} = $$;
-    my %code_for;
+    my %logger;
     for my $dest (@{ $self->{logdest}} ) {
-        next if $code_for{$dest};
+
+        next if exists $logger{$dest};
+
         if ($dest eq 'syslog') {
+            ## Use Sys::Syslog to open a new syslog connection
             openlog 'Bucardo', 'pid nowait', $config{syslog_facility};
             ## Ignore the header argument for syslog output.
-            $code_for{syslog} = sub { shift; syslog 'info', @_ };
+            $logger{syslog} = { type => 'syslog', code => sub { shift; syslog 'info', @_ } };
         }
         elsif ($dest eq 'stderr') {
-            $code_for{stderr} = sub { print STDERR @_, $/ };
+            $logger{stderr} = { type => 'stderr', code => sub { print STDERR @_, $/ } };
         }
         elsif ($dest eq 'stdout') {
-            $code_for{stdout} = sub { print STDOUT @_, $/ };
+            $logger{stdout} = { type => 'stdout', code => sub { print STDOUT @_, $/ } };
         }
         else {
+            ## Just a plain text file
             my $fn = File::Spec->catfile($dest, 'log.bucardo');
             $fn .= ".$self->{logextension}" if length $self->{logextension};
 
@@ -5216,11 +5615,20 @@ sub _logto {
             ## Turn off buffering on this handle
             $fh->autoflush(1);
 
-            $code_for{$dest} = sub { print {$fh} @_, $/ };
+            $logger{$dest} = {
+                type       => 'textfile',
+                code       => sub { print {$fh} @_, $/ },
+                filename   => $fn,
+                filehandle => $fh,
+            };
+
         }
     }
 
-    return @{ $self->{logcodes} = [ values %code_for ] };
+    ## Store this away so the reopening via USR2 works
+    $self->{logcodes} = \%logger;
+
+    return \%logger;
 }
 
 sub glog { ## no critic (RequireArgUnpacking)
@@ -5244,8 +5652,8 @@ sub glog { ## no critic (RequireArgUnpacking)
     return if $loglevel > $config{log_level_number};
 
     ## Just return if there is no place to log to.
-    my @logs = $self->_logto;
-    return unless @logs || ($loglevel == LOG_WARN && $self->{warning_file});
+    my $logs = $self->_logto;
+    return unless keys %$logs || ($loglevel == LOG_WARN && $self->{warning_file});
 
     ## Remove newline from the end of the message, in case it has one
     chomp $msg;
@@ -5293,7 +5701,10 @@ sub glog { ## no critic (RequireArgUnpacking)
     }
 
     # Send it to all logs.
-    $_->($header, $msg) for @logs;
+    for my $log (sort keys %$logs) {
+        next if ! exists $logs->{$log}{code};
+        $logs->{$log}{code}->($header, $msg);
+    }
     return;
 
 } ## end of glog
@@ -5632,19 +6043,19 @@ sub db_notify {
     ## 1. Database handle
     ## 2. The string to send
     ## 3. Whether to skip payloads. Optional boolean, defaults to false
+    ## 4. Name of the database (as defined in bucardo.db). Optional
     ## Returns: undef
 
-    my ($self, $ldbh, $string, $skip_payload) = @_;
+    my ($self, $ldbh, $string, $skip_payload, $dbname) = @_;
 
     ## We make some exceptions to the payload system, mostly for early MCP notices
     ## This is because we don't want to complicate external clients with payload decisions
     $skip_payload = 0 if ! defined $skip_payload;
 
-    ## XXX TODO: We should make this log level test more generic and apply it elsewhere
-    ## Basically, there is no reason to invoke caller() if we are not going to use it
     if ($config{log_level_number} <= LOG_DEBUG) {
         my $line = (caller)[2];
-        $self->glog(qq{Sending NOTIFY "$string" (line $line)}, LOG_DEBUG);
+        my $showdb = defined $dbname ? " to db $dbname" : '';
+        $self->glog(qq{Sending NOTIFY "$string"$showdb (line $line)}, LOG_DEBUG);
     }
 
     if ($ldbh->{pg_server_version} < 90000 or $skip_payload) {
@@ -5833,17 +6244,33 @@ sub validate_sync {
     ## We also populate the "source" database as the first source we come across
     my ($sourcename,$srcdbh);
 
+    ## How many database were restored from a stalled state
+    my $restored_dbs = 0;
+
     for my $dbname (sort keys %{ $s->{db} }) {
 
         ## Helper var so we don't have to type this out all the time
         my $d = $s->{db}{$dbname};
 
         ## Check for inactive databases
-        if ($d->{status} ne 'active') {
+        if ($d->{status} eq 'inactive') {
             ## Source databases are never allowed to be inactive
             if ($d->{role} eq 'source') {
                 $self->glog("Source database $dbname is not active, cannot run this sync", LOG_WARN);
-                die "Source database $dbname is not active";
+                ## Normally, we won't get here as the sync should not be active
+                ## Mark the syncs as stalled and move on
+                $s->{status} = 'stalled';
+                $SQL = 'UPDATE bucardo.sync SET status = ? WHERE name = ?';
+                eval {
+                    my $sth = $self->{masterdbh}->prepare($SQL);
+                    $sth->execute('stalled',$syncname);
+                    $self->{masterdbh}->commit();
+                };
+                if ($@) {
+                    $self->glog("Failed to set sync $syncname as stalled: $@", LOG_WARN);
+                    $self->{masterdbh}->rollback();
+                }
+                return 0;
             }
             ## Warn about non-source ones, but allow the sync to proceed
             $self->glog("Database $dbname is not active, so it will not be used", LOG_WARN);
@@ -5861,11 +6288,61 @@ sub validate_sync {
                 next;
             }
             $self->glog(qq{Connecting to database "$dbname" ($role)}, LOG_TERSE);
-            ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
-            if (defined $x->{backend}) {
-                $self->glog(qq{Database "$dbname" backend PID: $x->{backend}}, LOG_VERBOSE);
+            eval {
+                ## We do not want the MCP handler here
+                local $SIG{__DIE__} = undef;
+                ($x->{backend}, $x->{dbh}) = $self->connect_database($dbname);
+            };
+            if (!defined $x->{backend}) {
+                ## If this was already stalled, we can simply reject the validation
+                if ($d->{status} eq 'stalled') {
+                    $self->glog("Stalled db $dbname failed again: $@", LOG_VERBOSE);
+                    return 0;
+                }
+                ## Wasn't stalled before, but is now!
+                ## This is a temporary setting: we don't modify masterdbh
+                $d->{status} = 'stalled';
+                return 0;
             }
+
+            $self->glog(qq{Database "$dbname" backend PID: $x->{backend}}, LOG_VERBOSE);
             $self->show_db_version_and_time($x->{dbh}, qq{DB "$dbname" });
+
+            ## If this db was previously stalled, restore it
+            if ($d->{status} eq 'stalled') {
+                $self->glog("Restoring stalled db $dbname", LOG_NORMAL);
+                $SQL = 'UPDATE bucardo.db SET status = ? WHERE name = ?';
+                my $sth = $self->{masterdbh}->prepare($SQL);
+                eval {
+                    $sth->execute('active',$dbname);
+                    $self->{masterdbh}->commit();
+                    $restored_dbs++;
+                    $d->{status} = 'active';
+                };
+                if ($@) {
+                    $self->glog("Failed to set db $dbname as active: $@", LOG_WARN);
+                    $self->{masterdbh}->rollback();
+                    ## If this fails, we don't want the sync restored
+                    $restored_dbs = 0;
+                }
+            }
+
+        }
+
+        ## If the whole sync was stalled but we retored its dbs above,
+        ## restore the sync as well
+        if ($restored_dbs) {
+            $self->glog("Restoring stalled sync $syncname", LOG_NORMAL);
+            $SQL = 'UPDATE bucardo.sync SET status = ? WHERE name = ?';
+            eval {
+                my $sth = $self->{masterdbh}->prepare($SQL);
+                $sth->execute('active',$syncname);
+                $s->{status} = 'active';
+            };
+            if ($@) {
+                $self->glog("Failed to set sync $syncname as active: $@", LOG_WARN);
+                $self->{masterdbh}->rollback();
+            }
         }
 
         ## Help figure out source vs target later on
@@ -5894,7 +6371,14 @@ sub validate_sync {
     ## Call validate_sync: checks tables, columns, sets up supporting
     ## schemas, tables, functions, and indexes as needed
 
-    $self->{masterdbh}->do("SELECT validate_sync('$syncname')");
+    eval {
+        local $SIG{__DIE__} = undef;
+        $self->{masterdbh}->do("SELECT validate_sync('$syncname')");
+    };
+    if ($@) {
+        $self->{masterdbh}->rollback;
+        return 0;
+    }
 
     ## Prepare some SQL statements for immediate and future use
     my %SQL;
@@ -6453,6 +6937,7 @@ sub validate_sync {
         my $l = "kick_sync_$syncname";
         for my $dbname (sort keys %{ $s->{db} }) {
             $x = $s->{db}{$dbname};
+            next if $x->{status} ne 'active';
             $self->glog("Listen for $l on $dbname ($x->{role})", LOG_DEBUG);
             next if $x->{role} ne 'source';
             my $dbh = $self->{sdb}{$dbname}{dbh};
@@ -6502,6 +6987,8 @@ sub activate_sync {
     ## But we do need to listen for deactivate and kick requests
     $self->db_listen($maindbh, "deactivate_sync_$syncname", '', 1);
     $self->db_listen($maindbh, "kick_sync_$syncname", '', 1);
+    $self->db_listen($maindbh, "pause_sync_$syncname", '', 1);
+    $self->db_listen($maindbh, "resume_sync_$syncname", '', 1);
     $maindbh->commit();
 
     ## Redo our process name to include an updated list of active syncs
@@ -6547,9 +7034,11 @@ sub deactivate_sync {
 
     ## Let any listeners know we are done
     $self->db_notify($maindbh, "deactivated_sync_$syncname");
-    ## We don't need to listen for deactivation or kick requests
+    ## We don't need to listen for deactivation or kick/pause/resume requests
     $self->db_unlisten($maindbh, "deactivate_sync_$syncname", '', 1);
     $self->db_unlisten($maindbh, "kick_sync_$syncname", '', 1);
+    $self->db_unlisten($maindbh, "pause_sync_$syncname", '', 1);
+    $self->db_unlisten($maindbh, "resume_sync_$syncname", '', 1);
     ## But we do need to listen for an activation request
     $self->db_listen($maindbh, "activate_sync_$syncname", '', 1);
     $maindbh->commit();
@@ -6646,6 +7135,10 @@ sub fork_and_inactivate {
     else { ## Kid
         ## Walk through the list of all known DBI databases
         ## Inactivate each one, then undef it
+
+        ## Change to a better prefix, so 'MCP' does not appear in the logs
+        $self->{logprefix} = $type;
+
         ## It is probably still referenced elsewhere, so handle that - how?
         for my $iname (keys %{ $self->{dbhlist} }) {
             my $ldbh = $self->{dbhlist}{$iname};
@@ -6661,10 +7154,12 @@ sub fork_and_inactivate {
         ## Clear the 'sdb' structure of any existing database handles
         if (exists $self->{sdb}) {
             for my $dbname (keys %{ $self->{sdb} }) {
-                for my $item (qw/ dbh /) {
-                    $self->{sdb}{$dbname}{$item}->{InactiveDestroy} = 1
-                        if exists $self->{sdb}{$dbname}{$item};
-                    delete $self->{sdb}{$dbname}{$item};
+                if (exists $self->{sync}{sdb}{$dbname}{dbh}) {
+                    if (ref $self->{sync}{sdb}{$dbname}{dbh}) {
+                        $self->glog("Removing sdb reference to database $dbname", LOG_DEBUG);
+                        $self->{sync}{sdb}{$dbname}{dbh}->{InactiveDestroy} = 1;
+                    }
+                    delete $self->{sync}{sdb}{$dbname}{dbh};
                 }
             }
         }
@@ -6673,22 +7168,24 @@ sub fork_and_inactivate {
         if (exists $self->{sync}) {
             if (exists $self->{sync}{name}) { ## This is a controller/kid with a single sync
                 for my $dbname (sort keys %{ $self->{sync}{db} }) {
-                    $self->glog("Removing reference to database $dbname", LOG_DEBUG);
-                        for my $item (qw/ dbh /) {
-                            $self->{sync}{db}{$dbname}{$item}->{InactiveDestroy} = 1
-                                if exists $self->{sync}{db}{$dbname}{$item};
-                            delete $self->{sync}{db}{$dbname}{$item};
+                    if (exists $self->{sync}{db}{$dbname}{dbh}) {
+                        if (ref $self->{sync}{db}{$dbname}{dbh}) {
+                            $self->glog("Removing reference to database $dbname", LOG_DEBUG);
+                            $self->{sync}{db}{$dbname}{dbh}->{InactiveDestroy} = 1;
                         }
+                        delete $self->{sync}{db}{$dbname}{dbh};
                     }
+                }
             }
             else {
                 for my $syncname (keys %{ $self->{sync} }) {
                     for my $dbname (sort keys %{ $self->{sync}{$syncname}{db} }) {
-                        $self->glog("Removing reference to database $dbname in sync $syncname", LOG_DEBUG);
-                        for my $item (qw/ dbh /) {
-                            $self->{sync}{$syncname}{db}{$dbname}{$item}->{InactiveDestroy} = 1
-                                if exists $self->{sync}{$syncname}{db}{$dbname}{$item};
-                            delete $self->{sync}{$syncname}{db}{$dbname}{$item};
+                        if (exists $self->{sync}{$syncname}{db}{$dbname}{dbh}) {
+                            if (ref $self->{sync}{$syncname}{db}{$dbname}{dbh}) {
+                                $self->glog("Removing reference to database $dbname in sync $syncname", LOG_DEBUG);
+                                $self->{sync}{$syncname}{db}{$dbname}{dbh}->{InactiveDestroy} = 1;
+                            }
+                            delete $self->{sync}{$syncname}{db}{$dbname}{dbh};
                         }
                     }
                 }
@@ -6892,7 +7389,7 @@ sub fork_vac {
                 $config{bucardo_vac} = 0;
 
                 ## Caught by handler above
-                die "Not needed";
+                die 'Not needed';
 
             }
 
@@ -6955,6 +7452,8 @@ sub reset_mcp_listeners {
             'reload_config',
             'log_message',
             'mcp_ping',
+            'kid_pid_start',
+            'kid_pid_stop',
     ) {
         $self->db_listen($maindbh, $l, '', 1);
     }
@@ -7004,6 +7503,9 @@ sub reload_mcp {
 
     ## Grab a list of all the current syncs from the database and store as objects
     $self->{sync} = $self->get_syncs();
+
+    ## Try and restore any stalled syncs
+    $self->restore_syncs();
 
     ## This unlistens any old syncs
     $self->reset_mcp_listeners();
@@ -7056,8 +7558,8 @@ sub reload_mcp {
         ## Reset some boolean flags for this sync
         $s->{mcp_active} = $s->{kick_on_startup} = $s->{controller} = 0;
 
-        ## If this sync is active, don't bother going any further
-        if ($s->{status} ne 'active') {
+        ## If this sync is not active or stalled, don't bother going any further
+        if ($s->{status} ne 'active' and $s->{status} ne 'stalled') {
             $self->glog(qq{Skipping sync "$syncname": status is "$s->{status}"}, LOG_TERSE);
             next;
         }
@@ -7454,13 +7956,13 @@ sub cleanup_controller {
         $reason = 'Normal exit';
     }
 
-    ## Ask all kids to exit as well
-    my $exitname = "kid_stopsync_$self->{syncname}";
-    $self->{masterdbh}->rollback();
-    $self->db_notify($self->{masterdbh}, $exitname);
-
     ## Disconnect from the master database
     if ($self->{masterdbh}) {
+        ## Ask all kids to exit as well
+        my $exitname = "kid_stopsync_$self->{syncname}";
+        $self->{masterdbh}->rollback();
+        $self->db_notify($self->{masterdbh}, $exitname);
+
         # Quick debug to find active statement handles
         # for my $s (@{$self->{masterdbh}{ChildHandles}}) {
         #    next if ! ref $s or ! $s->{Active};
@@ -7686,13 +8188,16 @@ sub create_newkid {
     ## Just in case, ask any existing kid processes to exit
     $self->db_notify($self->{masterdbh}, "kid_stopsync_$self->{syncname}");
 
+    ## Sleep a hair so we don't have the newly created kid get the message above
+#    sleep 1;
+
     ## Fork off a new process which will become the KID
     my $newkid = $self->fork_and_inactivate('KID');
 
     if ($newkid) { ## We are the parent
         my $msg = sprintf q{Created new kid %s for sync "%s"},
             $newkid, $self->{syncname};
-        $self->glog($msg, LOG_NORMAL);
+        $self->glog($msg, LOG_VERBOSE);
 
         ## Map this PID to a name for CTL use elsewhere
         $self->{pidmap}{$newkid} = 'KID';
@@ -8121,7 +8626,7 @@ sub run_kid_custom_code {
         my $maindbh = $self->{masterdbh};
         $self->db_notify($maindbh, $notify);
         sleep $config{endsync_sleep};
-        redo KID;
+        return 'redo';
     }
 
     ## The custom code has requested we retry this sync (exception code only)
@@ -8278,23 +8783,21 @@ sub delete_rows {
     my $pkcolsraw = $goat->{pkeycolsraw};
     my $numpks = $goat->{numpkcols};
 
-    ## Keep track of exact number of rows deleted from each target
-    my %count;
-
-    ## Allow for non-arrays by forcing to an array
-    if (ref $deldb ne 'ARRAY') {
-        $deldb = [$deldb];
-    }
-
-    my $newname = $goat->{newname}{$self->{syncname}};
-
     ## Have we already truncated this table? If yes, skip and reset the flag
     if (exists $goat->{truncatewinner}) {
         return 0;
     }
 
+    ## Ensure the target database argument is always an array
+    if (ref $deldb ne 'ARRAY') {
+        $deldb = [$deldb];
+    }
+
+    ## We may be going from one table to another - this is the mapping hash
+    my $newname = $goat->{newname}{$self->{syncname}};
+
     ## Are we truncating?
-    if (exists $self->{truncateinfo}{$S}{$T}) {
+    if (exists $self->{truncateinfo} and exists $self->{truncateinfo}{$S}{$T}) {
 
         ## Try and truncate each target
         for my $t (@$deldb) {
@@ -8309,6 +8812,7 @@ sub delete_rows {
             if ('postgres' eq $type) {
                 my $tdbh = $t->{dbh};
                 $tdbh->do("TRUNCATE table $tname", { pg_async => PG_ASYNC });
+                $t->{async_active} = time;
             } ## end postgres database
             ## For all other SQL databases, we simply truncate
             elsif ($x->{does_sql}) {
@@ -8319,11 +8823,9 @@ sub delete_rows {
             elsif ('mongo' eq $type) {
                 $self->{collection} = $t->{dbh}->get_collection($tname);
                 $self->{collection}->remove({}, { safe => 1} );
-                next;
             }
             ## For Redis, do nothing
             elsif ('redis' eq $type) {
-                next;
             }
             ## For flatfiles, write out a basic truncate statement
             elsif ($type =~ /flat/o) {
@@ -8336,10 +8838,10 @@ sub delete_rows {
 
         ## Final cleanup for each target
         for my $t (@$deldb) {
-            my $type = $t->{dbtype};
-            if ('postgres' eq $type) {
+            if ('postgres' eq $t->{dbtype}) {
                 ## Wrap up all the async truncate call
                 $t->{dbh}->pg_result();
+                $t->{async_active} = 0;
             }
         }
 
@@ -8350,7 +8852,8 @@ sub delete_rows {
     ## The number of items before we break it into a separate statement
     ## This is inexact, as we don't know how large each key is,
     ## but should be good enough as long as not set too high.
-    my $chunksize = $config{statement_chunk_size} || 10_000;
+    ## For now, all targets have the same chunksize
+    my $chunksize = $config{statement_chunk_size} || 8_000;
 
     ## Setup our deletion SQL as needed
     my %SQL;
@@ -8358,96 +8861,57 @@ sub delete_rows {
 
         my $type = $t->{dbtype};
 
+        ## Track the number of rows actually deleted from this target
+        $t->{deleted_rows} = 0;
+
+        ## Set to true when all rounds completed
+        $t->{delete_complete} = 0;
+
         ## No special preparation for mongo or redis
         next if $type =~ /mongo|redis/;
 
-        ## Set the type of SQL we are using: IN vs ANY
-        my $sqltype = '';
-        if ('postgres' eq $type) {
-            $sqltype = (1 == $numpks) ? 'ANY' : 'IN';
-        }
-        elsif ('mysql' eq $type or 'drizzle' eq $type or 'mariadb' eq $type) {
-            $sqltype = 'MYIN';
-        }
-        elsif ('oracle' eq $type) {
-            $sqltype = 'IN';
-        }
-        elsif ('sqlite' eq $type) {
-            $sqltype = 'IN';
-        }
-        elsif ($type =~ /flatpg/o) {
-            ## XXX Worth the trouble to allow building an ANY someday for flatpg?
-            $sqltype = 'IN';
-        }
-        elsif ($type =~ /flat/o) {
-            $sqltype = 'IN';
+        ## Set the type of SQL we are using: IN vs ANY. Default is IN
+        my $sqltype = 'IN';
+
+        ## Use of ANY is greatly preferred, but can only use if the
+        ## underlying database supports it, and if we have a single column pk
+        if ($t->{does_ANY_clause} and 1==$numpks) {
+            $sqltype = 'ANY';
         }
 
+        ## The actual target table name: may differ from the source!
         my $tname = $newname->{$t->{name}};
 
-        ## We may want to break this up into separate rounds if large
-        my $round = 0;
+        ## Internal counters to help us break queries into chunks if needed
+        my ($round, $roundtotal) = (0,0);
 
-        ## Internal counter of how many items we've processed this round
-        my $roundtotal = 0;
-
-        ## Postgres-specific optimization for a single primary key:
-        if ($sqltype eq 'ANY') {
-            $SQL{ANY}{$tname} ||= "$self->{sqlprefix}DELETE FROM $tname WHERE $pkcols = ANY(?)";
-            ## The array where we store each chunk
-            my @SQL;
+        ## Array to store each chunk of SQL
+        my @chunk;
+        ## Optimization for a single primary key using ANY(?)
+        if ('ANY' eq $sqltype and ! exists $SQL{ANY}{$tname}) {
+            $SQL{ANY}{$tname} = "$self->{sqlprefix}DELETE FROM $tname WHERE $pkcols = ANY(?)";
             for my $key (keys %$rows) {
-                push @{$SQL[$round]} => length $key ? ([split '\0', $key, -1]) : [''];
+                push @{$chunk[$round]} => length $key ? ([split '\0', $key, -1]) : [''];
                 if (++$roundtotal >= $chunksize) {
                     $roundtotal = 0;
                     $round++;
                 }
             }
-            $SQL{ANYargs} = \@SQL;
+            $SQL{ANYargs} = \@chunk;
         }
         ## Normal DELETE call with IN() clause
-        elsif ($sqltype eq 'IN') {
-            $SQL = sprintf '%sDELETE FROM %s WHERE %s IN (',
+        elsif ('IN' eq $sqltype and ! exists $SQL{IN}{$tname}) {
+            $SQL{IN}{$tname} = sprintf '%sDELETE FROM %s WHERE %s IN (',
                 $self->{sqlprefix},
                 $tname,
                 $pkcols;
-            ## The array where we store each chunk
-            my @SQL;
-            for my $key (keys %$rows) {
-                my $inner = length $key
-                    ? (join ',' => map { s/\'/''/go; s{\\}{\\\\}; qq{'$_'}; } split '\0', $key, -1)
-                    : q{''};
-                $SQL[$round] .= "($inner),";
-                if (++$roundtotal >= $chunksize) {
-                    $roundtotal = 0;
-                    $round++;
-                }
-            }
-            ## Cleanup
-            for (@SQL) {
-                chop;
-                $_ = "$SQL $_)";
-            }
-            $SQL{IN} = \@SQL;
-        }
-        ## MySQL IN clause
-        elsif ($sqltype eq 'MYIN') {
-            (my $safepk = $pkcols) =~ s/\"/`/go;
-            $SQL = sprintf '%sDELETE FROM %s WHERE %s IN (',
-                $self->{sqlprefix},
-                $tname,
-                $safepk;
-
-            ## The array where we store each chunk
-            my @SQL;
-
-            ## Quick workaround for a more standard timestamp
-            if ($goat->{pkeytype}[0] =~ /timestamptz/) {
+            my $inner;
+            if ($t->{has_mysql_timestamp_issue}) {
                 for my $key (keys %$rows) {
-                    my $inner = length $key
+                    $inner = length $key
                         ? (join ',' => map { s/\'/''/go; s{\\}{\\\\}; s/\+\d\d$//; qq{'$_'}; } split '\0', $key, -1)
                         : q{''};
-                    $SQL[$round] .= "($inner),";
+                    $chunk[$round] .= "($inner),";
                     if (++$roundtotal >= $chunksize) {
                         $roundtotal = 0;
                         $round++;
@@ -8456,10 +8920,10 @@ sub delete_rows {
             }
             else {
                 for my $key (keys %$rows) {
-                    my $inner = length $key
+                    $inner = length $key
                         ? (join ',' => map { s/\'/''/go; s{\\}{\\\\}; qq{'$_'}; } split '\0', $key, -1)
                         : q{''};
-                    $SQL[$round] .= "($inner),";
+                    $chunk[$round] .= "($inner),";
                     if (++$roundtotal >= $chunksize) {
                         $roundtotal = 0;
                         $round++;
@@ -8467,231 +8931,296 @@ sub delete_rows {
                 }
             }
             ## Cleanup
-            for (@SQL) {
+            for (@chunk) {
                 chop;
-                $_ = "$SQL $_)";
+                $_ = "$SQL{IN}{$tname} $_)";
             }
-            $SQL{MYIN} = \@SQL;
+            $SQL{IN}{$tname} = \@chunk;
         }
-    }
 
-    ## Do each target in turn
-    for my $t (@$deldb) {
+        $t->{delete_rounds} = @chunk;
 
-        my $type = $t->{dbtype};
-
-        my $tname = $newname->{$t->{name}};
-
-        if ('postgres' eq $type) {
-            my $tdbh = $t->{dbh};
-
-            ## Only the last will be async
-            ## In most cases, this means always async
-            my $count = 1==$numpks ? @{ $SQL{ANYargs} } : @{ $SQL{IN} };
-            for my $loop (1..$count) {
-                my $async = $loop==$count ? PG_ASYNC : 0;
-                my $pre = $count > 1 ? "/* $loop of $count */ " : '';
-                if (1 == $numpks) {
-                    $t->{deletesth} = $tdbh->prepare("$pre$SQL{ANY}{$tname}", { pg_async => $async });
-                    my $res = $t->{deletesth}->execute($SQL{ANYargs}->[$loop-1]);
-                    $count{$t} += $res unless $async;
-                }
-                else {
-                    $count{$t} += $tdbh->do($pre.$SQL{IN}->[$loop-1], { pg_direct => 1, pg_async => $async });
-                    $t->{deletesth} = 0;
-                }
-            }
-
-            next;
-
-        } ## end postgres database
-
-        if ('mongo' eq $type) {
-
-            ## Grab the collection name and store it
-            $self->{collection} = $t->{dbh}->get_collection($tname);
-
-            ## Because we may have multi-column primary keys, and each key may need modifying,
-            ## we have to put everything into an array of arrays.
-            ## The first level is the primary key number, the next is the actual values
-            my @delkeys = [];
-
-            ## The pkcolsraw variable is a simple comma-separated list of PK column names
-            ## The rows variable is a hash with the PK values as keys (the values can be ignored)
-
-            ## Binary PKs are easy: all we have to do is decode
-            ## We can assume that binary PK means not a multi-column PK
-            if ($goat->{hasbinarypkey}) {
-                @{ $delkeys[0] } = map { decode_base64($_) } keys %$rows;
+        ## If we bypassed because of a cached version, use the cached delete_rounds too
+        if ('ANY' eq $sqltype) {
+            if (exists $SQL{ANYrounds}{$tname}) {
+                $t->{delete_rounds} = $SQL{ANYrounds}{$tname};
             }
             else {
+                $SQL{ANYrounds}{$tname} = $t->{delete_rounds};
+            }
+        }
+        elsif ('IN' eq $sqltype) {
+            if (exists $SQL{INrounds}{$tname}) {
+                $t->{delete_rounds} = $SQL{INrounds}{$tname};
+            }
+            else {
+                $SQL{INrounds}{$tname} = $t->{delete_rounds};
+            }
+        }
 
-                ## Break apart the primary keys into an array of arrays
-                my @fullrow = map { length($_) ? [split '\0', $_, -1] : [''] } keys %$rows;
+        ## Empty our internal tracking items that may have been set previously
+        $t->{delete_round} = 0;
+        delete $t->{delete_sth};
 
-                ## Which primary key column we are currently using
-                my $pknum = 0;
+    }
 
-                ## Walk through each column making up the primary key
-                for my $realpkname (split /,/, $pkcolsraw, -1) {
+    ## Start the main deletion loop
+    ## The idea is to be efficient as possible by always having as many
+    ## async targets running as possible. We run one non-async at a time
+    ## before heading back to check on the asyncs.
 
-                    ## Grab what type this column is
-                    ## We need to map non-strings to correct types as best we can
-                    my $type = $goat->{columnhash}{$realpkname}{ftype};
+    my $done = 0;
+    my $did_something;
+    while (!$done) {
 
-                    ## For integers, we simply force to a Perlish int
-                    if ($type =~ /smallint|integer|bigint/o) {
-                        @{ $delkeys[$pknum] } = map { int $_->[$pknum] } @fullrow;
+        $did_something = 0;
+
+        ## Wrap up any async targets that have finished
+        for my $t (@$deldb) {
+            next if !$t->{async_active} or $t->{delete_complete};
+            if ('postgres' eq $t->{dbtype}) {
+                if ($t->{dbh}->pg_ready) {
+                    ## If this was a do(), we already have the number of rows
+                    if (1 == $numpks) {
+                        $t->{deleted_rows} += $t->{dbh}->pg_result();
                     }
-                    ## Non-integer numbers get set via the strtod command from the 'POSIX' module
-                    elsif ($type =~ /real|double|numeric/o) {
-                        @{ $delkeys[$pknum] } = map { strtod $_->[$pknum] } @fullrow;
-                    }
-                    ## Boolean becomes true Perlish booleans via the 'boolean' module
-                    elsif ($type eq 'boolean') {
-                        @{ $delkeys[$pknum] } = map { $_->[$pknum] eq 't' ? true : false } @fullrow;
-                    }
-                    ## Everything else gets a direct mapping
                     else {
-                        @{ $delkeys[$pknum] } = map { $_->[$pknum] } @fullrow;
+                        $t->{dbh}->pg_result();
                     }
-                    $pknum++;
+                    $t->{async_active} = 0;
                 }
-            } ## end of multi-column PKs
+            }
+            ## Don't need to check for invalid types: happens on the kick off below
+        }
 
-            ## How many items we end up actually deleting
-            $count{$t} = 0;
+        ## Kick off all dormant async targets
+        for my $t (@$deldb) {
 
-            ## We may need to batch these to keep the total message size reasonable
-            my $max = keys %$rows;
-            $max--;
+            ## Skip if this target does not support async, or is in the middle of a query
+            next if !$t->{does_async} or $t->{async_active} or $t->{delete_complete};
 
-            ## The bottom of our current array slice
-            my $bottom = 0;
+            ## The actual target name
+            my $tname = $newname->{$t->{name}};
 
-            ## This loop limits the size of our delete requests to mongodb
-          MONGODEL: {
-                ## Calculate the current top of the array slice
-                my $top = $bottom + $chunksize;
+            if ('postgres' eq $t->{dbtype}) {
 
-                ## Stop at the total number of rows
-                $top = $max if $top > $max;
+                ## Which chunk we are processing.
+                $t->{delete_round}++;
+                if ($t->{delete_round} > $t->{delete_rounds}) {
+                    $t->{delete_complete} = 1;
+                    next;
+                }
+                my $dbname = $t->{name};
+                $self->glog("Deleting from target $dbname.$tname. $t->{delete_round} of $t->{delete_rounds}", LOG_DEBUG);
 
-                ## If we have a single key, we can use the '$in' syntax
-                if ($numpks <= 1) {
-                    my @newarray = @{ $delkeys[0] }[$bottom..$top];
-                    my $result = $self->{collection}->remove(
-                        {$pkcolsraw => { '$in' => \@newarray }}, { safe => 1 });
-                    $count{$t} += $result->{n};
+                $did_something++;
+
+                ## Single primary key, so delete using the ANY(?) format
+                if (1 == $numpks) {
+                    ## Use the or-equal so we only prepare this once
+                    $t->{delete_sth} ||= $t->{dbh}->prepare("$SQL{ANY}{$tname}", { pg_async => PG_ASYNC });
+                    $t->{delete_sth}->execute($SQL{ANYargs}->[$t->{delete_round}-1]);
+                }
+                ## Multiple primary keys, so delete old school via IN ((x,y),(a,b))
+                else {
+                    my $pre = $t->{delete_rounds} > 1 ? "/* $t->{delete_round} of $t->{delete_rounds} */ " : '';
+                    ## The pg_direct tells DBD::Pg there are no placeholders, and to use PQexec directly
+                    $t->{deleted_rows} += $t->{dbh}->
+                        do($pre.$SQL{IN}{$tname}->[$t->{delete_round}-1], { pg_async => PG_ASYNC, pg_direct => 1 });
+                }
+
+                $t->{async_active} = time;
+            } ## end postgres
+            else {
+                die qq{Do not know how to do async for type $t->{dbtype}!\n};
+            }
+
+        } ## end all async targets
+
+        ## Kick off a single non-async target
+        for my $t (@$deldb) {
+
+            ## Skip if this target is async, or has no more rounds
+            next if $t->{does_async} or $t->{delete_complete};
+
+            $did_something++;
+
+            my $type = $t->{dbtype};
+
+            ## The actual target name
+            my $tname = $newname->{$t->{name}};
+
+            if ('mongo' eq $type) {
+
+                ## Grab the collection name and store it
+                $self->{collection} = $t->{dbh}->get_collection($tname);
+
+                ## Because we may have multi-column primary keys, and each key may need modifying,
+                ## we have to put everything into an array of arrays.
+                ## The first level is the primary key number, the next is the actual values
+                my @delkeys = [];
+
+                ## The pkcolsraw variable is a simple comma-separated list of PK column names
+                ## The rows variable is a hash with the PK values as keys (the values can be ignored)
+
+                ## Binary PKs are easy: all we have to do is decode
+                ## We can assume that binary PK means not a multi-column PK
+                if ($goat->{hasbinarypkey}) {
+                    @{ $delkeys[0] } = map { decode_base64($_) } keys %$rows;
                 }
                 else {
-                    ## For multi-column primary keys, we cannot use '$in', sadly.
-                    ## Thus, we will just call delete once per row
 
-                    ## Put the names into an easy to access array
-                    my @realpknames = split /,/, $pkcolsraw, -1;
+                    ## Break apart the primary keys into an array of arrays
+                    my @fullrow = map { length($_) ? [split '\0', $_, -1] : [''] } keys %$rows;
 
-                    my @find;
+                    ## Which primary key column we are currently using
+                    my $pknum = 0;
 
-                    ## Which row we are currently processing
-                    my $numrows = scalar keys %$rows;
-                    for my $rownumber (0..$numrows-1) {
-                        for my $pknum (0..$numpks-1) {
-                            push @find => $realpknames[$pknum], $delkeys[$pknum][$rownumber];
+                    ## Walk through each column making up the primary key
+                    for my $realpkname (split /,/, $pkcolsraw, -1) {
+
+                        ## Grab what type this column is
+                        ## We need to map non-strings to correct types as best we can
+                        my $type = $goat->{columnhash}{$realpkname}{ftype};
+
+                        ## For integers, we simply force to a Perlish int
+                        if ($type =~ /smallint|integer|bigint/o) {
+                            @{ $delkeys[$pknum] } = map { int $_->[$pknum] } @fullrow;
                         }
+                        ## Non-integer numbers get set via the strtod command from the 'POSIX' module
+                        elsif ($type =~ /real|double|numeric/o) {
+                            @{ $delkeys[$pknum] } = map { strtod $_->[$pknum] } @fullrow;
+                        }
+                        ## Boolean becomes true Perlish booleans via the 'boolean' module
+                        elsif ($type eq 'boolean') {
+                            @{ $delkeys[$pknum] } = map { $_->[$pknum] eq 't' ? true : false } @fullrow;
+                        }
+                        ## Everything else gets a direct mapping
+                        else {
+                            @{ $delkeys[$pknum] } = map { $_->[$pknum] } @fullrow;
+                        }
+                        $pknum++;
                     }
+                } ## end of multi-column PKs
 
-                    my $result = $self->{collection}->remove(
+                ## We may need to batch these to keep the total message size reasonable
+                my $max = keys %$rows;
+                $max--;
+
+                ## The bottom of our current array slice
+                my $bottom = 0;
+
+                ## This loop limits the size of our delete requests to mongodb
+              MONGODEL: {
+                    ## Calculate the current top of the array slice
+                    my $top = $bottom + $chunksize;
+
+                    ## Stop at the total number of rows
+                    $top = $max if $top > $max;
+
+                    ## If we have a single key, we can use the '$in' syntax
+                    if ($numpks <= 1) {
+                        my @newarray = @{ $delkeys[0] }[$bottom..$top];
+                        my $result = $self->{collection}->remove(
+                        {$pkcolsraw => { '$in' => \@newarray }}, { safe => 1 });
+                        $t->{deleted_rows} += $result->{n};
+                    }
+                    else {
+                        ## For multi-column primary keys, we cannot use '$in', sadly.
+                        ## Thus, we will just call delete once per row
+
+                        ## Put the names into an easy to access array
+                        my @realpknames = split /,/, $pkcolsraw, -1;
+
+                        my @find;
+
+                        ## Which row we are currently processing
+                        my $numrows = scalar keys %$rows;
+                        for my $rownumber (0..$numrows-1) {
+                            for my $pknum (0..$numpks-1) {
+                                push @find => $realpknames[$pknum], $delkeys[$pknum][$rownumber];
+                            }
+                        }
+
+                        my $result = $self->{collection}->remove(
                         { '$and' => \@find }, { safe => 1 });
 
-                    $count{$t} += $result->{n};
+                        $t->{deleted_rows} += $result->{n};
 
-                    ## We do not need to loop, as we just went 1 by 1 through the whole list
-                    last MONGODEL;
+                        ## We do not need to loop, as we just went 1 by 1 through the whole list
+                        last MONGODEL;
 
+                    }
+
+                    ## Bail out of the loop if we've hit the max
+                    last MONGODEL if $top >= $max;
+
+                    ## Assign the bottom of our array slice to be above the current top
+                    $bottom = $top + 1;
+
+                    redo MONGODEL;
                 }
 
-                ## Bail out of the loop if we've hit the max
-                last MONGODEL if $top >= $max;
-
-                ## Assign the bottom of our array slice to be above the current top
-                $bottom = $top + 1;
-
-                redo MONGODEL;
+                $self->glog("Mongo objects removed from $tname: $t->{deleted_rows}", LOG_VERBOSE);
             }
-
-            $self->glog("Mongo objects removed from $tname: $count{$t}", LOG_VERBOSE);
-            next;
-        }
-
-        if ('mysql' eq $type or 'drizzle' eq $type or 'mariadb' eq $type) {
-            my $tdbh = $t->{dbh};
-            for (@{ $SQL{MYIN} }) {
-                ($count{$t} += $tdbh->do($_)) =~ s/0E0/0/o;
-            }
-            next;
-        }
-
-        if ('oracle' eq $type) {
-            my $tdbh = $t->{dbh};
-            for (@{ $SQL{IN} }) {
-                ($count{$t} += $tdbh->do($_)) =~ s/0E0/0/o;
-            }
-            next;
-        }
-
-        if ('redis' eq $type) {
-            ## We need to remove the entire tablename:pkey:column for each column we know about
-            my $cols = $goat->{cols};
-            for my $pk (keys %$rows) {
-                ## If this is a multi-column primary key, change our null delimiter to a colon
-                if ($goat->{numpkcols} > 1) {
-                    $pk =~ s{\0}{:}go;
+            elsif ('mysql' eq $type or 'drizzle' eq $type or 'mariadb' eq $type
+                       or 'oracle' eq $type or 'sqlite' eq $type) {
+                my $tdbh = $t->{dbh};
+                for (@{ $SQL{IN}{$tname} }) {
+                    $t->{deleted_rows} += $tdbh->do($_);
                 }
-                $count = $t->{dbh}->del("$tname:$pk");
             }
-            next;
+            elsif ('redis' eq $type) {
+                ## We need to remove the entire tablename:pkey:column for each column we know about
+                my $cols = $goat->{cols};
+                for my $pk (keys %$rows) {
+                    ## If this is a multi-column primary key, change our null delimiter to a colon
+                    if ($goat->{numpkcols} > 1) {
+                        $pk =~ s{\0}{:}go;
+                    }
+                    $t->{deleted_rows} += $t->{dbh}->del("$tname:$pk");
+                }
+            }
+            elsif ($type =~ /flat/o) { ## same as flatpg for now
+                for (@{ $SQL{IN}{$tname} }) {
+                    print {$t->{filehandle}} qq{$_;\n\n};
+                }
+                $self->glog(qq{Appended to flatfile "$t->{filename}"}, LOG_VERBOSE);
+            }
+            else {
+                die qq{No support for database type "$type" yet!};
+            }
+
+            $t->{delete_complete} = 1;
+
+            ## Only one target at a time, please: we need to check on the asyncs
+            last;
+
+        } ## end async target
+
+        ## If we did nothing this round, and there are no asyncs running, we are done.
+        ## Otherwise, we will wait for the oldest async to finish
+        if (!$did_something) {
+            if (! grep { $_->{async_active} } @$deldb) {
+                $done = 1;
+            }
+            else {
+                ## Since nothing else is going on, let's wait for the oldest async to finish
+                my $t = ( sort { $a->{async_active} > $b->{async_active} } grep { $_->{async_active} } @$deldb)[0];
+                if (1 == $numpks) {
+                    $t->{deleted_rows} += $t->{dbh}->pg_result();
+                }
+                else {
+                    $t->{dbh}->pg_result();
+                }
+                $t->{async_active} = 0;
+            }
         }
 
-        if ('sqlite' eq $type) {
-            my $tdbh = $t->{dbh};
-            for (@{ $SQL{IN} }) {
-                ($count{$t} += $tdbh->do($_)) =~ s/0E0/0/o;
-            }
-            next;
-        }
+    } ## end of main deletion loop
 
-        if ($type =~ /flat/o) { ## same as flatpg for now
-            for (@{ $SQL{IN} }) {
-                print {$t->{filehandle}} qq{$_;\n\n};
-            }
-            $self->glog(qq{Appended to flatfile "$t->{filename}"}, LOG_VERBOSE);
-            next;
-        }
-
-        die qq{No support for database type "$type" yet!};
-    }
-
-    ## Final cleanup as needed (e.g. process async results)
-    for my $t (@$deldb) {
-        my $type = $t->{dbtype};
-
-        if ('postgres' eq $type) {
-
-            my $tdbh = $t->{dbh};
-
-            ## Wrap up all the async queries
-            ($count{$t} += $tdbh->pg_result()) =~ s/0E0/0/o;
-
-            ## Call finish if this was a statement handle (as opposed to a do)
-            if ($t->{deletesth}) {
-                $t->{deletesth}->finish();
-            }
-            delete $t->{deletesth};
-        }
-    }
-
-    $count = 0;
+    ## Generate our final deletion counts
+    my $count = 0;
     for my $t (@$deldb) {
 
         ## We do not delete from certain types of targets
@@ -8699,8 +9228,8 @@ sub delete_rows {
 
         my $tname = $newname->{$t->{name}};
 
-        $count += $count{$t};
-        $self->glog(qq{Rows deleted from $t->{name}.$tname: $count{$t}}, LOG_VERBOSE);
+        $count += $t->{deleted_rows};
+        $self->glog(qq{Rows deleted from $t->{name}.$tname: $t->{deleted_rows}}, LOG_VERBOSE);
     }
 
     return $count;
@@ -9035,7 +9564,8 @@ sub push_rows {
                 ##   normal action of a trigger and add a row to bucardo.track to indicate that
                 ##   it has already been replicated here.
                 my $dbinfo = $sync->{db}{ $t->{name} };
-                if (!$fullcopy and exists $dbinfo->{is_makedelta}{$S}{$T}) {
+                if (!$fullcopy and $dbinfo->{does_makedelta}{$S}{$T}) {
+                    $self->glog("Using makedelta to populate delta and track tables for $t->{name}.$tname", LOG_VERBOSE);
                     my ($cols, $vals);
                     if ($numpks == 1) {
                         $cols = "($pkcols)";
@@ -9052,7 +9582,16 @@ sub push_rows {
                     $dbh->do(qq{
                         INSERT INTO bucardo.$goat->{tracktable}
                         VALUES (NOW(), ?)
-                    }, undef, $t->{SYNCNAME});
+                    }, undef, $x->{DBGROUPNAME});
+
+                    $self->glog("Signalling all other syncs that this table has changed", LOG_DEBUG);
+                    $SQL = 'SELECT sync FROM bucardo.bucardo_delta_names WHERE sync <> ? AND tablename = ?';
+                    $sth = $dbh->prepare($SQL);
+                    $count = $sth->execute($syncname,$tname);
+                    for my $row (@{ $sth->fetchall_arrayref }) {
+                        my $othersync = $row->[0];
+                        $self->db_notify($dbh, "kick_sync_$othersync");
+                    }
                 }
             }
             elsif ('flatpg' eq $type) {
@@ -9384,7 +9923,7 @@ Bucardo - Postgres multi-master replication system
 
 =head1 VERSION
 
-This document describes version 4.99.10 of Bucardo
+This document describes version 5.0.0 of Bucardo
 
 =head1 WEBSITE
 
@@ -9394,12 +9933,12 @@ http://bucardo.org/
 
 =head1 DESCRIPTION
 
-Bucardo is a Perl module that replicates Postgres databases using a combination 
+Bucardo is a Perl module that replicates Postgres databases using a combination
 of Perl, a custom database schema, Pl/Perlu, and Pl/Pgsql.
 
 Bucardo is unapologetically extremely verbose in its logging.
 
-Full documentation can be found on the website, or in the files that came with 
+Full documentation can be found on the website, or in the files that came with
 this distribution. See also the documentation for the bucardo program.
 
 =head1 DEPENDENCIES
@@ -9422,12 +9961,12 @@ this distribution. See also the documentation for the bucardo program.
 
 =head1 BUGS
 
-Bugs should be reported to bucardo-general@bucardo.org. A list of bugs can be found at 
+Bugs should be reported to bucardo-general@bucardo.org. A list of bugs can be found at
 http://bucardo.org/bugs.html
 
 =head1 CREDITS
 
-Bucardo was originally developed and funded by Backcountry.com, who have been using versions 
+Bucardo was originally developed and funded by Backcountry.com, who have been using versions
 of it in production since 2002. Jon Jensen <jon@endpoint.com> wrote the original version.
 
 =head1 AUTHOR
@@ -9436,7 +9975,7 @@ Greg Sabino Mullane <greg@endpoint.com>
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright (c) 2005-2013 Greg Sabino Mullane <greg@endpoint.com>.
+Copyright (c) 2005-2014 Greg Sabino Mullane <greg@endpoint.com>.
 
 This software is free to use: see the LICENSE file for details.
 

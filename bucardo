@@ -3,7 +3,7 @@
 
 ## Script to control Bucardo
 ##
-## Copyright 2006-2013 Greg Sabino Mullane <greg@endpoint.com>
+## Copyright 2006-2014 Greg Sabino Mullane <greg@endpoint.com>
 ##
 ## Please see http://bucardo.org/ for full documentation
 ##
@@ -12,17 +12,24 @@
 package bucardo;
 use strict;
 use warnings;
+use utf8;
 use 5.008003;
+use open qw( :std :utf8 );
 use DBI;
-use IO::Handle    qw/ autoflush /;
-use Time::HiRes   qw/ sleep gettimeofday tv_interval /;
-use POSIX         qw/ ceil setsid localeconv /;
-use Data::Dumper  qw/ Dumper /;
+use IO::Handle      qw/ autoflush /;
+use File::Basename  qw/ dirname /;
+use Time::HiRes     qw/ sleep gettimeofday tv_interval /;
+use POSIX           qw/ ceil setsid localeconv /;
+use Config          qw/ %Config /;
+use Encode          qw/ decode /;
+use Encode::Locale  qw/ decode_argv /;
+use File::Spec;
+use Data::Dumper    qw/ Dumper /;
 $Data::Dumper::Indent = 1;
 use Getopt::Long;
 Getopt::Long::Configure(qw/ no_ignore_case pass_through no_autoabbrev /);
 
-our $VERSION = '4.99.10';
+our $VERSION = '5.0.0';
 
 ## For the tests, we want to check that it compiles without actually doing anything
 return 1 if $ENV{BUCARDO_TEST};
@@ -31,8 +38,11 @@ return 1 if $ENV{BUCARDO_TEST};
 *STDOUT->autoflush(1);
 *STDERR->autoflush(1);
 
+## Treat ARGV values as utf8
+decode_argv();
+
 ## All the variables we use often and want to declare here without 'my'
-use vars qw/$dbh $SQL $sth %sth $count $info %global $SYNC $GOAT $TABLE $SEQUENCE $DB $DBGROUP $HERD
+use vars qw/$dbh $SQL $sth %sth $count $info %global $SYNC $GOAT $TABLE $SEQUENCE $DB $DBGROUP $HERD $RELGROUP
             $CUSTOMCODE $CUSTOMNAME $CUSTOMCOLS /;
 
 ## How to show dates from the database, e.g. start time of a sync
@@ -66,7 +76,7 @@ my $bcargs = {
               bcverbose    => 1,
               dbname       => 'bucardo',
               dbuser       => 'bucardo',
-              dbpass       => '',
+              dbpass       => undef,
               sendmail     => 0,
               extraname    => '',
               logseparate  => 0,
@@ -179,6 +189,11 @@ if ($bcargs->{version}) {
     exit 0;
 }
 
+## Allow some options to be set by env
+if ($ENV{BUCARDO_CONFIRM} and ! exists $bcargs->{confirm}) {
+    $bcargs->{confirm} = $ENV{BUCARDO_CONFIRM};
+}
+
 # Determine the logging destination.
 if (exists $bcargs->{logdest}) {
     if (! ref $bcargs->{logdest}) {
@@ -256,6 +271,16 @@ install() if $verb =~ /instal/i;
 ## Display more detailed help than --help
 superhelp() if $verb eq 'help';
 
+my ($STOPFILE,$REASONFILE,$REASONFILE_LOG);
+
+## If we are trying a stop, and piddir is already set, do it now
+if ('stop' eq $verb and $bcargs->{piddir}) {
+    $STOPFILE = "$bcargs->{piddir}/fullstopbucardo";
+    $REASONFILE = 'bucardo.restart.reason.txt';
+    $REASONFILE_LOG = 'bucardo.restart.reason.log';
+    stop();
+}
+
 ## For everything else, we need to connect to a previously installed Bucardo database
 
 ## Create a quick data source name
@@ -281,11 +306,11 @@ $dbh->commit();
 ## Set some global variables based on information from the bucardo_config table
 
 ## The reason file records startup and shutdown messages
-my $REASONFILE = get_config('reason_file') or die "Invalid reason_file!\n";
-(my $REASONFILE_LOG = $REASONFILE) =~ s{(?:[.][^.]+)?$}{.log};
+$REASONFILE = get_config('reason_file') or die "Invalid reason_file!\n";
+($REASONFILE_LOG = $REASONFILE) =~ s{(?:[.][^.]+)?$}{.log};
 
 ## The directory Bucardo.pm writes PID and other information to
-my $PIDDIR = get_config('piddir') or die "Invalid piddir!\n";
+my $PIDDIR = $bcargs->{piddir} || get_config('piddir') or die "Invalid piddir!\n";
 
 ## The PID file of the master control file (MCP)
 ## If this exists, it is a good bet that Bucardo is currently running
@@ -293,7 +318,7 @@ my $PIDFILE = "$PIDDIR/bucardo.mcp.pid";
 
 ## The stop file whose existence tells all Bucardo processes to exit immediately
 my $stopfile = get_config('stopfile') or die "Invalid stopfile!\n";
-my $STOPFILE = "$PIDDIR/$stopfile";
+$STOPFILE = "$PIDDIR/$stopfile";
 
 ## Aliases for terms people may shorten, misspell, etc.
 ## Mostly used for database columns when doing an 'update'
@@ -315,7 +340,7 @@ my %column_no_change = (
     'cdate' => 1,
 );
 
-## Regular expression for a valid database group name
+## Regular expression for a valid dbgroup name
 my $re_dbgroupname = qr{\w[\w\d]*};
 
 ## Regular expression for a valid database name
@@ -341,10 +366,13 @@ start()         if $verb eq 'start' or $verb eq 'strt';
 restart()       if $verb eq 'restart';
 
 ## Reload the configuration file
-reload_config() if $verb eq 'reload' && $nouns[0] eq 'config';
+reload_config() if $verb eq 'reload' and defined $nouns[0] and $nouns[0] eq 'config';
 
-## Reload the whole daemon
-reload()        if $verb eq 'reload';
+## Reload the mcp (if args, we want reload_sync)
+reload() if $verb eq 'reload' and ! defined $nouns[0];
+
+# Reopen the log files
+reopen()        if $verb eq 'reopen';
 
 ## Show information about something: database, table, sync, etc.
 list_item()     if $verb eq 'list' or $verb eq 'l' or $verb eq 'lsit' or $verb eq 'liast'
@@ -375,7 +403,9 @@ validate()      if $verb eq 'validate';
 purge()         if $verb eq 'purge';
 
 ## There are only a few valid verbs left, so we check for them now
-if ($verb ne 'kick' and $verb ne 'activate' and $verb ne 'deactivate') {
+if ($verb ne 'kick' and $verb ne 'activate' and $verb ne 'deactivate'
+    and $verb ne 'reload'
+        and $verb ne 'pause' and $verb ne 'resume') {
     ## Show help and exit
     help(1, qq{Unknown command "$verb"\n});
 }
@@ -397,7 +427,7 @@ my $msg;
 SYNCMATCH: for my $sync (@nouns) {
 
     ## Quick skipping of noise word 'sync'
-    next if $sync eq 'sync';
+    next if $sync =~ /^syncs?$/;
 
     ## If this is a number, it's a timeout, so set it and skip to the next noun
     if ($sync =~ /^\d+$/) {
@@ -463,6 +493,13 @@ vate_sync() if $verb eq 'activate' or $verb eq 'deactivate';
 
 ## Kick one or more syncs
 kick() if $verb eq 'kick';
+
+## Pause or resume one or more syncs
+pause_resume($verb) if $verb eq 'pause' or $verb eq 'resume';
+
+## Reload one or more syncs
+reload_sync() if $verb eq 'reload';
+
 
 ## If we reach here (and we should not), display help and exit
 help(1);
@@ -560,6 +597,7 @@ sub _pod2usage {
         '-exitval' => 2,
         @_
     );
+    return;
 }
 
 sub help {
@@ -577,6 +615,8 @@ sub help {
         '-sections' => '^(?:USAGE|COMMANDS|OPTIONS)$',
         '-exitval'  => $exitval || 0,
     );
+
+    return;
 
 } ## end of help
 
@@ -636,7 +676,7 @@ sub superhelp {
     my @names;
     for my $noun (@nouns) {
         push @names => $names{ lc $noun } || $names{ standardize_name($noun) }
-            || help( 1, "Unknown command: " . join ' ' => @nouns );
+            || help( 1, 'Unknown command: ' . join ' ' => @nouns );
     }
 
     my @command = ($names[0]);
@@ -649,6 +689,8 @@ sub superhelp {
         push @command, => '!.+' if $names[0] eq 'add' || $names[0] eq 'update';
     }
     usage_exit(join('/' => @command), 0);
+
+    return;
 
 } ## end of superhelp
 
@@ -718,28 +760,37 @@ sub start {
     ## Refuse to go on if we get a ping response within 5 seconds
     $QUIET or print "Checking for existing processes\n";
 
-    ## We refuse to start if the MCP PID file exists
-    my $oldpid = 0;
+    ## We refuse to start if the MCP PID file exists and looks valid
     if (-e $PIDFILE) {
-        $msg = "Cannot start, PID file $PIDFILE exists\n";
         open my $fh, '<', $PIDFILE or die qq{Could not open "$PIDFILE": $!\n};
-        if (<$fh> !~ /(\d+)/) { ## no critic
+        my $pid = <$fh> =~ /(\d+)/ ? $1 : 0;
+        close $fh or warn qq{Could not close $PIDFILE: $!\n};
+
+        $msg = qq{Cannot start, PID file "$PIDFILE" exists\n};
+        if (!$pid) {
             warn qq{File "$PIDFILE" does not start with a PID!\n};
         }
         else {
-            $msg = "Cannot start, process $1 is already running (file=$PIDFILE)\n";
+            ## We have a PID, see if it is still alive
+            my $res = kill 0 => $pid;
+            if (0 == $res) {
+                warn qq{Removing file "$PIDFILE" with stale PID $pid\n};
+                unlink $PIDFILE;
+                $msg = '';
+            }
         }
-        close $fh or warn qq{Could not close $PIDFILE: $!\n};
 
-        $QUIET or print $msg;
+        if ($msg) {
+            $QUIET or print $msg;
 
-        append_reason_file('fail');
+            append_reason_file('fail');
 
-        exit 1;
+            exit 1;
+        }
     }
 
     ## Verify that the version in the database matches our version
-    my $dbversion = get_config('bucardo_current_version')
+    my $dbversion = get_config('bucardo_version')
         or die "Could not find Bucardo version!\n";
     if ($dbversion ne $VERSION) {
         my $message = "Version mismatch: bucardo is $VERSION, but bucardo database is $dbversion\n";
@@ -750,6 +801,11 @@ sub start {
     }
 
     ## Create a new Bucardo daemon
+    ## If we are a symlink, put the source directory in our path
+    if (-l $progname and readlink $progname) {
+        my $dir = dirname( readlink $progname );
+        unshift @INC, $dir;
+    }
     require Bucardo;
     $bcargs->{exit_on_nosync} = delete $bcargs->{'exit-on-nosync'}
         if exists $bcargs->{'exit-on-nosync'};
@@ -767,7 +823,7 @@ sub start {
     stop_bucardo();
 
     if (-e $STOPFILE) {
-        print "Removing $STOPFILE\n" unless $QUIET;
+        print qq{Removing file "$STOPFILE"\n} unless $QUIET;
         unlink $STOPFILE;
     }
 
@@ -849,6 +905,45 @@ sub restart {
 } ## end of restart
 
 
+sub reload {
+
+    ## Reload the MCP daemon
+    ## Effectively restarts everything
+    ## Arguments: none
+    ## Returns: never, exits
+
+    ## Is Bucardo active?
+    my $pong = 'bucardo_mcp_pong';
+    $dbh->do("LISTEN $pong");
+    $dbh->do('NOTIFY bucardo_mcp_ping');
+    $dbh->commit();
+    ## Wait a little bit, then scan for the confirmation message
+    sleep 0.1;
+    if (! wait_for_notice($dbh, $pong, 2)) {
+        die "Looks like Bucardo is not running, so there is no need to reload\n";
+    }
+
+    ## We want to wait to hear from the MCP that it is done
+    my $done = 'bucardo_reloaded_mcp';
+    $dbh->do('NOTIFY bucardo_mcp_reload');
+    $dbh->do("LISTEN $done");
+    $dbh->commit();
+
+    ## Wait a little bit, then scan for the confirmation message
+    sleep 0.1;
+    my $timeout = $adverb || get_config('reload_config_timeout') || 30;
+    if (! wait_for_notice($dbh, $done, $timeout) ) {
+        die "Waited ${timeout}s, but Bucardo never confirmed the reload!\n"
+          . "HINT: Pass a longer timeout to the reload_config command or set the\n"
+          . "reload_config_timeout configuration setting to wait longer\n";
+    }
+    print "DONE!\n";
+
+    exit 0;
+
+} ## end of reload
+
+
 sub reload_config {
 
     ## Reload configuration settings from the bucardo database,
@@ -905,23 +1000,42 @@ sub wait_for_notice {
     ## Keep hanging out until we get the notice we are waiting for
     ## Arguments: three
     ## 1. Database handle
-    ## 2. String to listen for
+    ## 2. String(s) to listen for
     ## 3. How long to wait (default is forever)
     ## Returns: 1
+    ## If the strings argument is an array ref, this will return a hash ref
+    ## where each key is a string we found, and the value is how many times we
+    ## found it. Note that we return as soon as we've found at least one
+    ## matching NOTIFY; we don't wait for the full timeout to see which
+    ## messages show up.
 
     my ($ldbh, $string, $howlong) = @_;
+    my ($num_strings, %search_strings, %matches);
+    my $found = 0;
+    if (ref $string eq 'ARRAY') {
+        $num_strings = scalar @$string;
+        map { $search_strings{$_} = 1 } @$string;
+    }
+    else {
+        $num_strings = 1;
+        $search_strings{$string} = 1;
+    }
 
     my $start_time = [gettimeofday];
 
   WAITIN: {
         for my $notice (@{ db_get_notices($ldbh) }) {
             my ($name) = @$notice;
-            last WAITIN if $name eq $string;
+            if (exists $search_strings{$name}) {
+                $found = 1;
+                $matches{$name}++;
+            }
         }
+        last WAITIN if $found;
 
         if (defined $howlong) {
             my $elapsed = tv_interval( $start_time );
-            return 0 if $elapsed >= $howlong;
+            return 0 if ($elapsed >= $howlong and (scalar keys %matches == 0));
         }
 
         $dbh->commit();
@@ -929,12 +1043,26 @@ sub wait_for_notice {
         redo;
     }
 
-    return 1;
-
+    if (scalar keys %matches) {
+        if ($num_strings == 1) {
+            return 1;
+        }
+        else {
+            return \%matches;
+        }
+    }
+    else {
+        if ($num_strings == 1) {
+            return 0;
+        }
+        else {
+            return {};
+        }
+    }
 } ## end of wait_for_notice
 
 
-sub reload {
+sub reload_sync {
 
     ## Ask for one or more syncs to be reloaded
     ## Arguments: none directly (but processes the nouns for a list of syncs)
@@ -967,21 +1095,77 @@ sub reload {
 
         ## We wait for the MCP to tell us that each sync is done reloading
         my $done = "bucardo_reloaded_sync_$syncname";
+        my $err  = "bucardo_reload_error_sync_$syncname";
         print "Reloading sync $syncname...";
         $dbh->do(qq{LISTEN "$done"});
+        $dbh->do(qq{LISTEN "$err"});
         $dbh->do(qq{NOTIFY "bucardo_reload_sync_$syncname"});
         $dbh->commit();
 
         ## Sleep a little, then wait until we hear a confirmation from the MCP
         sleep 0.1;
-        wait_for_notice($dbh, $done);
+        my $res = wait_for_notice($dbh, [$err, $done], 10);
+        if ($res == 0 or scalar keys %$res == 0) {
+            print "Reload of sync $syncname failed; reload response message never received\n";
+        }
+        elsif (exists $res->{$done}) {
+            print "Reload of sync $syncname successful\n";
+        }
+        elsif (exists $res->{$err}) {
+            print "Reload of sync $syncname failed\n";
+        }
+        else {
+            print "ERROR. Reload results unavailable, because something weird happened.\n";
+        }
         print "\n";
 
     } ## end each sync to be reloaded
 
     exit 0;
 
-} ## end of reload
+} ## end of reload_sync
+
+
+sub reopen {
+
+    ## Signal the bucardo processes that they should reopen any log files
+    ## Used after a log rotation
+    ## Sends a USR2 to all Bucardo processes
+    ## Arguments: none
+    ## Returns: never, exits
+
+    open my $fh, '<', $PIDFILE
+        or die qq{Could not open pid file $PIDFILE: is Bucardo running?\n};
+
+    ## Grab the PID of the MCP
+    if (<$fh> !~ /(\d+)/) { ## no critic
+        die qq{Could not find a PID in file $PIDFILE!\n};
+    }
+    close $fh or warn qq{Could not close $PIDFILE: $!\n};
+
+    my $gid = getpgrp $1;
+    $gid =~ /^\d+$/ or die qq{Unable to obtain the process group\n};
+
+    ## Quick mapping of names to numbers so we can kill effectively
+    my $x = 0;
+    my %signumber;
+    for (split(' ', $Config{sig_name})) {
+        $signumber{$_} = $x++;
+    }
+
+    my $signumber = $signumber{USR2};
+
+    ## The minus indicates we are sending to the whole group
+    my $num = kill -$signumber, $gid;
+    if ($num < 1) {
+        warn "Unable to signal any processed with USR2\n";
+        exit 1;
+    }
+    $QUIET or print "Sent USR2 to Bucardo processes\n";
+
+    exit 0;
+
+} ## end of reopen
 
 
 sub validate {
@@ -1203,6 +1387,8 @@ sub add_item {
 
     usage_exit($doc_section);
 
+    return;
+
 } ## end of add_item
 
 
@@ -1235,7 +1421,9 @@ sub update_item {
 
     ## The update function returns, due to recursion, so we must exit.
     $code->(@nouns);
+
     exit 0;
+
 } ## end of update_item
 
 
@@ -1313,6 +1501,7 @@ sub list_item {
     } # SWITCH
 
     exit 0;
+
 } ## end of list_item
 
 
@@ -1346,6 +1535,8 @@ sub remove_item {
     ## Do not know how to remove anything else
     usage_exit($doc_section);
 
+    return;
+
 } ## end of remove_item
 
 
@@ -1362,71 +1553,124 @@ sub add_database {
     ## 2+ name=value parameters, dash-dash arguments
     ## Returns: undef
     ## Example: bucardo add db nyc1 dbname=nyc1 dbhost=nyc1.example.com dbgroup=sales
+    ## Example: bucardo add dbs nyc1,nyc2 dbname=nyc1,nyc2 dbgroup=sales
 
     ## Grab our generic usage message
     my $doc_section = 'add/add db';
 
-    ## The first word is the internal name (bucardo.db.name)
+    ## The first word is the internal name (bucardo.db.name) - may have commas
     my $item_name = shift @nouns || '';
 
     ## No name is a problem
     usage_exit($doc_section) unless length $item_name;
 
+    ## We may have more than one database specified at once
+    ## Assign to an array, and set the role as well in case a dbgroup is set
+    my $db_names = [];
+    my $newsource = 0;
+    for my $entry (split /\s*,\s*/ => $item_name) {
+        ## First database defaults to source, others to targets
+        if (! @$db_names and $entry !~ /:/) {
+            $entry .= ':source';
+            $newsource = 1;
+        }
+        push @{ $db_names } => [ extract_name_and_role($entry) ];
+    }
+
     ## Inputs and aliases, database column name, flags, default value
     my $validcols = qq{
-        null                     name                 0                $item_name
         type|dbtype              dbtype               0                postgres
-        user|username|dbuser     dbuser               0                bucardo
         pass|password|dbpass     dbpass               0                null
         db|dbname                dbname               0                null
-        port|dbport|pgport       dbport               numeric          ENV:PGPORT
+        port|dbport|pgport       dbport               0                ENV:PGPORT
         host|dbhost|pghost       dbhost               0                ENV:PGHOSTADDR|PGHOST
         conn|dbconn|pgconn       dbconn               0                null
         stat|status              status               =active|inactive null
-        group|dbgroup            none                 0                skip
-        addalltables             none                 0                skip
-        addallsequences          none                 0                skip
+        group|dbgroup            dbgroup              0                null
+        addalltables             none                 0                null
+        addallsequences          none                 0                null
         server_side_prepares|ssp server_side_prepares TF               null
         service|dbservice        dbservice            0                null
     };
 
+    ## Include the value for the dbuser only if a service is not specified, or
+    ## a user was explicitly included. In other words, don't default the user
+    ## name when there's a service.
+    $validcols .= "user|username|dbuser     dbuser               0                bucardo\n"
+        if ((! grep { /^(db)?service=/ } @nouns) || grep { /^(db)?user(name)?=/ } @nouns);
 
-    my ( $dbcols, $cols, $phs, $vals, $extra ) = process_simple_args({
+    my ($dbcols) = process_simple_args({
         cols        => $validcols,
         list        => \@nouns,
         doc_section => $doc_section,
     });
 
-    ## Must have a database name
-    if (! exists $vals->{dbname}) {
+    ## Must have a database name unless using a service
+    if (! exists $dbcols->{dbname} && ! exists $dbcols->{dbservice}) {
         print qq{Cannot add database: must supply a database name to connect to\n};
         exit 1;
     }
 
     ## Cannot add if already there
-    if (exists $DB->{$item_name}) {
-        print qq{Cannot add database: the name "$item_name" already exists\n};
-        exit 1;
+    for my $db (map { $_->[0] } @$db_names) {
+        if (exists $DB->{ $db }) {
+            print qq{Cannot add database: the name "$db" already exists\n};
+            exit 1;
+        }
     }
 
     ## Clean up and standardize the type name
-    my $dbtype = $vals->{dbtype} = standardize_rdbms_name($vals->{dbtype});
+    my $dbtype = $dbcols->{dbtype} = standardize_rdbms_name($dbcols->{dbtype});
 
-    ## Attempt to insert this into the database
-    $SQL = "INSERT INTO bucardo.db ($cols) VALUES ($phs)";
-    debug("SQL: $SQL");
-    debug(Dumper $vals);
-    $sth = $dbh->prepare($SQL);
-    my $evalok = 0;
-    eval {
-        $sth->execute(map { $vals->{$_} } sort keys %$vals);
-        $evalok = 1;
-    };
-    if (! $evalok) {
-        if ($@ =~ /"db_name_sane"/) {
-            die qq{Invalid name: you cannot refer to this database as "$item_name"\n};
+    ## If we have a service, strip the host and port as they may have been set via ENV
+    if (exists $dbcols->{dbservice}) {
+        delete $dbcols->{dbport};
+        delete $dbcols->{dbhost};
+    }
+
+    ## We do not want some things to hang around in the dbcols hash
+    my $dbgroup = delete $dbcols->{dbgroup};
+
+    ## Map each value into individual databases
+    my %dbinfo;
+    for my $k (sort keys %$dbcols) {
+        ## Each db in db_names needs to have an associated value for each dbcol entry
+        ## Hence, we only use dbcols to build list of columns: values are kept in a hash
+        next if $dbcols->{$k} !~ /,/;
+        my @list = split /\s*,\s*/ => $dbcols->{$k};
+        my $value;
+        for (my $x=0; defined $db_names->[$x]; $x++) {
+            $value = $list[$x] if defined $list[$x];
+            $dbinfo{$k}[$x] = $value;
         }
-        die "Failed to add database: $@\n";
+    }
+
+    ## Attempt to insert into the bucardo.db table
+    my $columns = join ',' => keys %$dbcols;
+    my $qs = '?,' x keys %$dbcols;
+    $SQL = "INSERT INTO bucardo.db (name,$columns) VALUES (${qs}?)";
+    debug("SQL: $SQL");
+    $sth = $dbh->prepare($SQL);
+    for (my $x = 0; defined $db_names->[$x]; $x++) {
+        my @args;
+        for my $key (keys %$dbcols) {
+            push @args => exists $dbinfo{$key} ? $dbinfo{$key}->[$x] : $dbcols->{$key};
+        }
+        my $evalok = 0;
+        debug(Dumper $db_names->[$x]);
+        debug(Dumper \@args);
+        eval {
+            $sth->execute($db_names->[$x][0], @args);
+            $evalok = 1;
+        };
+
+        if (! $evalok) {
+
+            if ($@ =~ /"db_name_sane"/) {
+                die qq{Invalid name: you cannot refer to this database as "$db_names->[$x]"\n};
+            }
+            die "Failed to add database: $@\n";
+        }
     }
 
     ## Store certain messages so we can output them in a desired order
@@ -1435,13 +1679,13 @@ sub add_database {
     ## Test database handle
     my $testdbh;
 
-    ## May want to do a test connection to the database
+    ## May want to do a test connection to each databases
   TESTCONN: {
 
         ## Nothing else to do for flatfiles
         last TESTCONN if 'flatfile' eq $dbtype;
 
-        ## Get the module namem the way to refer to its database
+        ## Get the module name, the way to refer to its database
         ## This also makes sure we have a valid type
         my %dbtypeinfo = (
             drizzle  => ['DBD::drizzle',  'Drizzle database'],
@@ -1461,143 +1705,168 @@ sub add_database {
         ## Gather connection information from the database via db_getconn
         $SQL = 'SELECT bucardo.db_getconn(?)';
         $sth = $dbh->prepare($SQL);
-        $sth->execute($item_name);
-        my $dbconn = $sth->fetchall_arrayref()->[0][0];
+        for my $db (map { $_->[0] } @$db_names) {
+            $sth->execute($db);
+            my $dbconn = $sth->fetchall_arrayref()->[0][0];
 
-        ## Must be able to load the Perl driver
-        $evalok = 0;
-        eval {
-            eval "require $module";
-            $evalok = 1;
-        };
-        if (! $evalok) {
-            die "Cannot add unless the Perl module '$module' is available: $@\n";
-        }
-
-        ## Reset for the evals below
-        $evalok = 0;
-
-        ## Standard args for the DBI databases
-        ## We put it here as we may move around with the Postgres bucardo user trick
-        my ($type,$dsn,$user,$pass) = split /\n/ => $dbconn;
-
-
-        ## Handle all of the ones that do not use standard DBI first
-
-        if ('mongo' eq $dbtype) {
-
-            my $dsn = {};
-            for my $line (split /\n/ => $dbconn) {
-                next if $line !~ /(\w+):\s+(.+)/;
-                $dsn->{$1} = $2;
-            }
-
+            ## Must be able to load the Perl driver
+            my $evalok = 0;
             eval {
-                $testdbh = MongoDB::Connection->new($dsn); ## no critic
+                eval "require $module";
                 $evalok = 1;
             };
-        }
-
-        elsif ('redis' eq $dbtype) {
-
-            my $tempdsn = {};
-            for my $line (split /\n/ => $dbconn) {
-                next if $line !~ /(\w+):\s+(.+)/;
-                $tempdsn->{$1} = $2;
-            }
-            my $server;
-            if (exists $tempdsn->{host}) {
-                $server = $tempdsn->{host};
-            }
-            if (exists $tempdsn->{port}) {
-                $server .= ":$tempdsn->{port}";
-            }
-            my @dsn;
-            if (defined $server) {
-                push @dsn => 'server', $server;
+            if (! $evalok) {
+                die "Cannot add unless the Perl module '$module' is available: $@\n";
             }
 
+            ## Reset for the evals below
             $evalok = 0;
-            eval {
-                $testdbh = Redis->new(@dsn);
-                $evalok = 1;
-            };
-        }
 
-        ## Anything else must be something with a standard DBI driver
-        else {
-            eval {
-                $testdbh = DBI->connect($dsn, $user, $pass, {AutoCommit=>0,RaiseError=>1,PrintError=>0});
-                $evalok = 1;
-            };
-        }
+            ## Standard args for the DBI databases
+            ## We put it here as we may move around with the Postgres bucardo user trick
+            my ($type,$dsn,$user,$pass) = split /\n/ => $dbconn;
 
-        ## At this point, we have eval'd a connection
-        if ($evalok) {
-            ## Disconnect from DBI.
-            $testdbh->disconnect if $module =~ /DBD/;
-        } else {
-            my $err = $DBI::errstr || $@;
-            my $msg;
+            ## Handle all of the ones that do not use standard DBI first
 
-            ## For Postgres, we get a little fancy and try to account for instances
-            ## where the bucardo user may not exist yet, by reconnecting and
-            ## creating said user if needed.
-            if ($DBI::errstr && 'postgres' eq $dbtype && $user eq 'bucardo' && eval { require Digest::MD5; 1 }) {
+            if ('mongo' eq $dbtype) {
 
-                # Try connecting as postgres instead.
-                print "Connection to $fullname as bucardo failed.\nError was: $DBI::errstr\n\n";
-                print qq{Will try to connect as postgres and create superuser $user...\n\n};
-                my $dbh = eval {
-                    DBI->connect($dsn, 'postgres', $pass, {AutoCommit=>1,RaiseError=>1,PrintError=>0});
-                };
-                if ($dbh) {
-                    ## Create the bucardo user now. We'll need a password;
-                    ## create one if we don't have one.
-                    my $connok = 0;
-                    eval {
-                        my $newpass = $pass || generate_password();
-                        my $encpass = Digest::MD5::md5_hex($newpass);
-                        $dbh->do(qq{CREATE USER $user SUPERUSER ENCRYPTED PASSWORD '$encpass'});
-                        $dbh->disconnect;
-                        my $extrauser = $pass ? '' : qq{ with password "$newpass"};
-                        warn "Created superuser '$user'$extrauser\n\n";
-                        $pass = $newpass;
-                        $connok = 1;
-                    };
-                    goto TESTCONN if $connok;
-                    $err = $DBI::errstr || $@;
-                    $msg = "Unable to create superuser $user";
-                } else {
-                    $err = $DBI::errstr || $@;
-                    $msg = 'Connection as postgres failed, too';
+                my $dsn = {};
+                for my $line (split /\n/ => $dbconn) {
+                    next if $line !~ /(\w+):\s+(.+)/;
+                    $dsn->{$1} = $2;
                 }
-            } else {
-                $msg = "Connection to $fullname as $user failed";
+
+                eval {
+                    $testdbh = MongoDB::Connection->new($dsn); ## no critic
+                    $evalok = 1;
+                };
             }
 
-            die "$msg. You may force add it with the --force argument.\nError was: $err\n\n"
-                unless $bcargs->{force};
-            warn "$msg, but will add anyway.\nError was: $err\n";
-        }
+            elsif ('redis' eq $dbtype) {
+
+                my $tempdsn = {};
+                for my $line (split /\n/ => $dbconn) {
+                    next if $line !~ /(\w+):\s+(.+)/;
+                    $tempdsn->{$1} = $2;
+                }
+                my $server;
+                if (exists $tempdsn->{host}) {
+                    $server = $tempdsn->{host};
+                }
+                if (exists $tempdsn->{port}) {
+                    $server .= ":$tempdsn->{port}";
+                }
+                my @dsn;
+                if (defined $server) {
+                    push @dsn => 'server', $server;
+                }
+
+                $evalok = 0;
+                eval {
+                    $testdbh = Redis->new(@dsn);
+                    $evalok = 1;
+                };
+            }
+
+            ## Anything else must be something with a standard DBI driver
+            else {
+                eval {
+                    $testdbh = DBI->connect($dsn, $user, $pass, {AutoCommit=>0,RaiseError=>1,PrintError=>0});
+                    $evalok = 1;
+                };
+            }
+
+            ## At this point, we have eval'd a connection
+            if ($evalok) {
+                ## Disconnect from DBI.
+                $testdbh->disconnect if $module =~ /DBD/;
+            }
+            else {
+                my $err = $DBI::errstr || $@;
+                my $msg;
+
+                ## For Postgres, we get a little fancy and try to account for instances
+                ## where the bucardo user may not exist yet, by reconnecting and
+                ## creating said user if needed.
+                if ($DBI::errstr
+                    and 'postgres' eq $dbtype
+                    and $user eq 'bucardo'
+                    and $DBI::errstr =~ /bucardo/
+                    and eval { require Digest::MD5; 1 }) {
+
+                    # Try connecting as postgres instead.
+                    print qq{Connection to "$db" ($fullname) as user bucardo failed.\nError was: $DBI::errstr\n\n};
+                    print qq{Will try to connect as user postgres and create superuser $user...\n\n};
+                    my $dbh = eval {
+                        DBI->connect($dsn, 'postgres', $pass, {AutoCommit=>1,RaiseError=>1,PrintError=>0});
+                    };
+                    if ($dbh) {
+                        ## Create the bucardo user now. We'll need a password;
+                        ## create one if we don't have one.
+                        my $connok = 0;
+                        eval {
+                            my $newpass = $pass || generate_password();
+                            my $encpass = Digest::MD5::md5_hex($newpass);
+                            $dbh->do(qq{CREATE USER $user SUPERUSER ENCRYPTED PASSWORD '$encpass'});
+                            $dbh->disconnect;
+                            my $extrauser = $pass ? '' : qq{ with password "$newpass"};
+                            warn "Created superuser '$user'$extrauser\n\n";
+                            $pass = $newpass;
+                            $connok = 1;
+                        };
+                        goto TESTCONN if $connok;
+                        $err = $DBI::errstr || $@;
+                        $msg = "Unable to create superuser $user";
+                    }
+                    else {
+                        $err = $DBI::errstr || $@;
+                        $msg = 'Connection as postgres failed, too';
+                    }
+                }
+                else {
+                    $msg = qq{Connection to "$db" ($fullname) as user $user failed};
+                }
+
+                die "$msg. You may force add it with the --force argument.\nError was: $err\n\n"
+                    unless $bcargs->{force};
+                warn "$msg, but will add anyway.\nError was: $err\n";
+            }
+        } ## End each database to connect to
 
     } ## end of TESTCONN
 
     ## If we got a group, process that as well
-    if (exists $extra->{dbgroup}) {
-        my $gname = $extra->{dbgroup};
-        ## We need to store this away as the function below changes the global hash
-        my $isnew = exists $DBGROUP->{$gname};
+    if (defined $dbgroup) {
 
-        my ($newgroup, $newrole) = add_db_to_group($item_name, $gname);
-        if (! $isnew) {
-            $finalmsg .= qq{Created database group "$newgroup"\n};
+        ## If it has an attached role, strip it out and force that everywhere
+        my $master_role = $dbgroup =~ s/:(\w+)// ? $1 : 0;
+
+        ## We need to store this away as the function below changes the global hash
+        my $isnew = exists $DBGROUP->{$dbgroup} ? 0 : 1;
+        my $firstrow = 1;
+        for my $row (@$db_names) {
+
+            my ($db,$role) = @$row;
+
+            ## If we set this source ourself, change to target if the group already exists
+            if ($firstrow) {
+                $firstrow = 0;
+                if ($newsource and ! $isnew) {
+                    $role = 'target';
+                }
+            }
+            $role = $master_role if $master_role;
+            my ($newgroup, $newrole) = add_db_to_group($db, "$dbgroup:$role");
+            if ($isnew) {
+                $finalmsg .= qq{Created dbgroup "$newgroup"\n};
+                $isnew = 0;
+            }
+            $finalmsg .= qq{  Added database "$db" to dbgroup "$newgroup" as $newrole\n};
         }
-        $finalmsg .= qq{Added database "$item_name" to group "$newgroup" as $newrole\n};
     }
 
     ## Adjust the db name so add_all_* can use it
-    $bcargs->{db} = $item_name;
+    $bcargs->{db} = $db_names->[0][0];
 
     ## Make sure $DB gets repopulated for the add_all_* calls below
     load_bucardo_info(1);
@@ -1609,7 +1878,9 @@ sub add_database {
     $finalmsg .= add_all_sequences() if grep /addallseq/i, @nouns;
 
     if (!$QUIET) {
-        print qq{Added database "$item_name"\n};
+        my $list = join ',' => map { qq{"$_->[0]"} } @$db_names;
+        printf qq{Added %s %s\n},
+            $list =~ /,/ ? 'databases' : 'database', $list;
         $finalmsg and print $finalmsg;
     }
 
@@ -1635,7 +1906,7 @@ sub remove_database {
     ## Make sure all named databases exist
     for my $name (@nouns) {
         if (! exists $DB->{$name}) {
-            die qq{No such database: $name\n};
+            die qq{No such database "$name"\n};
         }
     }
 
@@ -1647,6 +1918,7 @@ sub remove_database {
     for my $name (@nouns) {
         ## Wrap in an eval so we can handle known exceptions
         my $evalok = 0;
+        $dbh->pg_savepoint('try_remove_db');
         eval {
             $sth->execute($name);
             $evalok = 1;
@@ -1654,7 +1926,7 @@ sub remove_database {
         if (! $evalok) {
             if ($bcargs->{force} and $@ =~ /"goat_db_fk"|"dbmap_db_fk"/) {
                 $QUIET or warn qq{Dropping all tables and dbgroups that reference database "$name"\n};
-                $dbh->rollback();
+                $dbh->pg_rollback_to('try_remove_db');
                 $dbh->do('DELETE FROM bucardo.goat WHERE db = ' . $dbh->quote($name));
                 $dbh->do('DELETE FROM bucardo.dbmap WHERE db = ' . $dbh->quote($name));
                 ## Try the same query again
@@ -1728,6 +2000,8 @@ sub update_database {
     ## Walk through and handle each argument pair
     for my $setting (sort keys %$args) {
 
+        next if $setting eq 'extraargs';
+
         ## Change the name to a more standard form, to better figure out what they really mean
         ## This also excludes all non-alpha characters
         my $newname = transform_name($setting);
@@ -1765,7 +2039,7 @@ sub update_database {
                 ## Does this group exist?
                 if (! exists $DBGROUP->{$group}) {
                     create_dbgroup($group);
-                    push @groupchanges => qq{Created database group "$group"};
+                    push @groupchanges => qq{Created dbgroup "$group"};
                 }
 
                 ## Are we a part of it already?
@@ -1774,24 +2048,24 @@ sub update_database {
                     ## Same role?
                     my $oldrole = $oldgroup->{$group}{role};
                     if ($oldrole eq $role) {
-                        $QUIET or print qq{No change: database "$name" already belongs to group "$group" as $role\n};
+                        $QUIET or print qq{No change: database "$name" already belongs to dbgroup "$group" as $role\n};
                     }
                     else {
                         change_db_role($role,$group,$name);
-                        push @groupchanges => qq{Changed role for database "$name" in group "$group" from $oldrole to $role};
+                        push @groupchanges => qq{Changed role for database "$name" in dbgroup "$group" from $oldrole to $role};
                     }
                 }
                 else {
                     ## We are not a part of this group yet
                     add_db_to_group($name, "$group:$role");
-                    push @groupchanges => qq{Added database "$name" to group "$group" as $role};
+                    push @groupchanges => qq{Added database "$name" to dbgroup "$group" as $role};
                 }
 
                 ## Handle any extra modifiers
                 if (keys %$extra) {
                     update_dbmap($name, $group, $extra);
                     my $list = join ',' => map { "$_=$extra->{$_}" } sort keys %$extra;
-                    push @groupchanges => qq{For database "$name" in group "$group", set $list};
+                    push @groupchanges => qq{For database "$name" in dbgroup "$group", set $list};
                 }
 
             } ## end each group specified
@@ -1803,7 +2077,7 @@ sub update_database {
 
                     ## Remove this database from the group, but do not remove the group itself
                     remove_db_from_group($name, $old);
-                    push @groupchanges => qq{Removed database "$name" from group "$old"};
+                    push @groupchanges => qq{Removed database "$name" from dbgroup "$old"};
                 }
             }
 
@@ -2003,14 +2277,14 @@ sub list_databases {
 
         if ($VERBOSE) {
 
-            ## Which database groups is this a member of?
+            ## Which dbgroups is this a member of?
             if (exists $info->{group}) {
                 for my $group (sort keys %{ $info->{group} }) {
                     my $i = $info->{group}{$group};
                     my $role = $i->{role};
                     my $gang = $i->{gang};
                     my $pri = $i->{priority};
-                    print "  Belongs to database group $group ($role)";
+                    print "  Belongs to dbgroup $group ($role)";
                     $pri and print "  Priority:$pri";
                     print "\n";
                 }
@@ -2038,7 +2312,7 @@ sub list_databases {
 
 sub add_dbgroup {
 
-    ## Add one or more database groups. Inserts to the bucardo.dbgroup table
+    ## Add one or more dbgroups. Inserts to the bucardo.dbgroup table
     ## May also insert to the bucardo.dbmap table
     ## Arguments: one plus
     ## 1. The name of the group we are creating
@@ -2057,7 +2331,7 @@ sub add_dbgroup {
     ## Create the group if it does not exist
     if (! exists $DBGROUP->{$name}) {
         create_dbgroup($name);
-        $QUIET or print qq{Created database group "$name"\n};
+        $QUIET or print qq{Created dbgroup "$name"\n};
     }
 
     ## Add all these databases to the group
@@ -2074,7 +2348,7 @@ sub add_dbgroup {
 
         add_db_to_group($db, "$name:$role");
 
-        $QUIET or print qq{Added database "$db" to group "$name" as $role\n};
+        $QUIET or print qq{Added database "$db" to dbgroup "$name" as $role\n};
     }
 
     confirm_commit();
@@ -2088,7 +2362,7 @@ sub remove_dbgroup {
 
     ## Remove one or more entries from the bucardo.dbgroup table
     ## Arguments: one or more
-    ## 1+ Name of a database group
+    ## 1+ Name of a dbgroup
     ## Returns: undef
     ## Example: bucardo remove dbgroup sales
 
@@ -2100,7 +2374,7 @@ sub remove_dbgroup {
     ## Make sure all the groups exist
     for my $name (@nouns) {
         if (! exists $DBGROUP->{$name}) {
-            die qq{No such database group: $name\n};
+            die qq{No such dbgroup: $name\n};
         }
     }
 
@@ -2125,13 +2399,13 @@ sub remove_dbgroup {
                     goto NEND if ! $@;
                 }
                 else {
-                    die qq{Cannot remove database group "$name": it is being used by one or more syncs\n};
+                    die qq{Cannot remove dbgroup "$name": it is being used by one or more syncs\n};
                 }
             }
-            die qq{Could not delete database group "$name"\n$@\n};
+            die qq{Could not delete dbgroup "$name"\n$@\n};
         }
           NEND:
-        $QUIET or print qq{Removed database group "$name"\n};
+        $QUIET or print qq{Removed dbgroup "$name"\n};
     }
 
     confirm_commit();
@@ -2143,13 +2417,13 @@ sub remove_dbgroup {
 
 sub update_dbgroup {
 
-    ## Update one or more database groups
+    ## Update one or more dbgroups
     ## This may modify the bucardo.dbgroup and bucardo.dbmap tables
     ## Arguments: two or more
     ## 1. Group to be updated
     ## 2. Databases to be adjusted, or name change request (name=newname)
     ## Returns: undef
-    ## Example: bucardo update dbgroup sales A:slave
+    ## Example: bucardo update dbgroup sales A:target
 
     my @actions = @_;
 
@@ -2161,9 +2435,9 @@ sub update_dbgroup {
     ## Recursively call ourselves for wildcards and 'all'
     exit 0 if ! check_recurse($DBGROUP, $name, @actions);
 
-    ## Make sure this database group exists!
+    ## Make sure this dbgroup exists!
     if (! exists $DBGROUP->{$name}) {
-        die qq{Could not find a database group named "$name"\nUse 'list dbgroups' to see all available.\n};
+        die qq{Could not find a dbgroup named "$name"\nUse 'list dbgroups' to see all available.\n};
     }
 
     ## From this point on, we have either:
@@ -2181,13 +2455,13 @@ sub update_dbgroup {
         if ($action =~ /name=(.+)/) {
             my $newname = $1;
             if ($newname !~ /^$re_dbgroupname$/) {
-                die qq{Invalid database group name "$newname"\n};
+                die qq{Invalid dbgroup name "$newname"\n};
             }
             next if $name eq $newname; ## Duh
             $SQL = 'UPDATE bucardo.dbgroup SET name=? WHERE name=?';
             $sth = $dbh->prepare($SQL);
             $sth->execute($newname, $name);
-            $QUIET or print qq{Changed database group name from "$name" to "$newname"\n};
+            $QUIET or print qq{Changed dbgroup name from "$name" to "$newname"\n};
             $changes++;
             next;
         }
@@ -2212,7 +2486,7 @@ sub update_dbgroup {
     for my $db (sort keys %$oldlist) {
         if (! exists $dblist{$db}) {
             remove_db_from_group($db, $name);
-            $QUIET or print qq{Removed database "$db" from group "$name"\n};
+            $QUIET or print qq{Removed database "$db" from dbgroup "$name"\n};
             $changes++;
             next;
         }
@@ -2220,7 +2494,7 @@ sub update_dbgroup {
         my $newrole = $dblist{$db};
         if ($oldrole ne $newrole) {
             change_db_role($newrole, $name, $db);
-            $QUIET or print qq{Changed role of database "$db" in group "$name" from $oldrole to $newrole\n};
+            $QUIET or print qq{Changed role of database "$db" in dbgroup "$name" from $oldrole to $newrole\n};
             $changes++;
         }
     }
@@ -2230,7 +2504,7 @@ sub update_dbgroup {
         next if exists $oldlist->{$db};
         my $role = $dblist{$db};
         add_db_to_group($db, "$name:$role");
-        $QUIET or print qq{Added database "$db" to group "$name" as $role\n};
+        $QUIET or print qq{Added database "$db" to dbgroup "$name" as $role\n};
         $changes++;
     }
 
@@ -2251,7 +2525,7 @@ sub list_dbgroups {
 
     ## Might be no groups yet
     if (! keys %$DBGROUP) {
-        print "No database groups have been added yet\n";
+        print "No dbgroups have been added yet\n";
         return -1;
     }
 
@@ -2284,7 +2558,7 @@ sub list_dbgroups {
 
     ## No matches?
     if (@nouns and ! keys %matchdbg) {
-        print "No matching database groups found\n";
+        print "No matching dbgroups found\n";
         return -1;
     }
 
@@ -2317,7 +2591,7 @@ sub list_dbgroups {
                 }
             }
         }
-        printf "Database group: %-*s%s\n",
+        printf "dbgroup: %-*s%s\n",
             $maxlen, $name, $dbs;
         $VERBOSE >= 2 and show_all_columns($info);
     }
@@ -2665,12 +2939,12 @@ sub find_goat_by_item {
 
     ## Handle ID values
     if ($name =~ /^\d+$/) {
-        $DEBUG and warn "\$name is an ID value";
+        $DEBUG and warn "$name is an ID value";
         push @results, $GOAT->{by_id}{$name};
     }
     ## Handle names, with or without schemas, and with or without wildcards
     else {
-        $DEBUG and warn "\$name is a name value";
+        $DEBUG and warn "$name is a name value";
 
         my @found_keys;
 
@@ -2705,7 +2979,7 @@ sub find_goat_by_item {
                 push(@results, $b);
             }
         } @found_keys;
-        $DEBUG and warn "Here are the goats we've found, before filtering: " . Dumper(@results);
+        $DEBUG and warn q{Here are the goats we've found, before filtering: } . Dumper(@results);
     }
 
     if (@results && defined $results[0] && @nouns && defined $nouns[0]) {
@@ -2725,7 +2999,7 @@ sub find_goat_by_item {
         }
     }
 
-    $DEBUG and warn "Here are the filtered results: " . Dumper(@results);
+    $DEBUG and warn 'Here are the filtered results: ' . Dumper(@results);
     @results = () if (@results and !defined $results[0]);
     return @results;
 } ## end of find_goat_by_item
@@ -3168,6 +3442,7 @@ sub add_table {
 
 
 sub _remove_relation {
+
     my $reltype = shift;
 
     my $doc_section = 'remove';
@@ -3226,7 +3501,8 @@ sub remove_table {
     ## Usage: remove table tablename [t2 t3 ...]
     ## Arguments: none, parses nouns for tables
     ## Returns: never, exits
-    _remove_relation('table');
+
+    return _remove_relation('table');
 
 } ## end of remove_table
 
@@ -3235,7 +3511,9 @@ sub remove_sequence {
     ## Usage: remove sequence sequencename [t2 t3 ...]
     ## Arguments: none, parses nouns for sequences
     ## Returns: never, exits
-    _remove_relation('sequence');
+
+    return _remove_relation('sequence');
+
 } ## end of remove_sequence
 
 
@@ -3508,7 +3786,7 @@ sub list_tables {
 
 sub add_herd {
 
-    ## Add a herd. Inserts to the bucardo.herd table
+    ## Add a herd aka relgroup. Inserts to the bucardo.herd table
     ## May also insert to the bucardo.herdmap and bucardo.goat tables
     ## Arguments: one or more
     ## 1. Name of the herd
@@ -3544,7 +3822,7 @@ sub add_herd {
     }
 
     ## Get the list of all requested tables, adding as needed
-    my $goatlist = get_goat_ids(args => \@nouns);
+    my $goatlist = get_goat_ids(args => \@nouns, noherd => $herdname);
 
     ## The final output. Store it up all at once for a single QUIET check
     my $message = '';
@@ -3564,7 +3842,6 @@ sub add_herd {
             $message .= "  $_ (DB: $goatlist->{relations}{$_}{goat}[0]{db})\n";
         }
     }
-
 
     ## Now load all of these tables into this herd
     $SQL = 'INSERT INTO bucardo.herdmap (herd,priority,goat) VALUES (?,?,'
@@ -3724,290 +4001,397 @@ sub list_herds {
 ## Sync-related subroutines: add, remove, update, list
 ##
 
+
 sub add_sync {
 
-    ## Add an item to the bucardo.sync table
+    ## Create a new sync by adding an entry to the bucardo.sync table
+    ## Will add tables as needed to the bucardo.goat table
+    ## Will create implicit relgroups as needed
+    ## May also modify the goat, herd, and herdmap tables
     ## Arguments: none (uses nouns)
     ## Returns: never, exits
 
-    my $item_name = shift @nouns || '';
+    my $sync_name = shift @nouns || '';
 
+    ## If the sync name does not exist or is empty, show a help screen
     my $doc_section = 'add/add sync';
-    usage_exit($doc_section) unless length $item_name;
-    my $batch = 1;
+    usage_exit($doc_section) if ! length $sync_name;
+
+    ## If this named sync already exists, throw an exception
+    if (exists $SYNC->{$sync_name}) {
+        die qq{A sync with the name "$sync_name" already exists\n};
+    }
+
+    ## Store a list of messages we can output once no we have no errors
+    my @message;
 
     ## Inputs and aliases, database column name, flags, default
     my $validcols = qq{
-        name                     name                 0                $item_name
-        herd|relgroup            herd                 0                null
-        dbs                      dbs                  0                null
-        stayalive                stayalive            TF               null
-        kidsalive                kidsalive            TF               null
-        autokick|ping            autokick             TF               null
-        checktime                checktime            interval         null
-        strict_checking          strict_checking      TF               1
-        status                   status               =active|inactive null
-        conflict_strategy|standard_conflict conflict_strategy  0       null
-        priority                 priority             numeric          null
-        analyze_after_copy       analyze_after_copy   TF               null
-        overdue                  overdue              interval         null
-        expired                  expired              interval         null
-        track_rates              track_rates          TF               null
-        onetimecopy              onetimecopy          =0|1|2           null
-        lifetime                 lifetime             interval         null
-        maxkicks                 maxkicks             numeric          null
-        isolation_level|txnmode  isolation_level      0                null
-        rebuild_index|rebuildindex   rebuild_index    numeric          null
-        tables                   tables               0                skip
+        name                       name                 0                $sync_name
+        relgroup|herd              relgroup             0                null
+        stayalive                  stayalive            TF               null
+        kidsalive                  kidsalive            TF               null
+        autokick|ping              autokick             TF               null
+        checktime                  checktime            interval         null
+        strict_checking            strict_checking      TF               null
+        status                     status               =active|inactive null
+        priority                   priority             numeric          null
+        analyze_after_copy         analyze_after_copy   TF               null
+        overdue                    overdue              interval         null
+        expired                    expired              interval         null
+        track_rates                track_rates          TF               null
+        onetimecopy                onetimecopy          =0|1|2           null
+        lifetime                   lifetime             interval         null
+        maxkicks                   maxkicks             numeric          null
+        isolation_level|txnmode    isolation_level      0                null
+        rebuild_index|rebuildindex rebuild_index        numeric          null
+        dbgroup                    dbgroup              0                null
+
+        conflict_strategy|standard_conflict conflict_strategy  0   null
+        relation|relations|table|tables     tables             0   null
+        db|databases|database|databases|dbs dbs                0   null
     };
 
-    ## Fullcopy syncs get some of their defaults overriden
-    ## The controllers and kids never start automatically,
-    ## and autokick is never on
-
     my $morph = [
-        {
-            field => 'synctype',
-            value => 'fullcopy',
-            new_defaults => 'autokick|F stayalive|F kidsalive|F',
-        },
-        {
-            field => 'isolation_level',
-            dash_to_white => 1,
-        }
-    ];
+                 ## Fullcopy syncs get some of their defaults overriden
+                 ## The controllers and kids never start automatically,
+                 ## and autokick is never on
+                 {
+                  field => 'synctype',
+                  value => 'fullcopy',
+                  new_defaults => 'autokick|F stayalive|F kidsalive|F',
+                  },
+                 ## We need isolation level to be dash free for SQL
+                 {
+                  field => 'isolation_level',
+                  dash_to_white => 1,
+                  }
+                 ];
 
-    my ( $dbcols, $cols, $phs, $vals ) = process_simple_args({
+    ## Parse all of our arguments, and convert them per rules above
+    ## We don't use cols and phs and vals in this particular sub!
+    ## Others should be modified someday to also avoid them
+    my ($dbcols) = process_simple_args({
         cols        => $validcols,
         list        => \@nouns,
         doc_section => $doc_section,
         morph       => $morph,
     });
 
-    if (! exists $dbcols->{herd}) {
-        ## But allow on-the-fly herd creation
-        die "Need to specify a relgroup for this sync\n";
-    }
-    if (! exists $dbcols->{dbs}) {
-        die "Need to specify which databases\n";
+    ## We must know what to replicate: need a relgroup or a list of tables
+    if (! exists $dbcols->{relgroup} and ! exists $dbcols->{tables}) {
+        die "Must specify a relgroup (or a list of tables) for this sync\n";
     }
 
-    ## Already got a sync by this name?
-    if (exists $global{sync}{$item_name}) {
-        die qq{A sync with the name "$item_name" already exists\n};
+    ## We must know where to replicate: need a dbgroup or a list of databases
+    if (! exists $dbcols->{dbgroup} and ! exists $dbcols->{dbs}) {
+        die "Need to specify which dbgroup (or list of databases) for this sync\n";
     }
 
-    ## If this is a list of tables, create them as a new herd
-    ## Ideally we also re-use the herd if it already exists
-    if ($dbcols->{herd} =~ /,/) {
-        my @tables = split /\s*,\s*/ => $dbcols->{herd};
-        for my $table (sort @tables) {
-            if (! exists $global{goat}{by_fullname}{$table}) {
-                die "No such table or sequence: $table\n";
+    #### RELGROUP
+    ## Determine what relgroup to use
+    ## If one is given, use that; else create a new one
+    my $relgroup_name;
+    if (exists $dbcols->{relgroup}) {
+
+        ## Simple case where they give us the exact relgroup
+        if (exists $HERD->{ $dbcols->{relgroup} }) {
+
+            ## We cannot have both an existing relgroup and a list of tables
+            if (exists $dbcols->{tables}) {
+                die "Cannot specify an existing relgroup and a list of tables\n";
             }
+
+            $relgroup_name = $dbcols->{relgroup};
+        }
+
+        ## If the relgroup has commas, we treat it as a list of tables
+        ## Otherwise, we create a new relgroup
+        elsif ($dbcols->{relgroup} !~ /,/) {
+            $relgroup_name = create_herd( $dbcols->{relgroup}, 'noreload' );
+        }
+
+    }
+
+    ## DBGROUP
+    ## Determine which dbgroup to use
+    ## We create a unique name as needed later on
+    my $dbgroup_name;
+    if (exists $dbcols->{dbgroup}) {
+
+        ## If this dbgroup already exists, we are done
+        if (exists $DBGROUP->{ $dbcols->{dbgroup} }) {
+
+            ## We cannot have both an existing dbgroup and a list of databases
+            if (exists $dbcols->{dbs}) {
+                die "Cannot specify an existing dbgroup and a list of databases\n";
+            }
+
+            $dbgroup_name = $dbcols->{dbgroup};
+        }
+
+        ## If the dbgroup has commas, we treat it as a list of databases
+        ## Otherwise, we create a new dbgroup
+        elsif ($dbcols->{dbgroup} !~ /,/) {
+            $dbgroup_name = create_dbgroup( $dbcols->{dbgroup}, 'noreload' );
         }
     }
-    else {
-        my $name = $dbcols->{herd};
-        if (! exists $global{herd}{$name}) {
-            my $schema = 'public';
 
-            ## Maybe it's a table?
-            if (! exists $global{goat}{by_fullname}{$name}) {
-                warn "No such relgroup or table: $name\n";
-                warn "To list all relgroups, use: list relgroups\n";
-                warn "To list all tables, use: list tables\n";
-                exit 1;
-            }
+    ## Before we potentially create a unique dbgroup name
+    ## we need to process all of our databases, to see
+    ## if this combo matches an existing dbgroup
 
-            ## See if any existing herds match this one
-            for my $hname (sort keys %{$global{herd}}) {
-                my $number = keys %{$global{herd}{$hname}{hasgoat}{$schema}};
-                next unless 1 == $number;
-                print qq{Use existing relgroup "$hname"? Y/N };
-                my $ans = $batch ? 'Y' : <STDIN>;
-                if ($ans =~ /^y/i) {
-                    $dbcols->{herd} = $hname;
-                    $vals->{herd} = $hname;
-                    last;
-                }
-            }
-            ## If we aren't using an existing herd, create a new one
-            $name = $dbcols->{herd};
-            if (! exists $global{herd}{$name}) {
-                print "Create a new relgroup with table $name\n";
-
-                ## We will use the name of the sync if free
-                ## Otherwise, keep adding numbers to it until we get a free name
-                $SQL = 'SELECT 1 FROM bucardo.herd WHERE name = ?';
-                $sth = $dbh->prepare($SQL);
-                my $gname = $item_name;
-                my $x = 1;
-                {
-                    $count = $sth->execute($gname);
-                    $sth->finish();
-                    last if $count < 1;
-                    $gname  = "${item_name}_$x";
-                    $x++;
-                    redo;
-                }
-                $SQL = 'INSERT INTO bucardo.herd (name) VALUES (?)';
-                $sth = $dbh->prepare($SQL);
-                $count = $sth->execute($gname);
-                if (1 != $count) {
-                    die qq{Unable to add new herd named "$gname"\n};
-                }
-                $SQL = 'INSERT INTO bucardo.herdmap(herd,goat) VALUES (?,'
-                    . '(SELECT id FROM bucardo.goat WHERE schemaname = ? AND tablename = ?))';
-                $sth = $dbh->prepare($SQL);
-                $count = $sth->execute($gname, $schema, $name);
-                if (1 != $count) {
-                    die qq{Unable to add table "$name" to herd "$gname"\n};
-                }
-                print qq{Created herd "$gname"\n};
-                $dbcols->{herd} = $gname;
-
-            }
-        } ## end no herd name match
-
-    } ## end single word herd option
-
-    ## Next, the dbs
-
-    ## If this is a single database, turn into a "list" for below
-    if (exists $global{db}{$dbcols->{dbs}}) {
-        $dbcols->{dbs} .= ',';
+    #### DB
+    ## Parse the list of databases to use
+    ## Databases can come from both dbs and dbgroup - the latter only if it has commas
+    my @dblist;
+    if (exists $dbcols->{dbs}) {
+        @dblist = split /\s*,\s*/ => $dbcols->{dbs};
+    }
+    if (exists $dbcols->{dbgroup} and $dbcols->{dbgroup} =~ /,/) {
+        push @dblist => split /\s*,\s*/ => $dbcols->{dbgroup};
     }
 
-    ## Can be a database group, or a list of databases
-    ## We want to keep track of how many of each role we have
-    my %rolecount;
-    if ($dbcols->{dbs} =~ /,/) {
-        my @dbs = split /\s*,\s*/ => $dbcols->{dbs};
-        my %db;
-        my $type = '';
-        for my $db (sort @dbs) {
-            ## Set the default type of database
-            $type = $type eq '' ? 'source' : 'target';
-            if ($db =~ s/[=:](.+)//) {
-                $type = $1;
-            }
-            if (! exists $global{db}{$db}) {
-                die "No such database: $db\n";
-            }
-            ## Standardize and check the types
-            $type = 'source' if $type =~ /^s/i or $type =~ /^master/i;
-            $type = 'target' if $type =~ /^t/i or $type =~ /^rep/i;
-            $type = 'fullcopy' if $type =~ /^f/i;
-            if ($type !~ /^(?:source|target|fullcopy)$/) {
-                die "Invalid database type: must be source, target, or fullcopy (not $type)\n";
-            }
-            $db{$db} = $type;
-            $rolecount{$type}++;
+    ## If this is a new dbgroup, databases must be given
+    if (!@dblist and defined $dbgroup_name and ! exists $DBGROUP->{ $dbgroup_name }) {
+        die qq{Must provide a list of databases to go into the new dbgroup\n};
+    }
+
+    my $dbtype = ''; ## the current database type (e.g. source, target)
+    my %db; ## used to build matching list below
+    my %rolecount; ## Keep track of types for later logic
+    my $db_for_lookups; ## Which database to search for new tables
+
+    for my $db (@dblist) {
+
+        ## Set the default type of database: first is always source
+        $dbtype = $dbtype eq '' ? 'source' : 'target';
+
+        ## Extract the type if it has one
+        if ($db =~ s/[=:](.+)//) {
+            $dbtype = $1;
         }
-        ## Do any existing groups match this list exactly?
+
+        ## If this database is not known to us, throw an exception
+        if (! exists $DB->{$db}) {
+            ## This may be a dbgroup: we allow this if it is the only entry!
+            if (exists $DBGROUP->{ $db } and ! defined $dblist[1]) {
+                $dbgroup_name = $db;
+                undef @dblist;
+                last;
+            }
+            die qq{Unknown database "$db"\n};
+        }
+
+        ## Standardize and check the types
+        $dbtype = 'source'
+            if $dbtype =~ /^s/i or $dbtype =~ /^mas/i or $dbtype =~ /^pri/;
+        $dbtype = 'target'
+            if $dbtype =~ /^t/i or $dbtype =~ /^rep/i;
+        $dbtype = 'fullcopy'
+            if $dbtype =~ /^f/i;
+        if ($dbtype !~ /^(?:source|target|fullcopy)$/) {
+            die "Invalid database type: must be source, target, or fullcopy (not $dbtype)\n";
+        }
+
+        $db{$db} = $dbtype;
+        $rolecount{$dbtype}++;
+
+        $db_for_lookups = $db if $dbtype eq 'source';
+
+    }
+
+    ## If we were given dbgroup only, we still need to populate rolecount
+    if (! @dblist) {
+        for my $d (values %{ $DBGROUP->{ $dbgroup_name }{db} }) {
+            $rolecount{$d->{role}}++;
+        }
+    }
+
+    ## Do any existing groups match this list exactly?
+    ## We only care about this if they don't have an explicit dbgroup set
+    if (! defined $dbgroup_name) {
         my $newlist = join ',' => map { "$_=".$db{$_} } sort keys %db;
-        for my $gname (sort keys %{$global{dbgroup}}) {
-            my $innerjoin = join ',' => map { "$_=".$global{dbgroup}{$gname}{db}{$_} } sort keys %{$global{dbgroup}{$gname}{db}};
+        for my $gname (sort keys %$DBGROUP) {
+            my $innerjoin = join ',' =>
+                map { "$_=".$DBGROUP->{$gname}{db}{$_}{role} }
+                    sort keys %{$DBGROUP->{$gname}{db}};
             if ($innerjoin eq $newlist) {
-                print qq{That group of databases already exists as dbgroup "$gname"\n};
-                print q{Do you wish to use that group instead? Y/N };
-                my $ans = $batch ? 'Y' : <STDIN>;
-                if ($ans =~ /^y/i) {
-                    $dbcols->{dbs} = $gname;
-                    $vals->{dbs} = $gname;
-                    last;
-                }
-                ## Don't ask again?
-                $newlist = '';
+                push @message => qq{Using existing dbgroup "$gname"};
+                $dbgroup_name = $gname;
+                last;
+            }
+        }
+    }
+
+    ## If we still don't have a dbgroup, create one based on the sync name
+    if (! defined $dbgroup_name) {
+
+        ## We will use the name of the sync if free
+        ## Otherwise, keep adding numbers to it until we get a free name
+        my $newname = $sync_name;
+        for my $x (2..10_000) {
+            last if ! exists $DBGROUP->{$newname};
+            $newname = "${sync_name}_$x";
+        }
+
+        $dbgroup_name = create_dbgroup( $newname, 'noreload' );
+    }
+
+    ## Give a courtesy message is we created a new dbgroup
+    ## Also associate our dbs with this new group
+    if (! exists $DBGROUP->{ $dbgroup_name }) {
+        push @message => qq{Created a new dbgroup named "$dbgroup_name"\n};
+        $SQL = 'INSERT INTO bucardo.dbmap(dbgroup,db,role) VALUES (?,?,?)';
+        $sth = $dbh->prepare($SQL);
+        for my $db (sort keys %db) {
+            $count = $sth->execute($dbgroup_name, $db, $db{$db});
+            if (1 != $count) {
+                die qq{Unable to add database "$db" to dbgroup "$dbgroup_name"\n};
+            }
+        }
+    }
+
+    ## Make sure we only use what the bucardo.sync table needs: dbs
+    delete $dbcols->{dbgroup};
+    $dbcols->{dbs} = $dbgroup_name; ## Someday, rename this column!
+
+    ## TABLES
+    ## Determine the tables to use
+    ## Always check the first found source database
+    ## We can get a list of tables via the relgroup argument,
+    ## or from a tables argument. Handle both ways.
+    my @tables;
+
+    if (exists $dbcols->{relgroup} and $dbcols->{relgroup} =~ /,/) {
+        @tables = split /\s*,\s*/ => $dbcols->{relgroup};
+    }
+    if (exists $dbcols->{tables}) {
+        for my $table (split /\s*,\s*/ => $dbcols->{tables}) {
+            push @tables => $table;
+        }
+    }
+
+    ## Keep track of what we have already done
+    my %table;
+
+    for my $table (@tables) {
+
+        ## Skip if we have seen this already
+        next if exists $table{$table};
+
+        ## If this table already exists, we are done
+        if (exists $GOAT->{by_fullname}{$table}) {
+            $table{$table} = $GOAT->{by_fullname}{$table}->[0];
+            next;
+        }
+
+        my $result = get_goat_ids(args => [$table], dbcols => { db => $db_for_lookups} );
+        my $found = keys %{ $result->{match} };
+
+        for my $name (sort keys %{ $result->{new} }) {
+            push @message => qq{  Added table "$name"};
+        }
+
+        ## If a specific table is not found, throw an exception
+        if (!$found and $table !~ /^all/) {
+            die qq{Could not find a relation named "$table"\n};
+        }
+
+        ## Save each table's information for use below
+        for my $tname (sort keys %{ $result->{relations} }) {
+            $table{$tname} ||= $result->{relations}{$tname}{goat}[0];
+        }
+     }
+
+    ## If we don't have a relgroup already, see if our list matches an existing one
+    if (! defined $relgroup_name and keys %table) {
+        my $newlist = join ',' =>
+            map { "$table{$_}{schemaname}.$table{$_}{tablename}"}
+                sort { "$table{$a}->{schemaname}.$table{$a}->{tablename}"
+                           cmp "$table{$b}->{schemaname}.$table{$b}->{tablename}"}
+                    keys %table;
+        for my $rname (sort keys %$RELGROUP) {
+            my $innerjoin = join ',' => sort keys %{$RELGROUP->{$rname}{goat}};
+            if ($innerjoin eq $newlist) {
+                push @message => qq{Using existing relgroup "$rname"};
+                $relgroup_name = $rname;
+                last;
+            }
+        }
+    }
+
+    ## Now we can set a default relgroup based on the sync name if needed
+    ## If we still don't have a relgroup, create one based on the sync name
+    if (! defined $relgroup_name) {
+
+        ## We will use the name of the sync if free
+        ## Otherwise, keep adding numbers to it until we get a free name
+        my $newname = $sync_name;
+        for my $x (2..10_000) {
+            last if ! exists $HERD->{$newname};
+            $newname = "${sync_name}_$x";
+        }
+
+        $relgroup_name = create_herd( $newname, 'noreload' );
+    }
+
+    ## Give a courtesy message is we created a new relgroup
+    ## Also associate our tables with this new group
+    if (! exists $HERD->{ $relgroup_name }) {
+
+        unshift @message => qq{Created a new relgroup named "$relgroup_name"\n};
+
+        $SQL = 'INSERT INTO bucardo.herdmap(herd,goat) VALUES (?,?)';
+        $sth = $dbh->prepare($SQL);
+
+        for my $t (sort keys %table) {
+            $count = $sth->execute($relgroup_name, $table{$t}{id});
+            if (1 != $count) {
+                die qq{Unable to add table "$t" to relgroup "$relgroup_name"\n};
             }
         }
 
-        if ($dbcols->{dbs} =~ /,/) { ## Make sure we still have a list
-            ## We will use the name of the sync if free
-            ## Otherwise, keep adding numbers to it until we get a free name
-            $SQL = 'SELECT 1 FROM bucardo.dbgroup WHERE name = ?';
-            $sth = $dbh->prepare($SQL);
-            my $gname = $item_name;
-            my $x = 1;
-            {
-                $count = $sth->execute($gname);
-                $sth->finish();
-                last if $count < 1;
-                $gname  = "${item_name}_$x";
-                $x++;
-                redo;
-            }
-            $SQL = 'INSERT INTO bucardo.dbgroup (name) VALUES (?)';
-            $sth = $dbh->prepare($SQL);
-            $count = $sth->execute($gname);
-            if (1 != $count) {
-                die qq{Unable to add new dbgroup named "$gname"\n};
-            }
-            $SQL = 'INSERT INTO bucardo.dbmap(dbgroup,db,role) VALUES (?,?,?)';
-            $sth = $dbh->prepare($SQL);
-            for my $db (sort keys %db) {
-                $count = $sth->execute($gname, $db, $db{$db});
-                if (1 != $count) {
-                    die qq{Unable to add database "$db" to group "$gname"\n};
-                }
-            }
-            $QUIET or print qq{Created database group "$gname"\n};
-            $dbcols->{dbs} = $gname;
-            $vals->{dbs} = $gname;
-        }
-    } ## end of multiple databases specified
-    else {
-        my $dbg = $dbcols->{dbs};
-        if (! exists $DBGROUP->{$dbg}) {
-            warn "No such database group: $dbg\n";
-            warn "To list all database groups, use: list dbgroups\n";
-            exit 1;
-        }
-        for my $db (values %{ $DBGROUP->{$dbg}{db} }) {
-            $rolecount{$db->{role}}++;
-        }
+
     }
+
+    ## Make sure we use relgroup but not tables for the SQL below
+    delete $dbcols->{tables};
+    delete $dbcols->{relgroup};
+    $dbcols->{herd} = $relgroup_name;
 
     ## If this is a pure fullcopy sync, we want to turn stayalive and kidsalive off
     if ($rolecount{'source'} == 1
             and $rolecount{'fullcopy'}
                 and ! $rolecount{'target'}) {
-        if ($cols !~ /stayalive/) {
-            $vals->{stayalive} = 0;
-            $phs .= ',?';
-            my @cols = split /,/ => $cols;
-            $cols = join ',' => sort @cols, 'stayalive';
-        }
-        if ($cols !~ /kidsalive/) {
-            $vals->{kidsalive} = 0;
-            $phs .= ',?';
-            my @cols = split /,/ => $cols;
-            $cols = join ',' => sort @cols, 'kidsalive';
-        }
+        $dbcols->{stayalive} = 0;
+        $dbcols->{kidsalive} = 0;
     }
 
-    $dbh->commit();
-
     ## Attempt to insert this into the database
-    $SQL = "INSERT INTO bucardo.sync ($cols) VALUES ($phs)";
+    my $columns = join ',' => keys %$dbcols;
+    my $qs = '?,' x keys %$dbcols;
+    chop $qs;
+    $SQL = "INSERT INTO bucardo.sync ($columns) VALUES ($qs)";
     $DEBUG and warn "SQL: $SQL\n";
-    $DEBUG and warn Dumper $vals;
     $sth = $dbh->prepare($SQL);
-    my @flatvals = map { $vals->{$_} } sort keys %$vals;
-    $DEBUG and warn Dumper \@flatvals;
+    $DEBUG and warn Dumper values %$dbcols;
     eval {
-        $count = $sth->execute(@flatvals);
+        $count = $sth->execute(values %$dbcols);
     };
     if ($@) {
         die "Failed to add sync: $@\n";
     }
 
-    $dbh->commit();
+    $QUIET or print qq{Added sync "$sync_name"\n};
 
-    if (!$QUIET) {
-        print qq{Added sync "$item_name"\n};
+    ## Now we can output our success messages if any
+    for my $msg (@message) {
+        chomp $msg;
+        $QUIET or print "$msg\n";
     }
+
+    confirm_commit();
 
     exit 0;
 
@@ -4081,7 +4465,6 @@ sub update_sync {
         die qq{Could not find a sync named "$name"\nUse 'list syncs' to see all available.\n};
     }
 
-
     my $changes = 0;
 
     ## Current information about this sync, including column names
@@ -4094,6 +4477,15 @@ sub update_sync {
     );
 
     for my $action (@actions) {
+
+        ## Allow for some simple shortcuts
+        if ($action =~/^inactiv/i) {
+            $action = 'status=inactive';
+        }
+        elsif ($action =~ /^activ/i) {
+            $action = 'status=active';
+        }
+
         ## Look for a standard foo=bar or foo:bar format
         if ($action =~ /(.+?)\s*[=:]\s*(.+)/) {
             my ($setting,$value) = (lc $1,$2);
@@ -4222,12 +4614,11 @@ sub list_syncs {
     ## Determine the size of the output strings for pretty aligning later
     my ($maxname, $maxherd, $maxdbs) = (2,2,2);
     for my $name (keys %$syncs) {
-        my $s = $syncs->{$name};
-        $maxname = length $name if length $name > $maxname;
+        my $s = $syncs->{$name};        $maxname = length $name if length $name > $maxname;
         $maxherd = length $s->{herd}{name} if length $s->{herd}{name} > $maxherd;
-        $s->{d} = "DB group $s->{dbs}:";
+        $s->{d} = qq{DB group "$s->{dbs}"};
         for (sort keys %{ $s->{dblist} }) {
-            $s->{d} .= " $_ ($s->{dblist}{$_}{role})";
+            $s->{d} .= " $_:$s->{dblist}{$_}{role}";
         }
         $maxdbs = length $s->{d} if length $s->{d} > $maxdbs;
     }
@@ -4240,10 +4631,10 @@ sub list_syncs {
         my $maxdbline = 50;
 
         ## Show basic information
-        printf "Sync: %-*s  Relgroup: %-*s %s[%s]\n",
-            $maxname, $name,
-            $maxherd, $s->{herd}{name},
-            $maxdbs > $maxdbline ? '' : "$s->{d}  ",
+        printf qq{Sync %-*s  Relgroup %-*s %s[%s]\n},
+            2+$maxname, qq{"$name"},
+            2+$maxherd, qq{"$s->{herd}{name}"},
+            $maxdbs > $maxdbline ? '' : " $s->{d}  ",
             ucfirst $s->{status};
 
         ## Print the second line if needed
@@ -4281,9 +4672,10 @@ sub get_goat_ids {
     ## Returns the ids from the goat table for matching relations
     ## Also checks the live database and adds tables to the goat table as needed.
     ## Arguments: key-value pairs:
-    ##  - args: arrayref of names to match against. Can have wildcards.
+    ##  - args: arrayref of names to match against. Can have wildcards. Can be 'all'
     ##  - type: 'table' or 'sequence', depending on what we expect to find.
     ##  - dbcols: optional hashref of fields to populate goat table with (e.g. autokick=1)
+    ##  - noherd: do not consider items if already in this herd for "all"
     ## Returns: a hash with:
     ##  - relations: hash of goat objects, key is the fully qualified name
     ##    - original: hash of search term(s) used to find this
@@ -4294,8 +4686,9 @@ sub get_goat_ids {
 
     my %arg = @_;
     my $reltype = $arg{type};
-    my $names = $arg{args} or die;
+    my $names = $arg{args} or die "Must have list of things to match";
     my $dbcols = $arg{dbcols} || {};
+    my $noherd = $arg{noherd} || '';
 
     ## The final hash we return
     my %relation;
@@ -4313,11 +4706,17 @@ sub get_goat_ids {
     my %new;
 
     ## Figure out which database to search in, unless already given
-    my $bestdb = exists $dbcols->{db} ? $dbcols->{db} : find_best_db_for_searching();
+    my $bestdb = (exists $dbcols->{db} and defined $dbcols->{db})
+    ? $dbcols->{db} : find_best_db_for_searching();
 
     ## This check still makes sense: if no databases, there should be nothing in $GOAT!
     if (! defined $bestdb) {
         die "No databases have been added yet, so we cannot add tables!\n";
+    }
+
+    ## Allow "tables=all" to become "all"
+    for my $item (@$names) {
+        $item = 'all' if $item =~ /^tables?=all/i;
     }
 
     my $rdbh = connect_database({name => $bestdb}) or die;
@@ -4329,7 +4728,7 @@ sub get_goat_ids {
             ## Assume we're talking about tables unless we say "sequence" explicitly
         my $type = ( $arg eq 'sequence' ? 'S' : 'r' );
         return qq{
-SELECT nspname||'.'||relname AS name, relkind, c.oid
+SELECT nspname||'.'||relname AS name, relkind, c.oid, relhaspkey
 FROM pg_class c
 JOIN pg_namespace n ON (n.oid = c.relnamespace)
 WHERE relkind IN ('$type')
@@ -4390,20 +4789,26 @@ AND nspname !~ '^pg_'
         }
         else {
             ## No wildcards and no dot, so we match all tables regardless of the schema
-            $SQL = $BASESQL->($reltype) . 'AND relname = ?';
+            $SQL = $BASESQL->($reltype);
+            $item eq 'all' or $SQL .= 'AND relname = ?';
         }
 
         ## We do not check the live database if the match was exact
         ## *and* something was found. In all other cases, we go live.
         if ($hasstar or !$hasadot or !@matches) {
             debug(qq{NB! Found some existing matches; searching for other possibilities, because "$item" }
-                . ( $hasstar ? "includes wildcard characters " : '' )
-                . ( !$hasadot ? "doesn't include a dot" : '' )) if @matches;
+                . ( $hasstar ? 'includes wildcard characters ' : '' )
+                . ( !$hasadot ? 'does not include a dot' : '' )) if @matches;
             ## Search the live database for matches
             $sth = $rdbh->prepare($SQL);
             $regex_item ||= $item;
-            ($count = $sth->execute($regex_item)) =~ s/0E0/0/;
-            debug(qq{Searched live database "$bestdb" for arg "$item", count was $count});
+            if ('all' eq $item) {
+                ($count = $sth->execute()) =~ s/0E0/0/;
+            }
+            else {
+                ($count = $sth->execute($regex_item)) =~ s/0E0/0/;
+            }
+            debug(qq{Searched live database "$bestdb" for arg "$regex_item", count was $count});
             debug(qq{SQL: $SQL}, 2);
             debug(qq{Arg: $item ($regex_item)}, 2);
             for my $row (@{ $sth->fetchall_arrayref({}) }) {
@@ -4413,6 +4818,18 @@ AND nspname !~ '^pg_'
 
                 ## Don't bother if we have already added this!
                 next if find_goat_by_item($row->{name}, [ "db=$bestdb" ]);
+
+                ## If we are doing 'all', exclude the bucardo schema, and insist on a primary key
+                if ('all' eq $item) {
+                    next if $name =~ /^bucardo\./;
+                    if (!$row->{relhaspkey}) {
+                        ## Allow if we have a unique index on this table
+                        $SQL = q{SELECT 1 FROM pg_index WHERE indisunique AND indrelid=$1::regclass};
+                        my $sthunique = $rdbh->prepare_cached($SQL);
+                        $count = $sthunique->execute($name);
+                        next if $count < 1;
+                    }
+                }
 
                 ## Document the string that led us to this one
                 $relation{$name}{original}{$item}++;
@@ -4426,10 +4843,6 @@ AND nspname !~ '^pg_'
                 ## Set this table to be added to the goat table below
                 push @addtable, {name => $name, db => $bestdb, reltype => $row->{relkind}, dbcols => $dbcols};
 
-                ## Add this to our matching list
-                # This happens after add_items_to_goat_table now
-                #push @matches => $name;
-
             }
         }
 
@@ -4440,6 +4853,14 @@ AND nspname !~ '^pg_'
         }
         for my $tmp (@$added_tables) {
             push @matches, $GOAT->{by_id}{$tmp};
+        }
+
+        ## If we asked for "all", add in all of our known tables (not already in this herd)
+        if ($names->[0] eq 'all') {
+            for (values %{ $GOAT->{by_db}{$bestdb} }) {
+                next if exists $_->{herd}{$noherd};
+                push @matches, $_;
+            }
         }
 
         ## Populate the final hashes based on the match list
@@ -4466,7 +4887,7 @@ AND nspname !~ '^pg_'
         }
 
         ## If this item did not match anything, note that as well
-        if (! @matches) {
+        if (! @matches and $names->[0] ne 'all') {
             $nomatch{$original_item}++;
         }
 
@@ -4505,6 +4926,7 @@ sub add_items_to_goat_table {
     my @newid;
 
     for my $rel (sort { $a->{name} cmp $b->{name} } @$info) {
+        # XXX Is it safe to assume UTF8 encoding here? Probably not
         my $name = $rel->{name};
         if ($name !~ /^([\w ]+)\.([\w ]+)$/o) {
             die qq{Invalid name, got "$name", but expected format "schema.relname"};
@@ -4560,7 +4982,7 @@ sub create_dbgroup {
     ## Arguments: two
     ## 1. Name of the new group
     ## 2. Boolean: if true, prevents the reload
-    ## Returns: undef
+    ## Returns: name of the new group
 
     my ($name,$noreload) = @_;
 
@@ -4572,10 +4994,10 @@ sub create_dbgroup {
     if ($@) {
         if ($@ =~ /dbgroup_name_sane/) {
             print "Trying name $name\n";
-            print qq{Invalid characters in database group name "$name"\n};
+            print qq{Invalid characters in dbgroup name "$name"\n};
         }
         else {
-            print qq{Failed to create database group "$name"\n$@\n};
+            print qq{Failed to create dbgroup "$name"\n$@\n};
         }
         exit 1;
     }
@@ -4583,7 +5005,7 @@ sub create_dbgroup {
     ## Reload our hashes
     $noreload or load_bucardo_info(1);
 
-    return;
+    return $name;
 
 } ## end of create_dbgroup
 
@@ -4798,6 +5220,41 @@ sub kick {
     exit $exitstatus;
 
 } ## end of kick
+
+
+sub pause_resume {
+
+    ## Pause or resume one or more syncs
+    ## Arguments: none, parses nouns
+    ## Returns: never, exits
+
+    my $doc_section = 'pause';
+    usage_exit($doc_section) unless @nouns;
+
+    my $action = shift;
+
+    my @syncs_signalled;
+    for my $sync (@syncs) {
+
+        ## Syncs can only be paused/resumed if they are active
+        my $status = $SYNC->{$sync}{status};
+        if ($status ne 'active') {
+            print qq{Cannot pause or resume sync "$sync" unless it is active (currently "$status")\n};
+        }
+        else {
+            $dbh->do(qq{NOTIFY "bucardo_${action}_sync_$sync"});
+            push @syncs_signalled => $sync;
+        }
+    }
+
+    $dbh->commit();
+
+    my $list = join ',' => @syncs_signalled;
+    $QUIET or print qq{Syncs ${action}d: $list\n};
+
+    exit 0;
+
+} ## end of pause_resume
 
 
 sub show_why_sync_killed {
@@ -5342,6 +5799,9 @@ sub inspect {
     inspect_herd()  if $thing =~ /(?:relgr|herd)/i or $thing eq 'h';
 
     usage_exit($doc_section);
+
+    return;
+
 } ## end of inspect
 
 
@@ -5532,17 +5992,17 @@ sub process_args {
 
     my %arg;
 
-    while ($string =~ m/(\w+)\s*=\s*"(.+?)" /g) {
+    while ($string =~ m/(\w+)\s*[=:]\s*"(.+?)" /g) {
         $arg{lc $1} = $2;
     }
     $string =~ s/\w+\s*=\s*".+?" / /g;
 
-    while ($string =~ m/(\w+)\s*=\s*'(.+?)' /g) {
+    while ($string =~ m/(\w+)\s*[=:]\s*'(.+?)' /g) {
         $arg{lc $1} = $2;
     }
     $string =~ s/\w+\s*=\s*'.+?' / /g;
 
-    while ($string =~ m/(\w+)\s*=\s*(\S+)/g) {
+    while ($string =~ m/(\w+)\s*[=:]\s*(\S+)/g) {
         $arg{lc $1} = $2;
     }
     $string =~ s/\w+\s*=\s*\S+/ /g;
@@ -5647,7 +6107,7 @@ sub update_customcode {
             $setting =~ /^[a-z_]+$/ or die "Invalid setting: $setting\n";
 
             ## We only allow changing a strict subset of all the columns
-            if ($setting =~ /^(?:about|getdbh|name|priority|status|whenrun)$/) {
+            if ($setting =~ /^(?:about|getdbh|name|priority|status|whenrun|src_code)$/) {
                 my $oldvalue = defined $cc->{$setting} ? $cc->{$setting} : '';
                 ## Allow some variation for booleans, but transform to 0/1
                 if ($setting =~ /^(?:getdbh)$/) {
@@ -5665,13 +6125,29 @@ sub update_customcode {
                     die qq{Invalid value for setting "whenrun"\n}
                         unless $whenrun{$value};
                 }
+                elsif ('src_code' eq $setting) {
+                    my $srcfile = $value;
+                    if (! -e $srcfile) {
+                        warn qq{Could not find a file named "$srcfile"\n};
+                        exit 2;
+                    }
+                    open my $fh, '<', $srcfile or die qq{Could not open "$srcfile": $!\n};
+                    $value = '';
+                    { local $/; $value = <$fh>; } ## no critic (RequireInitializationForLocalVars)
+                    close $fh or warn qq{Could not close "$srcfile": $!\n};
+                }
                 ## Make the change, if it has changed
                 if ($value ne $oldvalue) {
                     $SQL = "UPDATE customcode SET $setting=? WHERE name = ?";
                     $sth = $dbh->prepare($SQL);
                     $sth->execute($value, $name);
                     $changes++;
-                    print qq{Changed customcode "$name" $setting from '$oldvalue' to '$value'\n};
+                    if ('src_code' eq $setting) {
+                        print qq{Changed customcode "$name" $setting with content of file "value"\n};
+                    }
+                    else {
+                        print qq{Changed customcode "$name" $setting from '$oldvalue' to '$value'\n};
+                    }
                 }
             }
             else {
@@ -5966,7 +6442,7 @@ sub add_customcode {
 
     ## Is this a valid sync?
     if ($extras->{sync} and ! exists $global{sync}{$extras->{sync}}) {
-        die qq{Unknown sync: $dbcols->{sync}\n};
+        die qq{Unknown sync: $extras->{sync}\n};
     }
 
     ## Is this a valid gaot?
@@ -6715,6 +7191,13 @@ sub find_bucardo_schema {
     my $schema_file = 'bucardo.schema';
     return ($fh, $schema_file) if open $fh, '<', $schema_file;
 
+    ## Check for a symlink path back to the right directory
+    if (-l $progname) {
+        my $dir = dirname( readlink $progname );
+        $schema_file = File::Spec->catfile( $dir, 'bucardo.schema' );
+        return ($fh, $schema_file) if open $fh, '<', $schema_file;
+    }
+
     ## Try /usr/local/share/bucardo
     $schema_file = '/usr/local/share/bucardo/bucardo.schema';
     return ($fh, $schema_file) if open $fh, '<', $schema_file;
@@ -7268,6 +7751,14 @@ sub upgrade {
         $changes++;
     }
 
+    ## Special case config renaming
+    if (config_exists('bucardo_current_version')) {
+        ## was version and current_version; became initial_version and version
+        clog('Renaming bucardo_current_version to bucardo_version, and bucardo_version to bucardo_initial_version');
+        upgrade_and_log(qq{UPDATE bucardo.bucardo_config SET name = 'bucardo_initial_version' WHERE name = 'bucardo_version'});
+        upgrade_and_log(qq{UPDATE bucardo.bucardo_config SET name = 'bucardo_version' WHERE name = 'bucardo_current_version'});
+    }
+
     ## Check for any new config items
     $SQL = 'SELECT setting FROM bucardo.bucardo_config WHERE lower(name) = ?';
     my $cfgsth = $dbh->prepare($SQL);
@@ -7437,18 +7928,18 @@ sub upgrade {
     }
 
     ## Make sure bucardo_config has the new schema version
-    $count = $cfgsth->execute('bucardo_current_version');
+    $count = $cfgsth->execute('bucardo_version');
     if ($count eq '0E0') {
         $cfgsth->finish();
-        warn "Weird: could not find bucardo_current_version in the bucardo_config table!\n";
+        warn "Weird: could not find bucardo_version in the bucardo_config table!\n";
     }
     else {
         my $curval = $cfgsth->fetchall_arrayref()->[0][0];
         if ($curval ne $schema_version) {
             $SQL = 'UPDATE bucardo.bucardo_config SET setting = ? WHERE name = ?';
             my $updatecfg = $dbh->prepare($SQL);
-            $updatecfg->execute($schema_version, 'bucardo_current_version');
-            clog "Set bucardo_config.bucardo_current_version to $schema_version";
+            $updatecfg->execute($schema_version, 'bucardo_version');
+            clog "Set bucardo_config.bucardo_version to $schema_version";
             $changes++;
         }
     }
@@ -7679,7 +8170,7 @@ sub message {
     $sth = $dbh->prepare($SQL);
     $sth->execute($nouns);
     $dbh->commit();
-    $VERBOSE and print "Message added\n";
+    $VERBOSE and print "Added message\n";
 
     exit 0;
 
@@ -7725,10 +8216,10 @@ sub install {
     }
 
     ## Setup our default arguments for the installation choices
-    my $host = $bcargs->{dbhost} || $ENV{PGHOST} || '<none>';
-    my $port = $bcargs->{dbport} || $ENV{PGPORT} || 5432;
-    my $user = $ENV{DBUSER} || 'postgres';
-    my $dbname = $ENV{DBNAME} || 'postgres';
+    my $host   = $bcargs->{dbhost} || $ENV{PGHOST} || '<none>';
+    my $port   = $bcargs->{dbport} || $ENV{PGPORT} || 5432;
+    my $user   = $ENV{DBUSER} || 'postgres';
+    my $dbname = $bcargs->{dbname} || $ENV{DBNAME} || 'postgres';
 
     ## Make sure the bucardo.schema file is available, and extract some config items
     my ($fh, $schema_file) = find_bucardo_schema();
@@ -7757,7 +8248,7 @@ sub install {
   GOOEY:
     {
 
-        ## We only don't print this in quiet batch mode
+        ## We only don't print this in quiet and batch mode
         if (! $QUIET or ! $bcargs->{batch}) {
             print "Current connection settings:\n";
 
@@ -7900,18 +8391,43 @@ sub install {
     my $res = qx{$COM 2>&1};
 
     ## Dump any problems verbatim to stderr
+    my $delayed_warning;
     if ($res =~ /FATAL|ERROR/ or $res =~ /psql:/) {
-        warn $res;
+        $delayed_warning = $res;
     }
 
     ## Check for some common errors
-    if ($res =~ /role ".+" does not exist/) {
-        print "-->Sorry, please try using a different user\n\n";
+    if ($res =~ /role "(.+)" does not exist/) {
+        my $baduser = $1;
+        if ($baduser eq 'postgres' and exists $ENV{USER} and $ENV{USER} =~ /^[\w-]+$/) {
+            $user = $ENV{USER};
+            if (!$QUIET and !$bcargs->{batch}) {
+                print "Failed to connect as user 'postgres', will try '$user'\n";
+            }
+        }
+        else {
+            print "-->Sorry, please try using a different user\n\n";
+            exit 1 if $bcargs->{batch};
+        }
         goto GOOEY;
+    }
+
+    ## Check for some common errors
+    if ($res =~ /database "(.+)" does not exist/) {
+        my $baddb = $1;
+        if ($baddb ne 'postgres') {
+            if (!$QUIET and !$bcargs->{batch}) {
+                print "Failed to connect to database '$dbname', will try 'postgres'\n";
+            }
+            $dbname = 'postgres';
+            goto GOOEY;
+        }
     }
 
     if ($res !~ /(\d+)\.(\d+)(\S+)/) {
         print "-->Sorry, unable to connect to the database\n\n";
+        warn $delayed_warning;
+        exit 1 if $bcargs->{batch};
         goto GOOEY;
     }
 
@@ -8255,6 +8771,14 @@ sub process_simple_args {
         }
     }
 
+    ## Automatic morphing magic
+    if (exists $item{status} and ! exists $dbcol{status}) {
+        for my $stat (qw/ active inactive /) {
+            if (grep { $_ eq $stat } @{ $xyargs->{extraargs} }) {
+                $dbcol{status} = $stat;
+            }
+        }
+    }
 
     ## Build the lists of columns and placeholders for the SQL statement
     my ($cols,$phs,$vals) = ('','',{});
@@ -8312,7 +8836,7 @@ sub check_recurse {
 sub extract_name_and_role {
 
     ## Given a group or db name with optional role information, return both
-    ## Also returns optional list of other items, e.g. ABC:slave:pri=2:gangs=2
+    ## Also returns optional list of other items, e.g. ABC:target:pri=2:gangs=2
     ## Arguments: one
     ## 1. Group or database name: 'foo' or 'foo:master'
     ## Returns: name, role name, and hashref of 'extra' info
@@ -8355,13 +8879,13 @@ sub extract_name_and_role {
     }
 
     ## Valid role name?
-    if ($role !~ /^(?:master|target|slave|rep|replica|source|fullcopy)$/) {
+    if ($role !~ /^(?:master|target|t|slave|rep|replica|source|s|fullcopy)$/) {
         die "Invalid database role: $role\n";
     }
 
     ## Standardize the names
-    $role = 'source' if $role =~ /master/;
-    $role = 'target' if $role =~ /slave|rep|tar/;
+    $role = 'source' if $role =~ /^(?:master|s)$/;
+    $role = 'target' if $role =~ /^(?:slave|rep|replica|tar|t)$/;
 
     return $name, $role, \%extra;
 
@@ -8563,7 +9087,7 @@ JOIN goat g ON (g.id = c.goat)
     $global{dbgroup} = $DBGROUP = $dbgroup;
     $global{db}      = $DB   = $db;
     $global{goat}    = $GOAT = $goat;
-    $global{herd}    = $HERD = $herd;
+    $global{herd}    = $HERD = $RELGROUP = $herd;
     $global{sync}    = $SYNC = $sync;
 
     ## Separate goat into tables and sequences
@@ -8787,7 +9311,7 @@ sub add_db_to_group {
         $sth->execute($db,$group,$role);
     };
     if ($@) {
-        my $message = qq{Cannot add database "$db" to group "$group"};
+        my $message = qq{Cannot add database "$db" to dbgroup "$group"};
         if ($@ =~ /"dbmap_unique"/) {
             die qq{$message: already part of the group\n};
         }
@@ -8856,7 +9380,7 @@ sub update_dbmap {
     ## Update the values in the bucardo.dbmap table
     ## Arguments: three
     ## 1. Name of the database
-    ## 2. Name of the database group
+    ## 2. Name of the dbgroup
     ## 3. Hashref of things to change
     ## Returns: undef
 
@@ -8877,12 +9401,12 @@ sub update_dbmap {
 sub create_herd {
 
     ## Creates a new entry in the bucardo.herd table
-    ## Caller should have alredy checked for existence
+    ## Caller should have already checked for existence
     ## Does not commit
     ## Arguments: two
     ## 1. Name of the new herd
     ## 2. Boolean: if true, prevents the reload
-    ## Returns: undef
+    ## Returns: name of the herd just created
 
     my ($name,$noreload) = @_;
 
@@ -8892,14 +9416,14 @@ sub create_herd {
         $sth->execute($name);
     };
     if ($@) {
-        print qq{Failed to create relation group "$name"\n$@\n};
+        print qq{Failed to create relgroup "$name"\n$@\n};
         exit 1;
     }
 
     ## Reload our hashes
     $noreload or load_bucardo_info(1);
 
-    return;
+    return $name;
 
 } ## end of create_herd
 
@@ -8912,7 +9436,7 @@ bucardo - utility script for controlling the Bucardo program
 
 =head1 VERSION
 
-This document describes version 4.99.10 of bucardo
+This document describes version 5.0.0 of bucardo
 
 =head1 USAGE
 
@@ -8975,6 +9499,11 @@ Kicks off one or more syncs.
 
 Sends a message to all CTL and KID processes asking them to reload the Bucardo
 configuration.
+
+=item C<reopen>
+
+Sends a message to all Bucardo processes asking them to reopen any log files
+they may have open. Call this after you have rotated the log file(s).
 
 =item C<< show all|<setting> [<setting>...] >>
 
@@ -9291,9 +9820,13 @@ include:
 
   bucardo add db <name> dbname=actual_name port=xxx host=xxx user=xxx pass=xxx
 
-Adds a new database. The C<name> is the name by which the database will be
+Adds one or more new databases. The C<name> is the name by which the database will be
 known to Bucardo, and must be unique. This may vary from the actual database
-name, as multiple hosts might have databases with the same name.
+name, as multiple hosts might have databases with the same name. Multiple databases
+can be added by separating the names with commas. Options that differ between the
+databases should be separated by a matching commas. Example:
+
+  bucardo add db alpha,beta dbname=sales host=aa,bb user=bucardo
 
 The supported named parameters are:
 
@@ -9380,9 +9913,7 @@ Initial status of the database in Bucardo. Must be either "active" or
 
 =item C<dbgroup>
 
-=item C<group>
-
-Bucardo database group to which to add the database. Optional.
+Bucardo dbgroup to which to add the database. Optional.
 
 =item C<addalltables>
 
@@ -9418,7 +9949,7 @@ an authentication failure.
 
   bucardo add dbgroup name db1:source db2:source db3:target ...
 
-Adds one or more databases to the named database group. If the database group
+Adds one or more databases to the named dbgroup. If the dbgroup
 doesn't exist, it will be created. The database parameters should specify
 their roles, either "source" or "target".
 
@@ -9452,20 +9983,20 @@ default. Optional.
 Boolean indicating whether or not to analyze the table after every sync. Off
 by default. Optional.
 
-=item C<vaccuum_after_copy>
+=item C<vacuum_after_copy>
 
 Boolean indicating whether or not to vacuum the table after every sync. Off by
 default. Optional.
 
 =item C<relgroup>
 
-Adds the table to the named relation group. If the relation group does not
+Adds the table to the named relgroup. If the relgroup does not
 exist, it will be created. Optional.
 
 =item C<makedelta>
 
-Turns makedelta magic on or off. Value is a list of databases which need makedelta 
-for this table. Value can also be "on" to enable makedelta for all databases. 
+Turns makedelta magic on or off. Value is a list of databases which need makedelta
+for this table. Value can also be "on" to enable makedelta for all databases.
 Defaults to "off".
 
 =item C<strict_check>
@@ -9473,7 +10004,7 @@ Defaults to "off".
 Boolean indicating whether or not to be strict when comparing the table
 between syncs. If the columns have different names or data types, the
 validation will fail. But perhaps the columns are allowed to have different
-names or data types. If so, disable C<strict_check> and column diffrences will
+names or data types. If so, disable C<strict_check> and column differences will
 result in warnings rather than failing the validation. Defaults to true.
 
 =back
@@ -9492,7 +10023,7 @@ Required.
 
 =item C<relgroup>
 
-Adds the sequence to the named relation group. If the relation group does not
+Adds the sequence to the named relgroup. If the relgroup does not
 exist, it will be created. Optional.
 
 =back
@@ -9553,7 +10084,7 @@ Exclude the specified tables. The options may be specified more than once.
 
 =item C<--relgroup>
 
-Name of the relation group to which to add new tables.
+Name of the relgroup to which to add new tables.
 
 =item C<pkonly>
 
@@ -9601,7 +10132,7 @@ options may be specified more than once.
 
 =item C<--relgroup>
 
-Name of the relation group to which to add new tables or sequences.
+Name of the relgroup to which to add new tables or sequences.
 
 =back
 
@@ -9610,12 +10141,12 @@ Name of the relation group to which to add new tables or sequences.
   bucardo add relgroup name
   bucardo add relgroup name table, sequence, ...
 
-Adds a relation group. After the name, pass in an optional list of tables
+Adds a relgroup. After the name, pass in an optional list of tables
 and/or sequences and they will be added to the group.
 
 =head3 add sync
 
-  bucardo add sync syncname relgroup=xxx dbs=xxx
+  bucardo add sync name relgroup=xxx dbs=xxx
 
 Adds a sync, which is a named replication event containing information about
 what to replicate from where to where. The supported parameters are:
@@ -9624,18 +10155,24 @@ what to replicate from where to where. The supported parameters are:
 
 =item C<dbs>
 
-The name of a database group or comma-delimited list of databases. All of the
+The name of a dbgroup or comma-delimited list of databases. All of the
 specified databases will be synchronized. Required.
+
+=item C<dbgroup>
+
+The name of a dbgroup. All of the databases within this group will be
+part of the sync. If the dbgroup does not exists and a separate list
+of databases is given, the group will be created and populated.
 
 =item C<relgroup>
 
-The name of a relation group to synchronize. All of the tables and/or
+The name of a relgroup to synchronize. All of the tables and/or
 sequences in the relgroup will be synchronized. Required unless C<tables> is
 specified.
 
 =item C<tables>
 
-List of tables to add to the sync. This implicitly creates a relation group
+List of tables to add to the sync. This implicitly creates a relgroup
 with the same name as the sync. Required unless C<relgroup> is specified.
 
 =item C<status>
@@ -9763,7 +10300,7 @@ default. Optional.
 Boolean indicating whether or not to be strict when comparing tables in the
 sync. If the columns have different names or data types, the validation will
 fail. But perhaps the columns are allowed to have different names or data
-types. If so, disable C<strict_check> and column diffrences will result in
+types. If so, disable C<strict_check> and column differences will result in
 warnings rather than failing the validation. Defaults to true.
 
 =back
@@ -10235,10 +10772,10 @@ them.
 
 The service name to use for a Postgres database.
 
-=item C<group>
+=item C<dbgroup>
 
-A comma-separated list of database groups to which to add the database. The
-database will be removed from any other groups of which it was previously a
+A comma-separated list of dbgroups to which to add the database. The
+database will be removed from any other dbgroups of which it was previously a
 member.
 
 =back
@@ -10258,11 +10795,11 @@ The name of the sync. Required.
 
 =item C<dbs>
 
-The name of a database group or comma-delimited list of databases.
+The name of a dbgroup or comma-delimited list of databases.
 
 =item C<relgroup>
 
-The name of a relation group to synchronize.
+The name of a relgroup to synchronize.
 
 =item C<status>
 
@@ -10286,7 +10823,7 @@ Number of times a KID may be kicked before being reaped.
 
 =item C<isolation_level>
 
-The transation isolation level this sync should use.
+The transaction isolation level this sync should use.
 Only choices are "serializable" and "repeatable read"
 
 =item C<conflict_strategy>
@@ -10395,7 +10932,7 @@ Boolean indicating whether or not to rebuild indexes after every sync.
 Boolean indicating whether or not to be strict when comparing tables in the
 sync. If the columns have different names or data types, the validation will
 fail. But perhaps the columns are allowed to have different names or data
-types. If so, disable C<strict_check> and column diffrences will result in
+types. If so, disable C<strict_check> and column differences will result in
 warnings rather than failing the validation. Defaults to true.
 
 =back
@@ -10436,14 +10973,14 @@ Boolean indicating whether or not to rebuild indexes after every sync.
 
 Boolean indicating whether or not to analyze the table after every sync.
 
-=item C<vaccuum_after_copy>
+=item C<vacuum_after_copy>
 
 Boolean indicating whether or not to vacuum the table after every sync.
 
 =item C<relgroup>
 
-Adds the table to the named relation group. May be specified more than once.
-The table will be removed from any other relation groups.
+Adds the table to the named relgroup. May be specified more than once.
+The table will be removed from any other relgroups.
 
 =item C<makedelta>
 
@@ -10454,7 +10991,7 @@ Specifies which databases need makedelta enabled for this table.
 Boolean indicating whether or not to be strict when comparing the table
 between syncs. If the columns have different names or data types, the
 validation will fail. But perhaps the columns are allowed to have different
-names or data types. If so, disable C<strict_check> and column diffrences will
+names or data types. If so, disable C<strict_check> and column differences will
 result in warnings rather than failing the validation. Defaults to true.
 
 =back
@@ -10475,8 +11012,8 @@ The name of the schema in which the sequence is found.
 
 =item C<relgroup>
 
-Adds the sequence to the named relation group. May be specified more than
-once. The sequence will be removed from any other relation groups.
+Adds the sequence to the named relgroup. May be speci<fied more than
+once. The sequence will be removed from any other relgroups.
 
 =back
 
@@ -10525,16 +11062,16 @@ Aliases:
 
   bucardo kick <syncname(s)> [timeout]
 
-Tells one or more named syncs to fire as soon as possible. Note that this simply sends a request that 
-the sync fire: it may not start right away if the same sync is already running, or if the source or 
-target database has exceeded the number of allowed Bucardo connections. If the final argument is a 
-number, it is treated as a timeout. If this number is zero, the bucardo command will not return 
-until the sync has finished. For any other number, the sync will wait at most that number of seconds. 
+Tells one or more named syncs to fire as soon as possible. Note that this simply sends a request that
+the sync fire: it may not start right away if the same sync is already running, or if the source or
+target database has exceeded the number of allowed Bucardo connections. If the final argument is a
+number, it is treated as a timeout. If this number is zero, the bucardo command will not return
+until the sync has finished. For any other number, the sync will wait at most that number of seconds.
 If any sync has not finished before the timeout, an exit value of 1 will be returned. Errors will
 cause exit values of 2 or 3. In all other cases, an exit value of 0 will be returned.
 
-If a timeout is given, the total completion time in seconds is also displayed. If the sync is going to 
-multiple targets, the time that each target takes from the start of the kick is also shown as each 
+If a timeout is given, the total completion time in seconds is also displayed. If the sync is going to
+multiple targets, the time that each target takes from the start of the kick is also shown as each
 target finishes. Options:
 
 =over
@@ -10555,6 +11092,17 @@ running a kick, for example, via a cronjob, so turning --notimer on will
 simply print the entire message without backspaces.
 
 =back
+
+=head2 pause
+
+  bucardo pause <syncname(s)>
+  bucardo pause all
+  bucardo resume <syncname(s)>
+  bucardo resume all
+
+Tells one or more named syncs to temporarily pause, or to resume from a previous pause. This
+only applies to active syncs and only takes effect if Bucardo is currently running. The
+keyword 'all' can be used as well to pause or resume all known active syncs.
 
 =head2 reload config
 
@@ -10594,17 +11142,17 @@ How to generate this list:
 
 Which DDL changing conditions do we try to remedy automatically? Default: C<newcol>.
 
-=item C<bucardo_current_version>
+=item C<bucardo_version>
 
-Current version of Bucardo. Default: C<4.99.10>.
+Current version of Bucardo. Default: C<5.0.0>.
 
 =item C<bucardo_vac>
 
 Do we want the automatic VAC daemon to run? Default: C<1>.
 
-=item C<bucardo_version>
+=item C<bucardo_initial_version>
 
-Bucardo version this schema was created with. Default: C<4.99.10>.
+Bucardo version this schema was created with. Default: C<5.0.0>.
 
 =item C<ctl_checkonkids_time>
 
@@ -10652,7 +11200,7 @@ Regex to make sure we don't accidentally run where we should not. Default: None.
 
 =item C<isolation_level>
 
-The transaction isolation level all sync should use. Defaults to 'serializable'. 
+The transaction isolation level all sync should use. Defaults to 'serializable'.
 The only other valid option is 'repeatable read'
 
 =item C<kid_deadlock_sleep>
@@ -10806,8 +11354,8 @@ L</show> and L</set> commands, instead.
   bucardo ping 60
   bucardo ping 0
 
-Sends a ping notice to the MCP process to see if it will respond. By default, it will wait 15 seconds. A 
-numeric argument will change this timeout. Using a 0 as the timeout indicates waiting forever. If a response 
+Sends a ping notice to the MCP process to see if it will respond. By default, it will wait 15 seconds. A
+numeric argument will change this timeout. Using a 0 as the timeout indicates waiting forever. If a response
 was returned, the program will exit with a value of 0. If it times out, the value will be 1.
 Returns a Nagios like message starting with "OK" or "CRITICAL" for success or failure.
 
@@ -10815,8 +11363,8 @@ Returns a Nagios like message starting with "OK" or "CRITICAL" for success or fa
 
   bucardo status [syncname(s)] [--sort=#] [--show-days] [--compress]
 
-Shows the brief status of all known syncs in a tabular format. If given one or more sync names, 
-shows detailed information for each one. To see detailed information for all syncs, simply 
+Shows the brief status of all known syncs in a tabular format. If given one or more sync names,
+shows detailed information for each one. To see detailed information for all syncs, simply
 use "status all"
 
 When showing brief information, the columns are:
@@ -10842,7 +11390,7 @@ How long it has been since the last sync success
 
 =item 5. B<Last I/U>
 
-The number of insert and deletes performed by the last successful sync. May also show 
+The number of insert and deletes performed by the last successful sync. May also show
 the number of rows truncated (T) or conflicted (C), if applicable.
 
 =item 6. B<Last bad>
@@ -10880,22 +11428,22 @@ negative number to reverse the sort order.
 
   bucardo activate syncname [syncname2 syncname3 ...] [timeout]
 
-Activates one or more named syncs. If given a timeout argument, it will wait until it has received 
+Activates one or more named syncs. If given a timeout argument, it will wait until it has received
 confirmation from Bucardo that each sync has been successfully activated.
 
 =head2 deactivate
 
   bucardo deactivate syncname [syncname2 syncname3 ...] [timeout]
 
-Deactivates one or more named syncs. If given a timeout argument, it will wait until it has received 
+Deactivates one or more named syncs. If given a timeout argument, it will wait until it has received
 confirmation from Bucardo that the sync has been successfully deactivated.
 
 =head2 message
 
   bucardo message 'I WAS HERE'
 
-Sends a message to the running Bucardo logs. This message will appear prefixed with "MESSAGE: ". If 
-Bucardo is not running, the message will go to the logs the next time Bucardo runs and someone 
+Sends a message to the running Bucardo logs. This message will appear prefixed with "MESSAGE: ". If
+Bucardo is not running, the message will go to the logs the next time Bucardo runs and someone
 adds another message.
 
 =head2 reload
@@ -10956,7 +11504,7 @@ or a command and its action. Some examples:
 
 =head1 OPTIONS DETAILS
 
-It is usually easier to set most of these options at the top of the script, or make an alias for them, 
+It is usually easier to set most of these options at the top of the script, or make an alias for them,
 as they will not change very often if at all.
 
 =over
@@ -11032,12 +11580,12 @@ Shows a brief summary of usage for bucardo.
 
 =head1 FILES
 
-In addition to command-line configurations, you can put any options inside of a file. The file F<.bucardorc> in 
-the current directory will be used if found. If not found, then the file F<~/.bucardorc> will be used. Finally, 
-the file /etc/bucardorc will be used if available. The format of the file is option = value, one per line. Any 
-line starting with a '#' will be skipped. Any values loaded from a bucardorc file will be overwritten by 
-command-line options. All bucardorc files can be ignored by supplying a C<--no-bucardorc> argument. A specific 
-file can be forced with the C<--bucardorc=file> option; if this option is set, bucardo will refuse to run 
+In addition to command-line configurations, you can put any options inside of a file. The file F<.bucardorc> in
+the current directory will be used if found. If not found, then the file F<~/.bucardorc> will be used. Finally,
+the file /etc/bucardorc will be used if available. The format of the file is option = value, one per line. Any
+line starting with a '#' will be skipped. Any values loaded from a bucardorc file will be overwritten by
+command-line options. All bucardorc files can be ignored by supplying a C<--no-bucardorc> argument. A specific
+file can be forced with the C<--bucardorc=file> option; if this option is set, bucardo will refuse to run
 unless that file can be read.
 
 =head1 ENVIRONMENT VARIABLES
@@ -11057,7 +11605,7 @@ Bucardo
 
 =head1 COPYRIGHT
 
-Copyright 2006-2013 Greg Sabino Mullane <greg@endpoint.com>
+Copyright 2006-2014 Greg Sabino Mullane <greg@endpoint.com>
 
 This program is free to use, subject to the limitations in the LICENSE file.
 

@@ -11,8 +11,10 @@ use lib 't','.';
 use DBD::Pg;
 use Test::More;
 use MIME::Base64;
+use File::Temp qw/ tempfile /;
+use Cwd;
 
-use vars qw/ $dbhX $dbhA $dbhB $dbhC $dbhD $res $command $t $SQL %pkey %sth %sql $sth $count $val /;
+use vars qw/ $dbhX $dbhA $dbhB $dbhC $dbhD $dbhE $res $command $t $SQL %pkey %sth %sql $sth $count $val /;
 
 use BucardoTesting;
 my $bct = BucardoTesting->new({location => 'postgres'})
@@ -23,12 +25,17 @@ my $bct = BucardoTesting->new({location => 'postgres'})
 ## The above runs one test for each passed in database x the number of test tables
 my $numtables = keys %tabletype;
 my $numsequences = keys %sequences;
-my $single_tests = 61;
+my $single_tests = 62;
 my $check_for_row_1 = 1;
 my $check_for_row_2 = 2;
 my $check_for_row_3 = 3;
 my $check_for_row_4 = 7;
 my $check_sequences_same = 1;
+
+## We have to set up the PGSERVICEFILE early on, so the proper
+## environment variable is set for all processes from the beginning.
+my ($service_fh, $service_temp_filename) = tempfile("bucardo_pgservice.tmp.XXXX", UNLINK => 0);
+$ENV{PGSERVICEFILE} = getcwd . '/' . $service_temp_filename;
 
 plan tests => $single_tests +
     ( $check_sequences_same * $numsequences ) + ## Simple sequence testing
@@ -46,25 +53,35 @@ END {
     $dbhB and $dbhB->disconnect();
     $dbhC and $dbhC->disconnect();
     $dbhD and $dbhD->disconnect();
+    $dbhE and $dbhE->disconnect();
 }
 
-## Get A, B, C, and D created, emptied out, and repopulated with sample data
+## Get A, B, C, D, and E created, emptied out, and repopulated with sample data
 $dbhA = $bct->repopulate_cluster('A');
 $dbhB = $bct->repopulate_cluster('B');
 $dbhC = $bct->repopulate_cluster('C');
 $dbhD = $bct->repopulate_cluster('D');
+$dbhE = $bct->repopulate_cluster('E');
 
 ## Create a bucardo database, and install Bucardo into it
 $dbhX = $bct->setup_bucardo('A');
 
-## Teach Bucardo about four databases
+## Teach Bucardo about the first four databases
 for my $name (qw/ A B C D A1 /) {
     $t = "Adding database from cluster $name works";
     my ($dbuser,$dbport,$dbhost) = $bct->add_db_args($name);
-    $command = "bucardo add db $name dbname=bucardo_test user=$dbuser port=$dbport host=$dbhost";
+    $command = "bucardo add db $name dbname=bucardo_test user=$dbuser port=$dbport host=$dbhost status=active";
     $res = $bct->ctl($command);
     like ($res, qr/Added database "$name"/, $t);
 }
+
+## Teach Bucardo about the fifth database using a service file
+$t = "Adding database E via a service name works";
+my ($dbuser,$dbport,$dbhost) = $bct->add_db_args('E');
+print $service_fh "[dbE]\ndbname=bucardo_test\nuser=$dbuser\nport=$dbport\nhost=$dbhost\n";
+close $service_fh;
+$res = $bct->ctl("add db E service=dbE status=inactive");
+like ($res, qr/Added database "E"/, $t);
 
 ## Put all pk tables into a relgroup
 $t = q{Adding all PK tables on the master works};
@@ -76,30 +93,30 @@ $t = q{Adding all sequences to the main relgroup};
 $res = $bct->ctl(q{bucardo add all sequences relgroup=allpk});
 like ($res, qr/New sequences added/s, $t);
 
-## Create a new database group going from A to B and C and D
-$t = q{Created a new database group A -> B C D};
-$res = $bct->ctl('bucardo add dbgroup pg1 A:source B:target C:target D:target');
-like ($res, qr/Created database group "pg1"/, $t);
+## Create a new dbgroup going from A to B and C and D and E
+$t = q{Created a new dbgroup A -> B C D E};
+$res = $bct->ctl('bucardo add dbgroup pg1 A:source B:target C:target D:target E:target');
+like ($res, qr/Created dbgroup "pg1"/, $t);
 
-## Create a new database group going from A and B to C and D
-$t = q{Created a new database group (A <=> B ) -> C D};
+## Create a new dbgroup going from A and B to C and D
+$t = q{Created a new dbgroup (A <=> B ) -> C D};
 $res = $bct->ctl('bucardo add dbgroup pg2 A:source B:source C D');
-like ($res, qr/Created database group "pg2"/, $t);
+like ($res, qr/Created dbgroup "pg2"/, $t);
 
-## Create a new database group going from A and B and C to D
-$t = q{Created a new database group (A <=> B <=> C) -> D};
+## Create a new dbgroup going from A and B and C to D
+$t = q{Created a new dbgroup (A <=> B <=> C) -> D};
 $res = $bct->ctl('bucardo add dbgroup pg3 A:source B:source C:source D');
-like ($res, qr/Created database group "pg3"/, $t);
+like ($res, qr/Created dbgroup "pg3"/, $t);
 
-## Create a new database group going from A and B and C and D
-$t = q{Created a new database group (A <=> B <=> C <=> D)};
+## Create a new dbgroup going from A and B and C and D
+$t = q{Created a new dbgroup (A <=> B <=> C <=> D)};
 $res = $bct->ctl('bucardo add dbgroup pg4 A:source B:source C:source D:source');
-like ($res, qr/Created database group "pg4"/, $t);
+like ($res, qr/Created dbgroup "pg4"/, $t);
 
-## Create a new database group going between A and B
-$t = q{Created a new database group (A <=> B)};
+## Create a new dbgroup going between A and B
+$t = q{Created a new dbgroup (A <=> B)};
 $res = $bct->ctl('bucardo add dbgroup pg5 A:source B:source');
-like ($res, qr/Created database group "pg5"/, $t);
+like ($res, qr/Created dbgroup "pg5"/, $t);
 
 ## Create some new syncs. Only one should be active at a time!
 $t = q{Created a new sync for dbgroup pg1};
@@ -175,7 +192,7 @@ $bct->restart_bucardo($dbhX, 'bucardo_stopped');
 # Nothing should have been copied to B, C, or D, yet.
 $bct->check_for_row([], [qw/B C D/]);
 
-## Activate the pg1, mtest, and samedb syncs
+## Activate the pgtest1 and samedb syncs
 is $bct->ctl('bucardo update sync pgtest1 status=active'), '', 'Activate pgtest1';
 is $bct->ctl('bucardo update sync samedb status=active'),  '', 'Activate samedb';
 
@@ -439,5 +456,7 @@ like $bct->ctl('bucardo kick sync pgtest3 0'),
 $bct->check_for_row([[1],[2],[3],[7]], [qw/A B C/]);
 $bct->check_for_row([[1],[2],[3],[7]], [qw/D/], 'customcols', '!test1');
 $bct->check_for_row([[2],[3],[7],[30]], [qw/D/], 'customcols', 'test1');
+
+unlink $service_temp_filename;
 
 exit;
